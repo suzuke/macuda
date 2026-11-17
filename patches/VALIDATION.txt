@@ -27,3 +27,14 @@ The patch is already applied in the local tested dependency checkout.
 
 No firmware binaries, VBIOS dumps, model files or full runtime logs are
 included in this change. Firmware is read from the card, not flashed.
+
+Full inference follow-up (same locally built e797e31-dirty binaries):
+Model: Qwen/Qwen2.5-0.5B-Instruct-GGUF,
+qwen2.5-0.5b-instruct-q8_0.gguf from Hugging Face.
+llama-simple: 64 tokens, 198.30 tokens/s, exit 0; coherent English output.
+llama-bench: -ngl 99 -p 256 -n 128 -r 3, CUDA backend:
+  pp256: 13596.39 +/- 1169.02 tokens/s
+  tg128: 282.99 +/- 11.68 tokens/s
+The benchmark reports 630.17 M parameters and 638.74 MiB model size.
+Both runs completed QUIESCE=1 successfully; these are short tests and do
+not establish sustained stability or throughput for larger models.
