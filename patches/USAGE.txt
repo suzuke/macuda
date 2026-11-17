@@ -29,3 +29,42 @@ header and uses subtraction-based ROM bounds checks to avoid overflow.
 Existing local binaries predate this refactor. No whole-project rebuild or
 hardware test was run for this change; earlier hardware evidence is recorded
 separately in VALIDATION.txt. Rebuild before testing the latest source on GPU.
+
+Profiling report and ABBA tools (default: no GPU work)
+
+Summarize an existing raw driver log:
+  python3 tools/profile-report.py logs/shim-probe-YYYYMMDD-HHMMSS.log
+The JSON separates throughput rows from timestamp-quality warnings. Zero,
+reversed or >100 ms printed intervals, discarded samples and negative
+microsecond durations are flagged. It does not repair timestamps or claim
+that an apparently sane clock is calibrated. Raw logs remain unchanged.
+
+Prepare a delta-delivery comparison without executing it:
+  python3 tools/ab-bench.py --model models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+The default prints an A-B-B-A plan: delta delivery 0 versus 1, identical
+pp256/tg128/r3 settings. A chain-depth plan instead uses:
+  python3 tools/ab-bench.py --model models/Qwen2.5-7B-Instruct-Q4_K_M.gguf --knob TINYNV_CHAIN_DEPTH --a 64 --b 128
+
+Only add --execute when GPU work is intended. It runs four benchmark
+processes sequentially under the existing runner, requires successful
+quiesce and postflight, and stops after a failed arm. It records model and
+binary SHA256, source state, raw-log references, summaries and load averages
+in a unique logs/ab-* directory. Model hashing reads the entire model once.
+Supported tuning variables are deliberately limited. The tool removes
+inherited CUDA/driver tuning variables so hidden overrides cannot change
+one arm. It does not stop unrelated workloads or change global settings.
+
+Use --profile to instrument BOTH arms in a separate diagnostic experiment;
+do not compare profiled numbers directly with unprofiled numbers.
+Its scheduler lock excludes other instances of this tool only. Ensure no
+other GPU client is running. Do not delete .dart-stale/.dext-seen to force a
+run through. Follow README's power and operating instructions.
+
+Results are performance measurements, not correctness certification.
+Before keeping a faster option, run operator and deterministic-output
+checks under that option. ABBA reduces order bias but cannot eliminate
+background-load changes or thermal drift. The runner orchestration has
+been prepared offline; new A/B GPU experiments have not yet been executed.
+
+Offline tool tests:
+  python3 tools/test-bench-tools.py

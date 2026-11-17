@@ -25,3 +25,5 @@ tinygrad
 tinygrad-stable
 venv
 .dext-seen
+
+.ab-bench.lock
