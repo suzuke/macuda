@@ -1,0 +1,31 @@
+macOS 15 / RTX 3060 compatibility branch
+
+Offline checks (safe to run while other jobs use the Mac):
+  sh tools/test-offline-compat.sh
+This compiles one small C test with AddressSanitizer/UndefinedBehaviorSanitizer
+and runs Python fixtures. It does not access the GPU, start Docker, or build
+llama.cpp. No downloaded firmware is required for these tests.
+
+The FWSEC signature is selected automatically from the card's fuse version
+and VBIOS version mask. GPU build architecture is still explicit: sm_86 for
+the tested RTX 3060. This branch does not auto-detect build architectures.
+
+When the Mac is available for compilation and GPU work:
+  ARCH=sm_86 sh install.sh
+  . ./env.sh
+  sh tools/preflight.sh
+  QUIESCE=1 BIN="$PWD/cuda-shim/build/bin-sm_86" sh tools/nv_shim_step.sh A opverify
+Run one GPU operation at a time. Follow README's operating protocol.
+
+Recovery dependency: apply patches/tinygrad-existing-socket.patch to the
+33cd373ad tinygrad-stable checkout as described in VALIDATION.txt.
+
+For small-model generation after successful hardware validation:
+  . ./env.sh
+  QUIESCE=1 BIN="$PWD/cuda-shim/build/bin-sm_86" sh tools/nv_shim_step.sh A simple models/qwen2.5-0.5b-instruct-q8_0.gguf 64 'Explain what a GPU does.'
+
+The latest offline-test change extracts signature selection into a shared
+header and uses subtraction-based ROM bounds checks to avoid overflow.
+Existing local binaries predate this refactor. No whole-project rebuild or
+hardware test was run for this change; earlier hardware evidence is recorded
+separately in VALIDATION.txt. Rebuild before testing the latest source on GPU.

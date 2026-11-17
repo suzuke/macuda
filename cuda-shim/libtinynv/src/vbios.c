@@ -13,6 +13,7 @@
 // this driver expects" and a read three megabytes past a one-megabyte buffer is the difference between a message and a
 // crash, and the walk is driven entirely by numbers that came off the card.
 #include "vbios.h"
+#include "fwsec_signature.h"
 #include "gpu.h"
 #include "internal.h"
 #include <stdio.h>
@@ -180,19 +181,13 @@ int tinynv_vbios_fwsec_frts(tinynv_gpu_t *g, uint64_t frts_offset, tinynv_fwsec_
   unsigned uid = out->desc.UcodeId;
   if (!uid || uid > 16) { tinynv_fail("invalid FWSEC ucode id %u", uid); goto done; }
   uint32_t fuse = tinynv_rd32(&g->dev, 0x008241c0u + 4u * (uid - 1));
-  unsigned version = 0;
-  for (uint32_t bits = fuse; bits; bits >>= 1) version++;
-  uint32_t versions = out->desc.SignatureVersions;
-  if (version >= 16 || !(versions & (1u << version))) {
-    tinynv_fail("FWSEC fuse version %u absent from signature mask %#x", version, versions); goto done;
+  unsigned version, index;
+  if (tinynv_fwsec_signature(fuse, out->desc.SignatureVersions, out->desc.SignatureCount,
+                            sig_len, sig_off, VBIOS_SIZE, &version, &index)) {
+    tinynv_fail("FWSEC fuse %#x has no valid signature in mask %#x/count %u or signature bounds are invalid",
+                fuse, out->desc.SignatureVersions, out->desc.SignatureCount); goto done;
   }
-  unsigned index = 0;
-  for (unsigned bit = 0; bit < version; bit++) index += (versions >> bit) & 1u;
   size_t selected = (size_t)index * FWSEC_SIG_BYTES;
-  if (index >= out->desc.SignatureCount || selected + FWSEC_SIG_BYTES > sig_len ||
-      sig_off + selected + FWSEC_SIG_BYTES > VBIOS_SIZE) {
-    tinynv_fail("FWSEC signature index %u outside descriptor", index); goto done;
-  }
   fprintf(stderr, "tinynv: FWSEC fuse %#x version %u, signature %u/%u\n",
           fuse, version, index, out->desc.SignatureCount);
   const uint8_t *sig = rom + sig_off + selected;

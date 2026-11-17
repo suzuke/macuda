@@ -38,3 +38,12 @@ llama-bench: -ngl 99 -p 256 -n 128 -r 3, CUDA backend:
 The benchmark reports 630.17 M parameters and 638.74 MiB model size.
 Both runs completed QUIESCE=1 successfully; these are short tests and do
 not establish sustained stability or throughput for larger models.
+
+Offline regression follow-up:
+  sh tools/test-offline-compat.sh
+Passed 13 C signature-selection cases with AddressSanitizer and UBSan,
+and 5 Python PCI-detection test methods. Tests include the real fuse 0x3 /
+mask 0xf regression, sparse signature masks, the highest supported version,
+missing versions, invalid counts, truncated blocks and ROM-offset overflow.
+The driver and C test use the same pure helper in src/fwsec_signature.h.
+No GPU access or full rebuild was performed for this refactor.
