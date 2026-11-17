@@ -42,7 +42,7 @@ ok "macOS $(sw_vers -productVersion) on $(uname -m)"
 free_gb=$(df -g . | awk 'NR==2{print $4}')
 [ "${free_gb:-0}" -ge 60 ] && ok "${free_gb} GB free here (the build needs ~25, models want far more)" \
                            || note "only ${free_gb} GB free here: the build alone needs ~25 GB, before any model"
-if system_profiler SPPCIDataType 2>/dev/null | grep -q "0x2b85\|NVIDIA"; then
+if system_profiler SPPCIDataType 2>/dev/null | grep -q "Vendor ID: 0x10de"; then
   ok "an NVIDIA card is on the PCI bus"
 else
   note "no NVIDIA card found on the PCI bus — everything still BUILDS, but nothing can run until an RTX 5090 is"

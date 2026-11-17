@@ -170,12 +170,32 @@ int tinynv_vbios_fwsec_frts(tinynv_gpu_t *g, uint64_t frts_offset, tinynv_fwsec_
   if (find_fwsec_desc(rom, VBIOS_SIZE, exp_off, &desc_off, &desc_size)) goto done;
   if (rom_get(rom, VBIOS_SIZE, desc_off, &out->desc, sizeof out->desc, "fwsec descriptor")) goto done;
 
-  // The signature block sits directly after the v3 layout, and the image directly after that. Only the LAST 0x180
-  // bytes of the block are the production signature the boot ROM checks.
+  // The signature block sits after the v3 layout, followed by the image.
+  // Each 0x180-byte signature corresponds to a set bit in SignatureVersions.
   size_t sig_len = desc_size - TINYNV_FALCON_UCODE_DESC_V3_SIZE_44;
   size_t sig_off = desc_off + TINYNV_FALCON_UCODE_DESC_V3_SIZE_44;
   if (sig_len < FWSEC_SIG_BYTES) { tinynv_fail("the fwsec signature block is %#zx bytes, under the %#x the boot rom reads", sig_len, FWSEC_SIG_BYTES); goto done; }
-  const uint8_t *sig = rom + sig_off + sig_len - FWSEC_SIG_BYTES;
+  // NVIDIA kgspReadUcodeFuseVersion_GA100 and kgspPrepareForFwsec:
+  // choose the signature matching the hardware rollback fuse, not the last one.
+  unsigned uid = out->desc.UcodeId;
+  if (!uid || uid > 16) { tinynv_fail("invalid FWSEC ucode id %u", uid); goto done; }
+  uint32_t fuse = tinynv_rd32(&g->dev, 0x008241c0u + 4u * (uid - 1));
+  unsigned version = 0;
+  for (uint32_t bits = fuse; bits; bits >>= 1) version++;
+  uint32_t versions = out->desc.SignatureVersions;
+  if (version >= 16 || !(versions & (1u << version))) {
+    tinynv_fail("FWSEC fuse version %u absent from signature mask %#x", version, versions); goto done;
+  }
+  unsigned index = 0;
+  for (unsigned bit = 0; bit < version; bit++) index += (versions >> bit) & 1u;
+  size_t selected = (size_t)index * FWSEC_SIG_BYTES;
+  if (index >= out->desc.SignatureCount || selected + FWSEC_SIG_BYTES > sig_len ||
+      sig_off + selected + FWSEC_SIG_BYTES > VBIOS_SIZE) {
+    tinynv_fail("FWSEC signature index %u outside descriptor", index); goto done;
+  }
+  fprintf(stderr, "tinynv: FWSEC fuse %#x version %u, signature %u/%u\n",
+          fuse, version, index, out->desc.SignatureCount);
+  const uint8_t *sig = rom + sig_off + selected;
 
   size_t image_len = (out->desc.StoredSize + 0xff) & ~(size_t)0xff;
   if (!(image = malloc(image_len))) { tinynv_fail("no memory for the fwsec image"); goto done; }

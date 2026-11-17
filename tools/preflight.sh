@@ -1,7 +1,7 @@
 #!/bin/sh
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 DART_STALE=${DART_STALE:-$([ -n "${MACUDA_SHARED_ROOT:-}" ] && echo "$MACUDA_SHARED_ROOT/.dart-stale" || echo $R/.dart-stale)}   # shared with the EGPU tree when it exists
-# Read-only pre-flight for an NVIDIA card in a Thunderbolt enclosure + TinyGPU dext. Prints a verdict. Touches nothing.
+# Checks OS-reported state without opening the GPU. Records the first dext instance in .dext-seen.
 # An ABORT names every rule that tripped on the verdict line, so a check that aborts and later clears on its own leaves
 # a reason behind rather than only a verdict (B, 2026-09-14: one that did not cost a minute; the next could cost a session).
 abort=0; why=""
@@ -14,13 +14,9 @@ echo "== $(date '+%F %T')  preflight =="
 # actually need is that SOME NVIDIA display function is on the bus with its link up - not which one. EGPU_GPU_DEVID pins
 # an expected id when that is wanted; unset, whatever NVIDIA card is plugged in is the card.
 pci=$(system_profiler SPPCIDataType 2>/dev/null)
-gpu=$(echo "$pci" | awk '
-  /^ *Type: /            { vga = ($0 ~ /VGA|Display|3D/) ? 1 : 0; nv = 0; devid = "" }
-  /^ *Vendor ID: 0x10de/ { nv = 1 }
-  /^ *Device ID: /       { if (vga && nv) devid = $3 }
-  /^ *Link Width: /      { if (vga && nv && devid != "") w = $3 }
-  /^ *Link Speed: /      { if (vga && nv && devid != "") sp = $3 " " $4 }
-  /^ *Link Status: /     { if (vga && nv && devid != "") { print devid, w, sp, ($0 ~ /Link up/ ? "up" : "down"); exit } }')
+# Structured IOKit properties also work on macOS 15, whose profiler omits Link Status.
+ioreg_pci=$(ioreg -a -r -c IOPCIDevice)
+gpu=$(printf '%s' "$ioreg_pci" | python3 "$R/tools/pci-preflight.py")
 # NOT `set -- $gpu`: that overwrites the positional parameters, and $1 is how --selftest is recognised twenty lines
 # below. Doing it that way quietly turned the selftest into an ordinary run that printed a verdict and exited 0 - a
 # self-test that cannot fail, introduced by the very edit that added this detection (2026-09-17).
@@ -33,7 +29,6 @@ echo "-- PCI --"
 if [ -z "$DEVID" ]; then echo "   no NVIDIA display function on the PCI bus"; fail "no NVIDIA GPU on the bus"
 else
   echo "   NVIDIA $DEVID, link $LSTATE, $LWIDTH at $LSPEED"
-  echo "$pci" | awk -v d="$DEVID" '$0 ~ d {f=1} f&&/Driver Installed|Tunnel|Link Status/{print "   "$0} f&&/Link Status/{exit}'
   [ "$LSTATE" = up ] || { echo "   $DEVID link NOT up"; fail "PCI link not up"; }
   [ -z "${EGPU_GPU_DEVID:-}" ] || [ "$EGPU_GPU_DEVID" = "$DEVID" ] || \
     { echo "   expected EGPU_GPU_DEVID=$EGPU_GPU_DEVID but found $DEVID"; fail "unexpected GPU $DEVID"; }
@@ -41,8 +36,7 @@ fi
 echo "-- IOKit nub --"
 # ioreg spells the device id little-endian, so 0x2504 is <04250000> and 0x2b85 was <852b0000>: built from whichever
 # card was detected above rather than written out for one of them.
-LE=$(printf '%s%s0000' "$(echo "$DEVID" | cut -c5-6)" "$(echo "$DEVID" | cut -c3-4)")
-nub=$(ioreg -l -w0 2>/dev/null | awk -v m="\"device-id\" = <$LE>" 'index($0,m){f=1} f{print; if(++n>70) exit}')
+nub=$(printf '%s' "$ioreg_pci" | python3 "$R/tools/pci-preflight.py" --nub)
 # the dart flag is thousands of hex digits and is reported below instead; dumping it here buries every other line
 echo "$nub" | grep -E 'IOPCIResourced|IODEXTMatchCount' | sed 's/^ *[| ]*/   /'
 echo "$nub" | grep -q '"IOPCIResourced" = Yes' || { echo "   IOPCIResourced missing"; fail "IOPCIResourced missing"; }

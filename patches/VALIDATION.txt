@@ -1,0 +1,29 @@
+Local validation: 2026-11-17
+Base: Davinchy/macuda e797e31
+Host: Apple M3 Max, macOS 15.5; Razer Core X V2; NVIDIA 10de:2544.
+
+FWSEC: fuse raw 0x3 -> version 2. VBIOS signature mask 0xf, count 4.
+Previously the driver selected the last signature (version 3), and failed
+with "write-protected region is still unplaced (frts error code 0)".
+Selecting the fuse-matched signature allowed GSP initialization.
+ARCH=sm_86 build: 188/188 CUDA translation units succeeded.
+Hardware opverify: 450/450 passed, CUDA0 OK, exit 0.
+Device reported GA106, compute capability 8.6, 12006 MiB VRAM.
+QUIESCE=1 completed; post-test preflight OK, no DART error reported.
+This establishes this operator test on this configuration, not general CUDA
+compatibility or full model inference validation.
+
+macOS 15 omits the text Link Status field. The preflight now reads IOKit
+plist properties, rejects ambiguous GPU selection and unknown link state,
+and scopes resource checks to the same NVIDIA display node.
+Run: python3 tools/test-pci-preflight.py
+
+Recovery dependency:
+The env.sh tinygrad-stable base 33cd373ad calls ensure_app unconditionally.
+Apply the included patch to avoid reinstalling TinyGPU when using an
+explicit APL_REMOTE_SOCK (the existing externally managed server):
+  git -C tinygrad-stable apply ../patches/tinygrad-existing-socket.patch
+The patch is already applied in the local tested dependency checkout.
+
+No firmware binaries, VBIOS dumps, model files or full runtime logs are
+included in this change. Firmware is read from the card, not flashed.
