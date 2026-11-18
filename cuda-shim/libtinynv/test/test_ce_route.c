@@ -448,6 +448,19 @@ int main(void) {
     CHECK(c0 >= 0 && !waits_in(c0, Q_CE), "B/copyq: A's copy acquires B's routed copy");
     CHECK(c1 >= 0 && waits_in(c1, Q_CE) == 3, "B/copyq: B's copy after its routed copy does not acquire it (ce >= 3)");
   }
+  { // a kernel still CHAINED (not submitted) on stream A, then a routed copy on the legacy stream: the chain is handed
+    // over first and the copy's acquire is taken after that, so it covers the chained launches (not a stale q_last)
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ON(ex, &sa); launch(ex, A); launch(ex, B);
+    CHECK(ex->nchain == 2 && ex->q_last[0] == 0, "B/legacy-after-chain: the launches are not pending as set up");
+    ON(ex, NULL); CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/legacy-after-chain: upload: %s", tinynv_last_error());
+    show("B: legacy copy after a chained kernel");
+    submitted_only("B/legacy-after-chain", base_route);
+    int b = first(EV_LAUNCH, B), ce0 = nth_batch(Q_CE, 0);
+    CHECK(b >= 0 && ce0 > ev[b].batch && waits_in(ce0, Q_COMPUTE) >= 2,
+          "B/legacy-after-chain: the legacy copy acquires compute >= %llu, want >= 2 (both chained launches)",
+          (unsigned long long)(ce0 >= 0 ? waits_in(ce0, Q_COMPUTE) : 0));
+  }
   { // TINYNV_CE_CONSERVATIVE: the overlap arm again, now with stage A's ordering
     tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
     ex->ce_conservative = 1;

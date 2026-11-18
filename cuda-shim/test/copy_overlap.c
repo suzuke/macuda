@@ -14,7 +14,7 @@
 //    with a stream synchronise; and refused, exit 1 before anything big is queued, if it is implausibly fast (under
 //    0.5 ms at n=2048, scaled by (n/2048)^3) or slower than 0.25 s;
 //  - R is at most 256 and at most 0.5 s of gemms; every batch of kernels is followed by a blocking read;
-//  - the whole run's planned GPU work (3 R gemm batches, 5 big copies, a few single gemms) must be under 3 s, else exit 1
+//  - the whole run's planned GPU work (4 R gemm batches, 5 big copies, a few single gemms) must be under 3 s, else exit 1
 //    after the two measuring copies (a smaller copy size is the fix);
 //  - a copy never leaves more than two 16 MiB chunks queued: an upload returns only once its last chunk is submitted.
 // So at any moment at most ~0.5 s of gemms plus two chunks are outstanding, which also keeps every semaphore acquire
@@ -24,6 +24,8 @@
 //   raw      copy (a=3) then gemm on the same stream                      -> C = 3n
 //   war      gemms on a 16 MiB matrix of 1s, then a copy of 2s into that matrix alone, same stream -> C = n. One
 //            chunk, so a copy that overtook the gemms would land while they still run and C would read 2n
+//   lwar     the same, the gemms on A and the copy a synchronous cudaMemcpy on the LEGACY stream, which must wait for
+//            every stream's earlier work -> C = n
 //   ssync    copy (a=5) on B, cudaStreamSynchronize(B), gemm on C          -> C = 5n
 //   dsync    copy (a=6) on B, cudaDeviceSynchronize, gemm on C             -> C = 6n
 //   event    copy (a=7) on B, record on B, cudaStreamWaitEvent(A), gemm on A -> C = 7n
@@ -113,7 +115,7 @@ int main(int argc, char **argv) {
   if (reps > 256) reps = 256;
   if (reps * one > 0.5) reps = (int)(0.5 / one);
   if (reps < 1) reps = 1;
-  double plan = 3 * reps * one + 5 * tc + 6 * one;
+  double plan = 4 * reps * one + 5 * tc + 6 * one;
   if (plan > 3.0) {
     fprintf(stderr, "copy_overlap: the run would queue %.2f s of GPU work (copy %.0f ms, %d gemms of %.2f ms), over the 3 s "
                     "ceiling. Refusing; pass a smaller copy size.\n", plan, tc * 1e3, reps, one * 1e3);
@@ -134,6 +136,10 @@ int main(int argc, char **argv) {
   CK(cudaMemcpy(dW, hones, mat, cudaMemcpyHostToDevice));
   gemms(sb, dW, reps); CK(cudaMemcpyAsync(dW, htwos, mat, cudaMemcpyHostToDevice, sb)); fails += check("war", sb, 1.0f);
   block_read();
+  // lwar: as war, but the gemms on A and the overwrite on the legacy stream (cudaMemcpy), ordered after all streams
+  CK(cudaMemcpy(dW, hones, mat, cudaMemcpyHostToDevice));
+  gemms(sa, dW, reps); CK(cudaMemcpy(dW, htwos, mat, cudaMemcpyHostToDevice)); fails += check("lwar", sa, 1.0f);
+  block_read();
   // ssync / dsync: a copy on B, then a CPU synchronisation, then a gemm on a third stream that knows nothing of B
   copy_big(dbig2, 5.0f, sb); CK(cudaStreamSynchronize(sb)); gemms(sc, tailB, 1); fails += check("ssync", sc, 5.0f);
   copy_big(dbig2, 6.0f, sb); CK(cudaDeviceSynchronize()); gemms(sc, tailB, 1); fails += check("dsync", sc, 6.0f);
@@ -149,6 +155,6 @@ int main(int argc, char **argv) {
   if (routed) printf("copy route: ON, copy engine type 0x%x (CE%u) on runlist %u\n", et, et >= 0x9 ? et - 0x9 : et, rl);
   else printf("copy route: OFF (every copy on the graphics copy queue)\n");
   printf("VERDICT: %s\n", r < 0.3 ? "OVERLAP" : r > 0.7 ? "SERIAL" : "PARTIAL");
-  printf(fails ? "RESULT: FAIL, %d correctness checks failed\n" : "RESULT: PASS, all 6 correctness checks passed\n", fails);
+  printf(fails ? "RESULT: FAIL, %d correctness checks failed\n" : "RESULT: PASS, all 7 correctness checks passed\n", fails);
   return fails ? 1 : 0;
 }
