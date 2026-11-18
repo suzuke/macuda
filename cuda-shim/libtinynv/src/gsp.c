@@ -1097,6 +1097,12 @@ int tinynv_gsp_open_client(tinynv_gpu_t *g) {
       if (rl == 0xffffffffu) {
         fprintf(stderr, "tinynv: CE group probe: no engine of type 0x%x in the table; not asking\n", et);
       } else {
+        // TINYNV_CE_GROUP is a diagnostic knob and is honoured as named, even onto the compute channel's runlist - but
+        // the automatic pick never goes there, so say plainly what that choice means for anything routed to it.
+        if (ce && rl == gsp->channel_runlist)
+          fprintf(stderr, "tinynv: WARNING: TINYNV_CE_GROUP=0x%x is on runlist %u, the compute channel's own: copies on it "
+                          "are not expected to overlap kernels (the runlist is shared with GR0); honoured as asked, "
+                          "unset TINYNV_CE_GROUP to let TINYNV_CE_ROUTE pick an engine on another runlist\n", et, rl);
         tinynv_channel_group_alloc_t g2;
         memset(&g2, 0, sizeof(g2));
         g2.engineType = et;
