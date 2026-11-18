@@ -45,7 +45,7 @@ CUDART   := $(BUILD)/libtinycudart.a
 CUBLAS   := $(BUILD)/libtinycublas.a
 
 .PHONY: all test clean FORCE
-all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke $(BUILD)/cublas_contract $(BUILD)/splitk_dispatch $(BUILD)/splitk_card
+all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke $(BUILD)/cublas_contract $(BUILD)/splitk_dispatch $(BUILD)/batched_capture $(BUILD)/splitk_card
 
 $(NV_LIB): FORCE
 	@$(MAKE) --no-print-directory -C libtinynv BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
@@ -102,6 +102,9 @@ $(BUILD)/link_smoke: test/link_smoke.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 $(BUILD)/splitk_dispatch: test/splitk_dispatch.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
+# pointer-array batched cuBLAS calls under a stream capture: recorded as device-side pointer reads (test/batched_capture_check.sh)
+$(BUILD)/batched_capture: test/batched_capture.c $(CUDART) $(CUBLAS) $(NV_LIB)
+	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 # host<->device copy bandwidth, pinned and pageable (a probe for nv_shim_step.sh; not built by `all`)
 $(BUILD)/copy_bw: test/copy_bw.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
@@ -130,6 +133,7 @@ test: all coverage $(SPIKE_CUBINS)
 	$(BUILD)/link_smoke
 	env -u TINYNV_SOCKET -u TINYNV_PCI $(BUILD)/cublas_contract
 	sh test/splitk_check.sh $(BUILD)/splitk_dispatch
+	sh test/batched_capture_check.sh $(BUILD)/batched_capture
 
 # every cuda*/cublas* symbol the compiled ggml-cuda archive needs must be defined by the shim (skipped if the archive is absent)
 .PHONY: coverage

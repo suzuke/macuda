@@ -4,7 +4,9 @@
 // compute is always f32. ggml calls this with Ctype=CUDA_R_16F for f16 matmuls, so writing f32 there overruns a half-sized dst.
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-extern "C" __global__ void tinyblas_gemm_f32(
+// The scalar GEMM and the trsm bodies are __forceinline__ device functions shared with their pointer-array variants (the
+// *_ptrs kernels at the end of this file); both entry points' SASS was checked identical to the previous build, sm_86 and sm_120.
+static __device__ __forceinline__ void tinyblas_gemm_f32_body(
     const void* A, const void* B, void* C, int m, int n, int k,
     int lda, int ldb, int ldc, float alpha, float beta,
     int opA, int opB, int in_dtype, int out_dtype) {   // opA/opB: 0=N,1=T ; dtypes: 0=f32,1=f16,2=bf16
@@ -33,12 +35,18 @@ extern "C" __global__ void tinyblas_gemm_f32(
   else if (out_dtype==1) ((__half*)C)[ci]=__float2half(outv);
   else ((__nv_bfloat16*)C)[ci]=__float2bfloat16(outv);
 }
+extern "C" __global__ void tinyblas_gemm_f32(
+    const void* A, const void* B, void* C, int m, int n, int k,
+    int lda, int ldb, int ldc, float alpha, float beta,
+    int opA, int opB, int in_dtype, int out_dtype) {
+  tinyblas_gemm_f32_body(A, B, C, m, n, k, lda, ldb, ldc, alpha, beta, opA, opB, in_dtype, out_dtype);
+}
 
 // Batched triangular solve, the one case ggml's SOLVE_TRI issues when its own fast kernel's limits (n<=64, k<=32) are
 // exceeded: cublasStrsmBatched(side=RIGHT, uplo=UPPER, trans=N, diag=NON_UNIT): X * A = alpha * B, solved in place in B,
 // A upper-triangular n x n (lda), X/B k x n (ldb), column-major. Each thread owns one row of X and forward-substitutes
 // across the columns, reading the already-solved entries back from X. Correctness first; one launch per batch.
-extern "C" __global__ void tinyblas_trsm_rupn_f32(const float* A, float* X, int k, int n, int lda, int ldb, float alpha) {
+static __device__ __forceinline__ void tinyblas_trsm_rupn_f32_body(const float* A, float* X, int k, int n, int lda, int ldb, float alpha) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;   // row of X
   if (i >= k) return;
   for (int j = 0; j < n; j++) {
@@ -46,6 +54,9 @@ extern "C" __global__ void tinyblas_trsm_rupn_f32(const float* A, float* X, int 
     for (int l = 0; l < j; l++) c -= X[i + (size_t)l * ldb] * A[l + (size_t)j * lda];
     X[i + (size_t)j * ldb] = c / A[j + (size_t)j * lda];
   }
+}
+extern "C" __global__ void tinyblas_trsm_rupn_f32(const float* A, float* X, int k, int n, int lda, int ldb, float alpha) {
+  tinyblas_trsm_rupn_f32_body(A, X, k, n, lda, ldb, alpha);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -413,6 +424,184 @@ extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2k_nn(con
 extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2k_nt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__nv_bfloat16,0,1,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
 extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2k_tn(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__nv_bfloat16,1,0,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
 extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2k_tt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__nv_bfloat16,1,1,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// POINTER-ARRAY BATCHES (2026-11-19): cublasGemmBatchedEx, cublasSgemmBatched and cublasStrsmBatched take arrays of matrix
+// pointers that live in device memory. Outside a capture the host reads them back and loops the ordinary kernels; inside
+// one it must not, because the read would run once at capture time - before the kernel that writes the array (ggml's
+// k_compute_batched_ptrs, solve_tri's get_batch_pointers) has run at all - and every replay would reuse those frozen
+// pointers. These kernels read element blockIdx.z of the arrays on the device, as cuBLAS does, so the graph node holds the
+// arrays' addresses and each replay reads whatever the replayed pointer kernel just wrote. The host offsets the array
+// bases for batches beyond gridDim.z's 65535. The f16 and f32 first-cut tensor-core kernels have no alignment precondition (the tc2
+// kernels' 16-byte one cannot be checked on pointers the host never sees), and bf16 takes the scalar body.
+extern "C" __global__ void tinyblas_gemm_f32_ptrs(
+    const void* const* Ap, const void* const* Bp, void* const* Cp, int m, int n, int k,
+    int lda, int ldb, int ldc, float alpha, float beta,
+    int opA, int opB, int in_dtype, int out_dtype) {
+  const unsigned z = blockIdx.z;
+  tinyblas_gemm_f32_body(Ap[z], Bp[z], Cp[z], m, n, k, lda, ldb, ldc, alpha, beta, opA, opB, in_dtype, out_dtype);
+}
+// A copy of tinyblas_gemm_f16_tc above, line for line, but for its signature and the three operand lines. Not a shared
+// __forceinline__ body: that changed tinyblas_gemm_f16_tc's own sm_120 code, which a card-free change must not do.
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc_ptrs(
+    const __half* const* Ap, const __half* const* Bp, void* const* Cp,
+    int m, int n, int k, int lda, int ldb, int ldc,
+    float alpha, float beta, int opA, int opB, int out_dtype) {
+  enum { BM = 64, BN = 64, BK = 32, APAD = 16, BPAD = 16, CPAD = 8, NT = 128 };
+  __shared__ __align__(32) __half As[BM][BK + APAD];   // As[mi][ki] = op(A)[m0+mi][k0+ki]   (row = m, col = k)
+  __shared__ __align__(32) __half Bs[BK][BN + BPAD];   // Bs[ki][ni] = op(B)[k0+ki][n0+ni]   (row = k, col = n)
+  __shared__ __align__(32) float  Cs[BM][BN + CPAD];
+  const __half* A = Ap[blockIdx.z];
+  const __half* B = Bp[blockIdx.z];
+  char* Cb = (char*)Cp[blockIdx.z];
+  const int tid = threadIdx.x, warp = tid >> 5, wm = warp >> 1, wn = warp & 1;
+  const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+  #pragma unroll
+  for (int i = 0; i < 2; i++)
+    #pragma unroll
+    for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.f);
+  const __half zero = __float2half(0.f);
+  for (int k0 = 0; k0 < k; k0 += BK) {
+    if (opA == 0) {            // A is m x k col-major: consecutive m are contiguous -> threads walk m
+      #pragma unroll
+      for (int i = 0; i < (BM * BK) / NT; i++) { int idx = tid + i * NT; int ki = idx / BM, mi = idx % BM; int gm = m0 + mi, gk = k0 + ki;
+        As[mi][ki] = (gm < m && gk < k) ? A[gm + (long long)gk * lda] : zero; }
+    } else {                   // op(A) = A^T, A stored k x m: consecutive k are contiguous -> threads walk k
+      #pragma unroll
+      for (int i = 0; i < (BM * BK) / NT; i++) { int idx = tid + i * NT; int mi = idx / BK, ki = idx % BK; int gm = m0 + mi, gk = k0 + ki;
+        As[mi][ki] = (gm < m && gk < k) ? A[gk + (long long)gm * lda] : zero; }
+    }
+    if (opB == 0) {            // B is k x n col-major: consecutive k contiguous -> threads walk k
+      #pragma unroll
+      for (int i = 0; i < (BK * BN) / NT; i++) { int idx = tid + i * NT; int ni = idx / BK, ki = idx % BK; int gn = n0 + ni, gk = k0 + ki;
+        Bs[ki][ni] = (gk < k && gn < n) ? B[gk + (long long)gn * ldb] : zero; }
+    } else {                   // op(B) = B^T, B stored n x k: consecutive n contiguous -> threads walk n
+      #pragma unroll
+      for (int i = 0; i < (BK * BN) / NT; i++) { int idx = tid + i * NT; int ki = idx / BN, ni = idx % BN; int gn = n0 + ni, gk = k0 + ki;
+        Bs[ki][ni] = (gk < k && gn < n) ? B[gn + (long long)gk * ldb] : zero; }
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int kk = 0; kk < BK; kk += 16) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a[2];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b[2];
+      #pragma unroll
+      for (int i = 0; i < 2; i++) wmma::load_matrix_sync(a[i], &As[wm * 32 + i * 16][kk], BK + APAD);
+      #pragma unroll
+      for (int j = 0; j < 2; j++) wmma::load_matrix_sync(b[j], &Bs[kk][wn * 32 + j * 16], BN + BPAD);
+      #pragma unroll
+      for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int i = 0; i < 2; i++)
+    #pragma unroll
+    for (int j = 0; j < 2; j++) wmma::store_matrix_sync(&Cs[wm * 32 + i * 16][wn * 32 + j * 16], acc[i][j], BN + CPAD, wmma::mem_row_major);
+  __syncthreads();
+  for (int idx = tid; idx < BM * BN; idx += NT) {   // consecutive threads walk m: coalesced column-major stores
+    int mi = idx % BM, ni = idx / BM; int gm = m0 + mi, gn = n0 + ni;
+    if (gm >= m || gn >= n) continue;
+    long long ci = gm + (long long)gn * ldc;
+    float v = alpha * Cs[mi][ni];
+    if (beta != 0.f) {
+      float prev = out_dtype == 0 ? ((const float*)Cb)[ci]
+                 : out_dtype == 1 ? __half2float(((const __half*)Cb)[ci])
+                                  : __bfloat162float(((const __nv_bfloat16*)Cb)[ci]);
+      v += beta * prev;
+    }
+    if (out_dtype == 0) ((float*)Cb)[ci] = v;
+    else if (out_dtype == 1) ((__half*)Cb)[ci] = __float2half(v);
+    else ((__nv_bfloat16*)Cb)[ci] = __float2bfloat16(v);
+  }
+}
+// A copy of tinyblas_gemm_f32_tc above, line for line, but for its signature and the three operand lines. Not a shared
+// __forceinline__ body: that changed tinyblas_gemm_f32_tc's own sm_120 code, which a card-free change must not do.
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f32_tc_ptrs(
+    const float* const* Ap, const float* const* Bp, void* const* Cp,
+    int m, int n, int k, int lda, int ldb, int ldc,
+    float alpha, float beta, int opA, int opB, int out_dtype) {
+  enum { BM = 64, BN = 64, BK = 32, APAD = 8, BPAD = 8, CPAD = 8, NT = 128 };
+  __shared__ __align__(32) float As[BM][BK + APAD];
+  __shared__ __align__(32) float Bs[BK][BN + BPAD];
+  __shared__ __align__(32) float Cs[BM][BN + CPAD];
+  const float* A = Ap[blockIdx.z];
+  const float* B = Bp[blockIdx.z];
+  char* Cb = (char*)Cp[blockIdx.z];
+  const int tid = threadIdx.x, warp = tid >> 5, wm = warp >> 1, wn = warp & 1;
+  const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
+  wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc[2][2];
+  #pragma unroll
+  for (int i = 0; i < 2; i++)
+    #pragma unroll
+    for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.f);
+  for (int k0 = 0; k0 < k; k0 += BK) {
+    if (opA == 0) {
+      #pragma unroll
+      for (int i = 0; i < (BM * BK) / NT; i++) { int idx = tid + i * NT; int ki = idx / BM, mi = idx % BM; int gm = m0 + mi, gk = k0 + ki;
+        As[mi][ki] = (gm < m && gk < k) ? A[gm + (long long)gk * lda] : 0.f; }
+    } else {
+      #pragma unroll
+      for (int i = 0; i < (BM * BK) / NT; i++) { int idx = tid + i * NT; int mi = idx / BK, ki = idx % BK; int gm = m0 + mi, gk = k0 + ki;
+        As[mi][ki] = (gm < m && gk < k) ? A[gk + (long long)gm * lda] : 0.f; }
+    }
+    if (opB == 0) {
+      #pragma unroll
+      for (int i = 0; i < (BK * BN) / NT; i++) { int idx = tid + i * NT; int ni = idx / BK, ki = idx % BK; int gn = n0 + ni, gk = k0 + ki;
+        Bs[ki][ni] = (gk < k && gn < n) ? B[gk + (long long)gn * ldb] : 0.f; }
+    } else {
+      #pragma unroll
+      for (int i = 0; i < (BK * BN) / NT; i++) { int idx = tid + i * NT; int ki = idx / BN, ni = idx % BN; int gn = n0 + ni, gk = k0 + ki;
+        Bs[ki][ni] = (gk < k && gn < n) ? B[gn + (long long)gk * ldb] : 0.f; }
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int kk = 0; kk < BK; kk += 8) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a[2];
+      wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b[2];
+      #pragma unroll
+      for (int i = 0; i < 2; i++) { wmma::load_matrix_sync(a[i], &As[wm * 32 + i * 16][kk], BK + APAD);
+        #pragma unroll
+        for (int t = 0; t < a[i].num_elements; t++) a[i].x[t] = wmma::__float_to_tf32(a[i].x[t]); }
+      #pragma unroll
+      for (int j = 0; j < 2; j++) { wmma::load_matrix_sync(b[j], &Bs[kk][wn * 32 + j * 16], BN + BPAD);
+        #pragma unroll
+        for (int t = 0; t < b[j].num_elements; t++) b[j].x[t] = wmma::__float_to_tf32(b[j].x[t]); }
+      #pragma unroll
+      for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int i = 0; i < 2; i++)
+    #pragma unroll
+    for (int j = 0; j < 2; j++) wmma::store_matrix_sync(&Cs[wm * 32 + i * 16][wn * 32 + j * 16], acc[i][j], BN + CPAD, wmma::mem_row_major);
+  __syncthreads();
+  for (int idx = tid; idx < BM * BN; idx += NT) {
+    int mi = idx % BM, ni = idx / BM; int gm = m0 + mi, gn = n0 + ni;
+    if (gm >= m || gn >= n) continue;
+    long long ci = gm + (long long)gn * ldc;
+    float v = alpha * Cs[mi][ni];
+    if (beta != 0.f) {
+      float prev = out_dtype == 0 ? ((const float*)Cb)[ci]
+                 : out_dtype == 1 ? __half2float(((const __half*)Cb)[ci])
+                                  : __bfloat162float(((const __nv_bfloat16*)Cb)[ci]);
+      v += beta * prev;
+    }
+    if (out_dtype == 0) ((float*)Cb)[ci] = v;
+    else if (out_dtype == 1) ((__half*)Cb)[ci] = __float2half(v);
+    else ((__nv_bfloat16*)Cb)[ci] = __float2bfloat16(v);
+  }
+}
+extern "C" __global__ void tinyblas_trsm_rupn_f32_ptrs(const float* const* Ap, float* const* Xp, int k, int n, int lda, int ldb, float alpha) {
+  const unsigned z = blockIdx.z;
+  tinyblas_trsm_rupn_f32_body(Ap[z], Xp[z], k, n, lda, ldb, alpha);
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Bandwidth probes (2026-09-14): read-only kernels reach ~1570 GB/s on this card, every read+write copy caps at ~508.

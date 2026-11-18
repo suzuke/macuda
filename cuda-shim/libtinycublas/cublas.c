@@ -29,10 +29,10 @@ extern int tinycudart_internal_cubin(const char*, const unsigned char*, unsigned
 extern unsigned char gemm_cubin[]; extern unsigned int gemm_cubin_len;   // gemm.cubin embedded by the Makefile (xxd -i)
 static tinynv_module_t g_mod; static int g_mod_tried;
 static tinynv_kernel_t tinycublas_kernel(const char* name){   // any kernel in the embedded cubin, resolved once
-  static struct { const char* name; tinynv_kernel_t k; int tried; } cache[32];   /* 27 names since split-K; a full cache returns NULL */
+  static struct { const char* name; tinynv_kernel_t k; int tried; } cache[48];   /* 32 names since the *_ptrs kernels; a full cache returns NULL */
   if (!g_mod && !g_mod_tried){ g_mod_tried=1; const void* c; size_t n; if (tinycudart_internal_cubin("gemm", gemm_cubin, gemm_cubin_len, &c, &n) || tinynv_module_load(tinycudart_device(), c, n, &g_mod)!=TINYNV_OK){ fprintf(stderr,"[tinycublas] cubin failed to load\n"); g_mod=NULL; } }
   if (!g_mod) return NULL;
-  for (int i=0;i<32;i++){
+  for (int i=0;i<48;i++){
     if (cache[i].name && !strcmp(cache[i].name,name)) return cache[i].k;
     if (!cache[i].name){ cache[i].name=name; if (tinynv_get_kernel(g_mod,name,&cache[i].k)!=TINYNV_OK){ fprintf(stderr,"[tinycublas] %s not in the cubin\n",name); cache[i].k=NULL; } return cache[i].k; }
   }
@@ -301,10 +301,47 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t h, cublasOperation_t ta,
     const float* A,int lda,long long sA, const float* B,int ldb,long long sB, const float* beta, float* C,int ldc,long long sC, int batch){
   return cublasGemmStridedBatchedEx(h,ta,tb,m,n,k,alpha,A,CUDA_R_32F,lda,sA,B,CUDA_R_32F,ldb,sB,beta,C,CUDA_R_32F,ldc,sC,batch,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
 }
+// POINTER-ARRAY BATCHES UNDER A STREAM CAPTURE (2026-11-19). The arrays of matrix pointers live in DEVICE memory. Eagerly
+// (below, unchanged) the host reads them back, syncs, and loops the ordinary kernels. Inside a capture that is wrong twice:
+// the read and the sync go straight to libtinynv, so they run at once instead of being refused or recorded, and the
+// pointers they read are frozen into every node - while the kernel that fills the array in the same capture (ggml's
+// k_compute_batched_ptrs before cublasGemmBatchedEx for a broadcast/non-contiguous batched matmul, solve_tri's
+// get_batch_pointers before cublasStrsmBatched, out-prod's pointer kernel before cublasSgemmBatched) has only been
+// recorded, not run. ggml's graph check (ggml_cuda_graph_check_compability) vetoes only MUL_MAT_ID, so these ARE captured.
+// Under a capture the batch is instead ONE node per 65535 elements of a *_ptrs kernel (gemm.cu) that reads element
+// blockIdx.z of the arrays on the device, as cuBLAS does: the node holds the arrays' addresses, never their contents.
+// The kernel differs from the eager loop's: f16/f32 take the first-cut tensor-core kernel (the tc2 kernels need 16-byte
+// aligned operands, which the host cannot check without reading the array), bf16 the scalar one; all accumulate in f32.
+static cublasStatus_t batched_captured(struct tinyblas_handle* h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k, float alpha,
+    const void* const* Ad,int lda, const void* const* Bd,int ldb, float beta, void* const* Cd,int ldc, int batch, int in, int out){
+  int tc = (in==0 || in==1) && tc_enabled();
+  const char* kname = !tc ? "tinyblas_gemm_f32_ptrs" : in==0 ? "tinyblas_gemm_f32_tc_ptrs" : "tinyblas_gemm_f16_tc_ptrs";
+  tinynv_kernel_t kern = tinycublas_kernel(kname); if (!kern) return CUBLAS_STATUS_NOT_INITIALIZED;
+  static int said; if (!said++) fprintf(stderr,"[tinycublas] pointer-array batched GEMM under a stream capture: recorded as %s, the pointers read on the device at each replay\n",kname);
+  // param blobs match the kernels' KPARAM_INFO (read from the sm_120 cubin: 0x44 bytes for the tc ones, 0x48 for the scalar)
+  struct __attribute__((packed)) { uint64_t A,B,C; int32_t m,n,k,lda,ldb,ldc; float alpha,beta; int32_t opA,opB,out; } q;
+  struct __attribute__((packed)) { uint64_t A,B,C; int32_t m,n,k,lda,ldb,ldc; float alpha,beta; int32_t opA,opB,in,out; } p;
+  _Static_assert(sizeof(q)==0x44 && sizeof(p)==0x48, "*_ptrs param blobs must match the cubin's KPARAM_INFO");
+  q.m=p.m=m; q.n=p.n=n; q.k=p.k=k; q.lda=p.lda=lda; q.ldb=p.ldb=ldb; q.ldc=p.ldc=ldc; q.alpha=p.alpha=alpha; q.beta=p.beta=beta;
+  q.opA=p.opA=(ta==CUBLAS_OP_N?0:1); q.opB=p.opB=(tb==CUBLAS_OP_N?0:1); q.out=p.out=out; p.in=in;
+  unsigned t = tc ? 64 : 16, gx=(unsigned)((m+t-1)/t), gy=(unsigned)((n+t-1)/t), bx = tc ? 128 : 16, by = tc ? 1 : 16;
+  for (int b0=0; b0<batch; b0+=65535){
+    int nb = batch-b0 < 65535 ? batch-b0 : 65535;
+    q.A=p.A=(uint64_t)(Ad+b0); q.B=p.B=(uint64_t)(Bd+b0); q.C=p.C=(uint64_t)(Cd+b0);   // offsets into the DEVICE arrays, never read here
+    if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%d) block=(%u,%u,1) m=%d n=%d k=%d in=%d out=%d Aarray=%#llx Barray=%#llx Carray=%#llx\n",
+                                    kname,gx,gy,nb,bx,by,m,n,k,in,out,(unsigned long long)q.A,(unsigned long long)q.B,(unsigned long long)q.C);
+    tinycudart_count_launch(kname);
+    if (blas_launch(h->stream, kern, kname, gx,gy,(unsigned)nb, bx,by,1, tc ? (const void*)&q : (const void*)&p, tc ? sizeof(q) : sizeof(p))!=TINYNV_OK)
+      return CUBLAS_STATUS_EXECUTION_FAILED;
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
 // pointer-array batches: the arrays of matrix pointers live in DEVICE memory, so read them back before looping
 static cublasStatus_t batched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k, float alpha,
     const void* const* Ad,int lda, const void* const* Bd,int ldb, float beta, void* const* Cd,int ldc, int batch, int in, int out){
   if (batch<=0) return CUBLAS_STATUS_SUCCESS;
+  if (tinycudart_capturing_nv(((struct tinyblas_handle*)h)->stream))
+    return batched_captured((struct tinyblas_handle*)h,ta,tb,m,n,k,alpha,Ad,lda,Bd,ldb,beta,Cd,ldc,batch,in,out);
   void **A=malloc(sizeof(void*)*batch), **B=malloc(sizeof(void*)*batch), **C=malloc(sizeof(void*)*batch);
   tinynv_stream_t s=((struct tinyblas_handle*)h)->stream; cublasStatus_t rc=CUBLAS_STATUS_EXECUTION_FAILED;
   if (tinynv_memcpy_dtoh(s,A,(tinynv_devptr_t)Ad,sizeof(void*)*batch)==TINYNV_OK && tinynv_memcpy_dtoh(s,B,(tinynv_devptr_t)Bd,sizeof(void*)*batch)==TINYNV_OK
@@ -331,6 +368,20 @@ cublasStatus_t cublasStrsmBatched(cublasHandle_t h, cublasSideMode_t side, cubla
   tinynv_kernel_t kern=tinycublas_kernel("tinyblas_trsm_rupn_f32"); if (!kern) return CUBLAS_STATUS_NOT_INITIALIZED;
   if (batch<=0) return CUBLAS_STATUS_SUCCESS;
   tinynv_stream_t s=((struct tinyblas_handle*)h)->stream;
+  if (tinycudart_capturing_nv(s)) {   // as batched_captured: one node of the *_ptrs kernel, the pointers read on the device
+    tinynv_kernel_t kp=tinycublas_kernel("tinyblas_trsm_rupn_f32_ptrs"); if (!kp) return CUBLAS_STATUS_NOT_INITIALIZED;
+    struct __attribute__((packed)) { uint64_t A,X; int32_t k,n,lda,ldb; float alpha; } p={ 0,0, m,n,lda,ldb,*alpha };
+    _Static_assert(sizeof(p)==0x24, "trsm *_ptrs param blob must match the cubin's KPARAM_INFO");
+    unsigned gx=(unsigned)((m+255)/256);
+    for (int b0=0; b0<batch; b0+=65535){
+      int nb = batch-b0 < 65535 ? batch-b0 : 65535;
+      p.A=(uint64_t)(A+b0); p.X=(uint64_t)(B+b0);
+      if (tinycudart_trace()) fprintf(stderr,"[trace] launch tinyblas_trsm_rupn_f32_ptrs grid=(%u,1,%d) block=(256,1,1) k=%d n=%d Aarray=%#llx Xarray=%#llx\n",gx,nb,m,n,(unsigned long long)p.A,(unsigned long long)p.X);
+      tinycudart_count_launch("tinyblas_trsm_rupn_f32_ptrs");
+      if (blas_launch(s,kp, "tinyblas_trsm_rupn_f32_ptrs", gx,1,(unsigned)nb, 256,1,1, &p, sizeof(p))!=TINYNV_OK) return CUBLAS_STATUS_EXECUTION_FAILED;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+  }
   void **Ah=malloc(sizeof(void*)*batch), **Bh=malloc(sizeof(void*)*batch); cublasStatus_t rc=CUBLAS_STATUS_EXECUTION_FAILED;
   if (tinynv_memcpy_dtoh(s,Ah,(tinynv_devptr_t)A,sizeof(void*)*batch)==TINYNV_OK && tinynv_memcpy_dtoh(s,Bh,(tinynv_devptr_t)B,sizeof(void*)*batch)==TINYNV_OK && tinynv_stream_sync(s)==TINYNV_OK){
     rc=CUBLAS_STATUS_SUCCESS;
