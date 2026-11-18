@@ -237,7 +237,7 @@ fail_img:
 
 int tinynv_tensor_unlock(tinynv_gpu_t *g) {
   const char *env = getenv("TINYNV_TENSOR_UNLOCK");
-  if (!env || strcmp(env, "1") != 0) return 0;
+  if (!env) return 0;
 
   tinynv_dev_t *d = &g->dev;
   if (d->architecture != 0x17) {
@@ -245,11 +245,36 @@ int tinynv_tensor_unlock(tinynv_gpu_t *g) {
     return 0;
   }
 
-  // check if already unlocked (previous run — values persist in AON domain across FLR)
   uint32_t plm = tinynv_rd32(d, FEAT_OVR_PLM);
   uint32_t ss0 = tinynv_rd32(d, FEAT_SS0);
   uint32_t ss1 = tinynv_rd32(d, FEAT_SS1);
   fprintf(stderr, "libtinynv: tensor_unlock: PLM=%#x SS0=%#x SS1=%#x\n", plm, ss0, ss1);
+
+  // TINYNV_TENSOR_UNLOCK=0: lock — open PLM fully, write SS back to zero, restore PLM
+  if (strcmp(env, "0") == 0) {
+    if (ss0 == 0 && ss1 == 0) {
+      fprintf(stderr, "libtinynv: tensor_unlock: already locked\n");
+      return 0;
+    }
+    // try to push PLM fully open from the host so SS writes are accepted
+    tinynv_wr32(d, FEAT_OVR_PLM, 0xFFFFFFFFu);
+    uint32_t plm2 = tinynv_rd32(d, FEAT_OVR_PLM);
+    fprintf(stderr, "libtinynv: tensor_unlock: lock: PLM %#x -> %#x after host write 0xffffffff\n", plm, plm2);
+    tinynv_wr32(d, FEAT_SS0, 0);
+    tinynv_wr32(d, FEAT_SS1, 0);
+    uint32_t r0 = tinynv_rd32(d, FEAT_SS0), r1 = tinynv_rd32(d, FEAT_SS1);
+    // restore PLM
+    tinynv_wr32(d, FEAT_OVR_PLM, plm);
+    uint32_t plm3 = tinynv_rd32(d, FEAT_OVR_PLM);
+    fprintf(stderr, "libtinynv: tensor_unlock: locked SS0=%#x SS1=%#x, PLM restored %#x\n", r0, r1, plm3);
+    if (r0 != 0 || r1 != 0)
+      fprintf(stderr, "libtinynv: tensor_unlock: WARNING: lock write did not take (need power cycle to clear AON)\n");
+    return 0;
+  }
+
+  if (strcmp(env, "1") != 0) return 0;
+
+  // check if already unlocked (previous run — values persist in AON domain across FLR)
   if (ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK) {
     fprintf(stderr, "libtinynv: tensor_unlock: speed-select already at full speed (AON persisted), skipping exploit\n");
     return 0;
