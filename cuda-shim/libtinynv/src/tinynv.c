@@ -422,7 +422,11 @@ tinynv_status_t tinynv_device_get(tinynv_device_t *out, int ordinal) {
 }
 
 tinynv_status_t tinynv_device_props(tinynv_device_t d, tinynv_device_props_t *p) {
+  if (!p) return TINYNV_ERR_INVALID;
   memset(p, 0, sizeof(*p));
+  // No device at all (the runtime's init failed and handed back NULL) is refused, never dereferenced: it used to crash
+  // every caller that asked for properties after a failed init.
+  if (!d) return tinynv_fail("no device to describe (driver init failed)"), TINYNV_ERR_INVALID;
   p->warp_size = 32;
   p->max_threads_per_block = 1024;
   p->max_shared_per_block = 48 * 1024;   // what a kernel gets without asking for more, as real cuda reports it

@@ -73,6 +73,8 @@ static int optin_smem_for(int cc_major, int cc_minor) {
 }
 static tinynv_device_props_t props(void) {
   tinynv_device_props_t p; memset(&p, 0, sizeof p);
+  // No device: init already said so loudly and ggml sees zero devices. Answer an empty card without claiming one exists.
+  if (!tinycudart_device()) return p;
   tinynv_status_t rc = tinynv_device_props(tinycudart_device(), &p);
   static int announced, complained;
   const char *env = getenv("TINYCUDART_NULL_PROFILE");

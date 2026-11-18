@@ -34,6 +34,11 @@ int main(void) {
   CHECK(st == TINYNV_ERR_NODEV && strstr(tinynv_last_error(), "null device"), "mem_info on the null device: status %d: %s",
         (int)st, tinynv_last_error());
   CHECK(fr == 7 && tot == 7, "a refused mem_info must not write (wrote %llu/%llu)", (unsigned long long)fr, (unsigned long long)tot);
+  { tinynv_device_props_t pr; memset(&pr, 0x5a, sizeof pr);
+    CHECK(tinynv_device_props(NULL, &pr) == TINYNV_ERR_INVALID && strstr(tinynv_last_error(), "no device"),
+          "props of a NULL device is refused by name: %s", tinynv_last_error());
+    CHECK(pr.total_mem == 0 && pr.cc_major == 0, "a refused props leaves a zeroed answer");
+    CHECK(tinynv_device_props(dev, NULL) == TINYNV_ERR_INVALID, "a NULL answer pointer is refused"); }
   CHECK(tinynv_event_destroy(a) == TINYNV_OK && tinynv_event_destroy(b) == TINYNV_OK, "destroy");
   CHECK(tinynv_event_destroy(NULL) != TINYNV_OK, "destroying NULL is refused");
   printf(fails ? "%d of %d checks failed\n" : "events and mem_info on the null device: all %d checks passed\n",
