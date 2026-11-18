@@ -7,7 +7,8 @@
 #   sh install.sh build     skip the prerequisite checks and build (a second run, after check passed once)
 #   YES=1 sh install.sh     do not ask; assume yes to every install prompt
 #   ARCH=sm_89 sh install.sh build   build for an RTX 40 (Ada) card instead, beside the default Blackwell tree; the
-#                           binaries land in cuda-shim/build/bin-sm_89 (see setup.sh for ARCH)
+#                           binaries land in cuda-shim/build/bin-sm_89 (see setup.sh for ARCH). Unset, ARCH is
+#                           detected from the connected card's PCI id (sm_120a when none is recognised)
 #
 # WHAT THIS DOES NOT DO, because it cannot: approve the DriverKit system extension (macOS asks you, in System Settings),
 # plug the card in, or replug it when it wedges. Those are yours. Everything else is here.
@@ -146,6 +147,10 @@ fi
 # ---------------------------------------------------------------- build
 head_ "Building (llama.cpp ~5 min; the CUDA half ~3-5 min once the image is here, plus a 4 GB pull the first time)"
 set -e
+# One ARCH for every stage below, resolved once (setup.sh detects it from the card when unset)
+want=${ARCH:-}
+ARCH=$(sh setup.sh arch) || { echo "== stopping: ARCH=$want is not one this tree builds (sm_86, sm_89, sm_120a)"; exit 2; }; export ARCH
+echo "== target architecture: $ARCH (binaries in cuda-shim/build/bin$([ "$ARCH" = sm_120a ] || echo "-$ARCH"))"
 echo "== 1/6 headers and firmware (NVIDIA's open-gpu-kernel-modules headers, GSP firmware, CUDA headers)"
 sh setup.sh deps
 echo "== 2/6 llama.cpp at the pinned commit, CPU-only static tree"

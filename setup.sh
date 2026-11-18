@@ -29,12 +29,23 @@ LLAMA_FIX=2f539596c6e9a977e91b6bc6344650422c6bc3b0    # 2f53959 (#28882): ggml-c
 SD_URL=https://github.com/leejet/stable-diffusion.cpp.git
 SD_COMMIT=59c23bce0d82be3a922023ab811194f05b3e2faa      # 59c23bc
 JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
-ARCH=${ARCH:-sm_120a}
+# Unset, ARCH comes from the connected card's PCI device id (tools/pci-preflight.py --arch; read-only, from IOKit), so
+# a 3060 builds sm_86 without being told. No card, several cards or an unknown one fall back to the default, sm_120a,
+# and say so. A set ARCH always wins. Messages go to stderr: `sh setup.sh arch` prints the chosen ARCH alone.
+if [ -z "${ARCH:-}" ]; then
+  if ARCH=$(ioreg -a -r -c IOPCIDevice 2>/dev/null | python3 "$R/tools/pci-preflight.py" --arch 2>/dev/null) && [ -n "$ARCH" ]; then
+    echo "ARCH=$ARCH: detected from the connected NVIDIA card (set ARCH to override)" >&2
+  else
+    why=$(ioreg -a -r -c IOPCIDevice 2>/dev/null | python3 "$R/tools/pci-preflight.py" --arch 2>&1 >/dev/null) || true
+    ARCH=sm_120a
+    echo "ARCH not set and no recognised card to detect it from (${why:-no answer}): building the default, sm_120a (Blackwell); set ARCH=sm_86 or sm_89 for an RTX 30 or 40" >&2
+  fi
+fi
 case "$ARCH" in
   sm_120a) SUF=""; CUBIN_ARCH="" ;;                          # the tree's own default: nothing moves
   sm_8[0-9]) SUF="-$ARCH"; CUBIN_ARCH=sm_86 ;;               # Ampere and Ada: sm_89 runs the sm_86 kernels as they are
   sm_12[0-9]*) SUF="-$ARCH"; CUBIN_ARCH=sm_120 ;;
-  *) echo "ARCH=$ARCH: no committed copy/GEMM kernels for that family (have sm_86 and sm_120)"; exit 2 ;;
+  *) echo "ARCH=$ARCH: no committed copy/GEMM kernels for that family (have sm_86 and sm_120)" >&2; exit 2 ;;
 esac
 export ARCH
 step=${1:-all}
@@ -153,5 +164,6 @@ split() {
 case "$step" in
   all)   deps; llama; sd; shim; cuda; link ;;
   deps)  deps ;; llama) llama ;; sd) sd ;; shim) shim ;; cuda) cuda ;; link) link ;; split) split ;;
-  *) echo "usage: sh setup.sh [all|deps|llama|sd|shim|cuda|link|split]"; exit 2 ;;
+  arch)  echo "$ARCH" ;;   # the ARCH this run resolved to (install.sh fixes it once for all its stages)
+  *) echo "usage: sh setup.sh [all|deps|llama|sd|shim|cuda|link|split|arch]"; exit 2 ;;
 esac

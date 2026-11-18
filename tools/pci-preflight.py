@@ -31,10 +31,30 @@ def inspect(nodes):
     return f'0x{devid:04x} x{width} {rate} GT/s {"up" if valid and resourced else "unknown"}', node
 
 
+# PCI device id -> the ARCH setup.sh builds for. Ranges of NVIDIA's consumer and workstation families this driver
+# boots; the data-centre chips in the gaps (GH100 0x23xx, GB100 0x29xx) and anything newer are refused rather than
+# guessed. A wrong answer is still caught at run time: libtinynv refuses a cubin whose sm the card cannot run.
+ARCH_RANGES = (
+    (0x2200, 0x22ff, 'sm_86'),    # Ampere GA102
+    (0x2400, 0x25ff, 'sm_86'),    # Ampere GA103/GA104/GA106/GA107
+    (0x2600, 0x28ff, 'sm_89'),    # Ada AD102-AD107
+    (0x2b00, 0x2dff, 'sm_120a'),  # Blackwell GB202-GB207
+)
+
+
+def arch_for(devid):
+    for lo, hi, arch in ARCH_RANGES:
+        if lo <= devid <= hi:
+            return arch
+    raise ValueError(f'device 0x{devid:04x} is not a family this driver builds for; set ARCH by hand')
+
+
 if __name__ == '__main__':
     try:
         result, node = inspect(plistlib.loads(sys.stdin.buffer.read()))
-        if '--nub' in sys.argv:
+        if '--arch' in sys.argv:
+            print(arch_for(int.from_bytes(node['device-id'], 'little')))
+        elif '--nub' in sys.argv:
             if node.get('IOPCIResourced') is True:
                 print('"IOPCIResourced" = Yes')
             print('"IODEXTMatchCount" =', node.get('IODEXTMatchCount', 0))

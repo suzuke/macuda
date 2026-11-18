@@ -21,4 +21,12 @@ class DetectionTests(unittest.TestCase):
     def test_audio_excluded(self):
         n=self.node(); n['class-code']=bytes.fromhex('00030400')
         with self.assertRaises(ValueError): m.inspect([n])
+class ArchTests(unittest.TestCase):
+    def test_known_cards(self):
+        for devid, arch in ((0x2544, 'sm_86'), (0x2504, 'sm_86'), (0x2204, 'sm_86'), (0x2684, 'sm_89'),
+                            (0x2b85, 'sm_120a'), (0x2c02, 'sm_120a'), (0x2d04, 'sm_120a')):
+            self.assertEqual(m.arch_for(devid), arch, hex(devid))
+    def test_refused(self):
+        for devid in (0x2330, 0x2901, 0x1e04, 0x2e12, 0x20b0):
+            with self.assertRaises(ValueError): m.arch_for(devid)
 unittest.main()

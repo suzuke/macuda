@@ -144,7 +144,7 @@ Speculative throughput depends on prompt content and draft acceptance. Single-st
 Each stage can be run separately from the repository root:
 
 ```sh
-export ARCH=sm_89               # an Ada card (RTX 40); sm_86 for Ampere; leave unset for Blackwell (sm_120a)
+export ARCH=sm_89               # an Ada card (RTX 40); sm_86 for Ampere; sm_120a for Blackwell. Unset: detected from the connected card
 sh setup.sh deps
 sh setup.sh llama
 sh setup.sh sd

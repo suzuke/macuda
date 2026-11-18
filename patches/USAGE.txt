@@ -7,8 +7,13 @@ and runs Python fixtures. It does not access the GPU, start Docker, or build
 llama.cpp. No downloaded firmware is required for these tests.
 
 The FWSEC signature is selected automatically from the card's fuse version
-and VBIOS version mask. GPU build architecture is still explicit: sm_86 for
-the tested RTX 3060. This branch does not auto-detect build architectures.
+and VBIOS version mask. With ARCH unset, setup.sh and install.sh pick the
+build architecture from the connected card's PCI device id (sm_86 for the
+tested RTX 3060; `sh setup.sh arch` prints the choice). No card or an
+unrecognised one falls back to sm_120a and says why; a set ARCH always wins.
+At run time libtinynv refuses a cubin the card cannot run (for example
+sm_120 code on GA106), naming both architectures; TINYNV_ARCH_CHECK=0
+overrides for diagnostics. Each build still targets one architecture.
 
 When the Mac is available for compilation and GPU work:
   ARCH=sm_86 sh install.sh
