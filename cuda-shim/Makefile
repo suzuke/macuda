@@ -117,7 +117,15 @@ $(BUILD)/ce_hazard: test/ce_hazard.c $(CUDART) $(CUBLAS) $(NV_LIB)
 $(BUILD)/splitk_card: test/splitk_card.c $(NV_LIB)
 	$(CC) $(CFLAGS) $< $(NV_LIB) -o $@
 
-test: all coverage
+# libtinynv's suite reads these as fixtures and stops at the first one missing; they are build output (.gitignore), made
+# through the same nvcc route as ggml-cuda (a CUDA container, or TINYCC_HOST) and only when absent or older than the source
+SPIKE_CUBINS := spike/vecadd.sm86.cubin spike/vecadd.sm90.cubin spike/vecadd.sm120.cubin
+spike/vecadd.sm%.cubin: spike/vecadd.cu spike/tinycudart_compat.h
+	sh build/spike-cubin.sh $< sm_$* $@
+.PHONY: spike-cubins
+spike-cubins: $(SPIKE_CUBINS)
+
+test: all coverage $(SPIKE_CUBINS)
 	@$(MAKE) --no-print-directory -C libtinynv test BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
 	$(BUILD)/link_smoke
 	env -u TINYNV_SOCKET -u TINYNV_PCI $(BUILD)/cublas_contract
