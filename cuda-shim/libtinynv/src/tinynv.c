@@ -17,6 +17,7 @@
 #include "mmu.h"
 #include "nv_regs.h"
 #include "fw_layout.h"
+#include "arch_compat.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -373,6 +374,23 @@ static int booted(tinynv_device_t d) {
   return rc;
 }
 
+// Whether this module's machine code can run on the booted card, asked once, before its image first goes across.
+// Refused by name with both architectures; TINYNV_ARCH_CHECK=0 lets a diagnostic session through with a warning. The
+// caller holds g_lock and the card has booted, so BOOT_42's architecture is known (dev.c, early init).
+static int module_fits_card(tinynv_device_t d, tinynv_module_t m) {
+  uint32_t cc = tinynv_arch_cc(d->gpu.dev.architecture), sm = m->cubin.sm_arch;
+  if (tinynv_sm_fits(sm, cc)) return 0;
+  const char *v = getenv("TINYNV_ARCH_CHECK");
+  if (v && *v == '0') {
+    fprintf(stderr, "libtinynv: WARNING sm_%u code on %s (compute %u.%u) - TINYNV_ARCH_CHECK=0, loading anyway\n", sm,
+            d->gpu.dev.chip_name, cc / 10, cc % 10);
+    return 0;
+  }
+  return tinynv_fail("this binary carries sm_%u code, which cannot run on %s (compute %u.%u): rebuild for the card "
+                     "(ARCH=%s), or select the matching build directory", sm, d->gpu.dev.chip_name, cc / 10, cc % 10,
+                     cc == 120 ? "sm_120a" : cc == 89 ? "sm_89" : cc == 86 ? "sm_86" : "?");
+}
+
 static tinynv_alloc_t *find_alloc(tinynv_device_t d, uint64_t va) {
   for (int i = 0; i < d->nallocs; i++) if (d->allocs[i].va == va) return &d->allocs[i];
   return NULL;
@@ -523,7 +541,7 @@ tinynv_status_t tinynv_get_global(tinynv_module_t m, const char *name, tinynv_de
     if (booted(d)) return TINYNV_ERR_DRIVER;
     pthread_mutex_lock(&g_lock);
     if (!m->is_loaded) {
-      if (tinynv_exec_load(&d->exec, &m->cubin, m->cubin.kernels[0].name, &m->loaded)) {
+      if (module_fits_card(d, m) || tinynv_exec_load(&d->exec, &m->cubin, m->cubin.kernels[0].name, &m->loaded)) {
         pthread_mutex_unlock(&g_lock);
         return TINYNV_ERR_DRIVER;
       }
@@ -1254,7 +1272,7 @@ tinynv_status_t tinynv_launch(tinynv_stream_t s, tinynv_kernel_t k, unsigned gx,
     // The module's image goes across once, on the first launch out of it rather than at load: a ggml cubin is megabytes
     // of code and a run touches a fraction of it, so loading a module should not be a transfer.
     if (!k->mod->is_loaded) {
-      if (tinynv_exec_load(&dev->exec, &k->mod->cubin, d->name, &k->mod->loaded)) {
+      if (module_fits_card(dev, k->mod) || tinynv_exec_load(&dev->exec, &k->mod->cubin, d->name, &k->mod->loaded)) {
         pthread_mutex_unlock(&g_lock);
         return TINYNV_ERR_DRIVER;
       }
