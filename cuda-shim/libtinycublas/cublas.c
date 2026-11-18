@@ -69,13 +69,20 @@ static const char* const tc2k_names[2][4]={
 // and the expected image with TINYCUBLAS_SPLITK=0), while test_splitk passes on a 3090 under NVIDIA's own driver - so the
 // kernel is not the suspect, the way this driver runs it on Ampere is. Until that is found, sm_8x takes the unsplit
 // kernels it took before split-K existed. TINYCUBLAS_SPLITK=1 forces it on anywhere (to reproduce), =0 off anywhere.
-// The null device reports cc_major 0 and keeps the default ON, which is what test/splitk_check.sh traces.
+// The null device (cc_major 0, cudart_api.c:60; or no device handle at all) keeps the default ON, which is what
+// test/splitk_check.sh traces - nothing executes there. A device whose properties cannot be read is treated as unknown
+// and gets OFF: the unsplit kernels are correct everywhere, the split ones are only known good on sm_120. Decided once
+// per process, from the one device this runtime drives.
 static int splitk_enabled(void){
   static int v=-1;
   if(v<0){
     const char* e=getenv("TINYCUBLAS_SPLITK");
     if (e&&*e) v=(*e!='0');
-    else { tinynv_device_props_t p; v = !(tinynv_device_props(tinycudart_device(), &p)==TINYNV_OK && p.cc_major==8); }
+    else {
+      tinynv_device_t d=tinycudart_device(); tinynv_device_props_t p;
+      if (!d) v=1;
+      else v = tinynv_device_props(d, &p)==TINYNV_OK && p.cc_major!=8;
+    }
   }
   return v;
 }
@@ -180,7 +187,7 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
                      && offsetof(__typeof__(q2), S) == 0x68 && sizeof(q2) == 0x6c, "tc2k param blob must match the cubin's KPARAM_INFO");
       unsigned gx=(unsigned)((m+63)/64), gy=(unsigned)((n+63)/64), gz=(unsigned)(batch*S);
       const char* kname=tc2k_names[in_dtype==2?1:0][oa*2+ob];
-      static int said; if (!said++) fprintf(stderr,"[tinycublas] split-K ON (TINYCUBLAS_SPLITK=1): first %s m=%d n=%d k=%d batch=%d S=%d grid=(%u,%u,%u)\n",kname,m,n,k,batch,S,gx,gy,gz);
+      static int said; if (!said++) fprintf(stderr,"[tinycublas] split-K ON (default off on sm_8x; TINYCUBLAS_SPLITK=0/1 forces): first %s m=%d n=%d k=%d batch=%d S=%d grid=(%u,%u,%u)\n",kname,m,n,k,batch,S,gx,gy,gz);
       if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%u) block=(128,1,1) m=%d n=%d k=%d out=%d S=%d\n",kname,gx,gy,gz,m,n,k,out_dtype,S);
       tinycudart_count_launch(kname); double t0=tinycudart_now_ns();
       tinynv_status_t st = tinynv_launch(h->stream, kk, gx,gy,gz, 128,1,1, 0, &q2, sizeof(q2));
