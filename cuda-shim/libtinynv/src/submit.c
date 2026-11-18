@@ -310,6 +310,7 @@ uint64_t tinynv_ring_entry_read(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t slo
 }
 
 int tinynv_submit_stage(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, uint32_t dwords) {
+  if (g->lost) return tinynv_gpu_lost_fail(g);   // a lost gpu is handed nothing more (lost.c)
   if (!q->entries) return tinynv_fail("this channel has no ring");
   if (g->nstaged == (int)(sizeof g->staged / sizeof g->staged[0]))
     return tinynv_fail("more batches staged than there is room to announce (%d)", g->nstaged);
@@ -330,6 +331,7 @@ int tinynv_submit_stage(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, 
 }
 
 int tinynv_submit_ring_send(tinynv_gpu_t *g) {
+  if (g->lost) { g->nstaged = 0; return tinynv_gpu_lost_fail(g); }
   if (!g->nstaged) return 0;
   // One in flight at a time: the socket carries one conversation, and an announcement owed must be paid first.
   if (g->ring_pending && tinynv_submit_ring_complete(g)) return -1;
@@ -366,24 +368,36 @@ int tinynv_submit_ring_send(tinynv_gpu_t *g) {
 }
 
 int tinynv_submit_ring_complete(tinynv_gpu_t *g) {
-  if (!g->ring_pending) return 0;
+  if (!g->ring_pending) return g->lost ? tinynv_gpu_lost_fail(g) : 0;
+  // The reply is taken even from a lost gpu: with the transport alive (a lost window) it is still on the socket.
   uint32_t want = g->ring_want, got = nv_rd32_recv(&g->dev.vram);
+  // A write pointer is a ring index, so all ones is not a value it can hold: find out why it read that, before any
+  // doorbell rings on top of it (lost.c). A loss latched here or earlier rings nothing - on 2026-11-18 these doorbells
+  // went on into a dead connection for half a minute.
+  if (got == 0xffffffffu && got != want) tinynv_gpu_lose(g, "the write-pointer read before the doorbell", 0);
   if (got != want && g->submit_checked < 4) {
     g->submit_checked++;
     // Which failure this is, before anyone chases it: on 2026-11-18 "4294967295" here was the TinyGPU backend's
-    // sentinel for a server that had gone, and it read as a card returning all ones. Only the wording differs.
+    // sentinel for a server that had gone, and it read as a card returning all ones. Only the wording differs. A card
+    // or window loss has just said so itself, in the line the latch prints.
     tinynv_pci_t *pci = g->dev.pci;
     if (pci && pci->transport_dead && pci->transport_dead(pci))
       fprintf(stderr, "tinynv: the write pointer read back as %u where %u was just written - not from the device: the "
               "tinygpu server connection is lost, so this is the transport's failure value and neither this read nor "
               "the doorbells reach the card\n", got, want);
-    else
+    else if (!g->lost)
       fprintf(stderr, "tinynv: the write pointer read back as %u where %u was just written - the read before the doorbell "
               "is not reaching the device, so it is not ordering anything the engine sees\n", got, want);
   } else if (got == want && !g->submit_checked) {
     g->submit_checked = 1;
     fprintf(stderr, "tinynv: the write pointer reads back as written, so the read before the doorbell reaches the "
             "device\n");
+  }
+  if (g->lost) {
+    g->ring_n = 0;
+    g->ring_pending = 0;
+    g->nstaged = 0;
+    return tinynv_gpu_lost_fail(g);
   }
   // one doorbell per queue, however many of its batches were staged: the doorbell says "look", not "how many"
   for (int i = 0; i < g->ring_n; i++) {

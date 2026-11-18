@@ -110,6 +110,10 @@ static const char *const PROF_NAME[8] = {"a launch, all of it", "a flush, all of
 // exactly one writer each - which is what turns the wrap guard below from a partial check into a sufficient one.
 enum { AR_DESC, AR_CMD };
 
+// A wait that has gone on this long asks whether the gpu is still there (tinynv_gpu_probe), and then again this often.
+#define PROBE_AFTER_S 0.25
+#define PROBE_EVERY_S 0.25
+
 static double now(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
@@ -168,9 +172,14 @@ static int ce_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
   if (value > ex->ce_reserved) value = ex->ce_reserved;
   if (!value || ce_read(ex) >= value) return 0;
   if (tinynv_submit_ring(ex->g)) return -1;
-  double deadline = now() + seconds;
+  double t0 = now(), deadline = t0 + seconds, next_probe = t0 + PROBE_AFTER_S;
   while (ce_read(ex) < value) {
-    if (now() > deadline) {
+    double t = now();
+    if (t >= next_probe) {   // past 250 ms only: a wait that ends sooner issues nothing extra (lost.c)
+      next_probe = t + PROBE_EVERY_S;
+      if (tinynv_gpu_probe(ex->g, "a copy-channel wait's health check")) return -1;
+    }
+    if (t > deadline) {
       int bad = tinynv_gsp_poll(ex->g);
       uint32_t get = 0, put = 0;
       uint64_t pub = 0;
@@ -561,7 +570,7 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
   PROF_START(ex);
   uint64_t was = ex->prof_ns[PROF_WAIT];
   int spun = 0;
-  double deadline = now() + seconds;
+  double t0 = now(), deadline = t0 + seconds, next_probe = t0 + PROBE_AFTER_S;
   for (;;) {
     // `done` decides; `v` is only for saying where things stand, and with a slot per queue there is no single number
     // for that any more. The compute slot is the one worth naming, because that is where the launches report.
@@ -763,7 +772,14 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
     }
     spun = 1;
 
-    if (now() > deadline) {
+    // The health check (lost.c). The semaphore is host memory, so this spin touches nothing else: without it a server
+    // that has gone, or a card whose windows were cleared, is found only by the timeout - 30 s later, on 2026-11-18.
+    double t = now();
+    if (t >= next_probe) {
+      next_probe = t + PROBE_EVERY_S;
+      if (tinynv_gpu_probe(ex->g, "a wait's health check")) return -1;
+    }
+    if (t > deadline) {
       // Before giving up, ask the firmware. An engine that faults says so on the status queue, and the message names
       // what it faulted on; without this the driver reports "it did not finish" and knows nothing else.
       int bad = tinynv_gsp_poll(ex->g);
@@ -1935,8 +1951,11 @@ int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
     if (ex->graph_pace && k >= 2) {
       double t0 = now();
       if (tinynv_submit_ring(ex->g)) return -1;   // what is staged must be announced before anything is waited for
+      double next_probe = t0 + PROBE_AFTER_S;
       while (sem_read_slot(ex, 0) < at0 + (uint64_t)k - 2) {
-        if (now() - t0 > 2.0) return tinynv_fail("the resident token's chain %d did not release in 2 s", k - 2);
+        double t = now();
+        if (t >= next_probe) { next_probe = t + PROBE_EVERY_S; if (tinynv_gpu_probe(ex->g, "a paced chain's health check")) return -1; }
+        if (t - t0 > 2.0) return tinynv_fail("the resident token's chain %d did not release in 2 s", k - 2);
       }
     }
     uint32_t want = 48u + (k == 0 ? (8u + qdw) * (uint32_t)r->nchains : 0u) + (ex->profile ? 16u : 0u);

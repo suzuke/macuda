@@ -31,7 +31,25 @@ struct tinynv_gpu {
   } tensor;
   tinynv_flcn_t flcn;
   tinynv_gsp_t gsp;
+  // THE GPU IS LOST, latched and never cleared (2026-11-18 DART panic, M2): one of TINYNV_LOST_*. From here nothing is
+  // staged, no doorbell is rung, no rpc is sent to GSP-RM, and every wait fails at once. See lost.c.
+  int lost;
 };
+
+enum { TINYNV_LOST_SERVER = 1, TINYNV_LOST_CARD, TINYNV_LOST_WINDOW };
+// An impossible value was read: find out why, and latch the loss if it is one. Returns the TINYNV_LOST_* found (and
+// then says it once on stderr and, for a lost server, starts the emergency bus-master clear), or 0 when the card
+// still answers. b0_all_ones: the caller has just read NV_PMC_BOOT_0 as all ones, so it is not read again.
+int tinynv_gpu_lose(tinynv_gpu_t *g, const char *found_by, int b0_all_ones);
+// The health check of a long wait: free when the transport has already latched its loss, otherwise one BAR0 read.
+// The waits call it only after 250 ms and then every 250 ms, so a wait that ends sooner costs nothing extra. -1 = lost.
+int tinynv_gpu_probe(tinynv_gpu_t *g, const char *found_by);
+// The refusal every entry point returns once the loss is latched.
+int tinynv_gpu_lost_fail(tinynv_gpu_t *g);
+// Latch a server loss the transport has already seen, at no cost (no bus operation). Returns g->lost.
+int tinynv_gpu_note_transport(tinynv_gpu_t *g, const char *found_by);
+// The emergency bus-master clear through the backend (M3), if it has one; wait_s as tinynv_pci_t.rescue.
+void tinynv_gpu_rescue(tinynv_gpu_t *g, double wait_s);
 
 // Identify the chip, put it in a known state, and carve up its memory. Reads and writes registers; runs no firmware.
 int tinynv_gpu_open(tinynv_gpu_t *g, tinynv_pci_t *pci);

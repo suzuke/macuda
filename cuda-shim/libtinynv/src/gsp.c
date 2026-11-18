@@ -195,6 +195,7 @@ static uint32_t rpc_checksum(const uint8_t *data, size_t n) {
 // Put one record in the ring and ring the doorbell. A record that runs off the end of the ring wraps to the start, which
 // is why the copy is in two parts.
 static int rpc_send_record(tinynv_gpu_t *g, uint32_t func, const void *payload, size_t len) {
+  if (g->lost) return tinynv_gpu_lost_fail(g);   // no record and no doorbell for a lost gpu (lost.c)
   tinynv_gsp_t *gsp = &g->gsp;
   tinynv_rpcq_t *q = &gsp->cmd_q;
   size_t hdrs = sizeof(tinynv_msg_element_t) + sizeof(tinynv_msg_header_t);
@@ -423,6 +424,9 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
   // back within a quarter second is less time for anything written through the window to be lost.
   double next_cfg = start + 0.25;
   do {
+    // Free checks only (lost.c): the latch, and the transport's own. This loop runs on the recorded boot, where any
+    // new bus operation would be one the recording never made.
+    if (g->lost || tinynv_gpu_note_transport(g, "an rpc wait")) return tinynv_gpu_lost_fail(g);
     if (rpc_drain(g, want, &seen, reply, reply_len)) return -1;
     if (seen) {
       if (report && tinynv_now_s() - start > 5.0)

@@ -103,6 +103,10 @@ int tinynv_gpu_boot_firmware(tinynv_gpu_t *g) {
 // firmware told, halted and its region torn down. TINYNV_UNLOAD=0 restores the old behaviour, for comparison.
 int tinynv_gpu_unload(tinynv_gpu_t *g) {
   if (!g->gsp.up) return 0;         // nothing came up, so there is nothing to tell
+  if (g->lost) {                    // nothing can reach it: the notice would only wait out its timeouts (lost.c)
+    fprintf(stderr, "libtinynv: the gpu is lost, so gsp-rm is not told to unload\n");
+    return -1;
+  }
   if (!g->dev.pci->live) return 0;  // a recording ends where it ends
   const char *knob = getenv("TINYNV_UNLOAD");
   // The chain-of-trust path has no booter_unload, and its reset-on-open works on the 5090 in the AORUS box, so it stays

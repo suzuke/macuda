@@ -61,7 +61,11 @@ static void wp_check(int dead, int errfd) {
   g.dev.vram = (tinynv_mmio_t){.rd32_recv = fake_recv};
   g.ring_pending = 1; g.ring_want = 7; g_dead = dead;
   ftruncate(errfd, 0); lseek(errfd, 0, SEEK_SET);
-  CHECK(tinynv_submit_ring_complete(&g) == 0, "ring complete");
+  // With the transport dead the gpu is latched lost (src/lost.c) and the announcement refused - nothing is rung into a
+  // connection that is gone. Alive, on this non-live fake nothing can be classified, and it completes as before.
+  int rc = tinynv_submit_ring_complete(&g);
+  CHECK(dead ? rc != 0 && g.lost == TINYNV_LOST_SERVER : rc == 0 && !g.lost, "ring complete returned %d with the transport %s (lost %d)",
+        rc, dead ? "dead" : "alive", g.lost);
   fflush(stderr);
   char log[2048] = {0};
   pread(errfd, log, sizeof(log) - 1, 0);

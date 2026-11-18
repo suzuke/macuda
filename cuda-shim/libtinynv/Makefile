@@ -34,6 +34,9 @@ NVINC   := -I$(NVSRC)/src/nvidia/arch/nvalloc/common/inc -I$(NVSRC)/src/common/s
            -I$(NVSRC)/src/nvidia/generated   # rmconfig.h, which gsp_fw_heap.h (the firmware heap formula test_headers pins) includes
 BUILD   := build
 SKIPS    = $(BUILD)/test-skips.txt   # one line per SKIP of the last `make test`; the top level counts it
+# where the library finds the emergency bus-master clear (tools/tinynv_bmclear.c, built beside it): absolute, as the
+# firmware directory is, because the process that needs it is somebody else's program in somebody else's directory
+CFLAGS  += -DTINYNV_BMCLEAR_DEFAULT=\"$(abspath $(BUILD))/tinynv-bmclear\"
 # track header dependencies. without this a change to a struct in a header rebuilds only the .c files that were edited,
 # and the rest of the library keeps the old layout: the two halves then disagree about where a field is, which shows up
 # as a value that was set a moment ago reading back as zero. cost me a debugging round; never again.
@@ -66,7 +69,7 @@ $(BUILD)/src/build_id.o: always
 
 UNAME := $(shell uname -s)
 SRCS  := src/err.c src/build_id.c src/qmd.c src/image.c src/arena.c src/exec.c src/cubin.c src/sha256.c src/fw.c src/dev.c src/mmu.c src/tlsf.c src/pt.c src/gpu.c src/gsp.c src/flcn.c src/vbios.c src/submit.c \
-         src/tensor_unlock.c src/tinynv.c src/pci_replay.c src/pci_tinygpu.c
+         src/tensor_unlock.c src/tinynv.c src/pci_replay.c src/pci_tinygpu.c src/lost.c
 ifeq ($(UNAME),Linux)
 SRCS  += src/pci_sysfs.c
 endif
@@ -75,7 +78,7 @@ OBJS  := $(SRCS:%.c=$(BUILD)/%.o)
 .PHONY: all test clean
 # The smi tool is part of a build, not of a test run. It was reachable only through `make test`, which meant the one
 # command anybody would run to get it did not produce it and it sat in a directory nobody had reason to look in.
-all: $(BUILD)/libtinynv.a $(BUILD)/tinynv-smi
+all: $(BUILD)/libtinynv.a $(BUILD)/tinynv-smi $(BUILD)/tinynv-bmclear
 
 $(BUILD)/libtinynv.a: $(OBJS)
 	@mkdir -p $(@D)
@@ -91,6 +94,12 @@ $(BUILD)/%.o: %.c
 $(BUILD)/tinynv-smi: tools/tinynv_smi.c $(BUILD)/libtinynv.a
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Isrc -o $@ tools/tinynv_smi.c $(BUILD)/libtinynv.a
+
+# The emergency bus-master clear a client starts when it has lost its TinyGPU server (tools/tinynv_bmclear.c). Built
+# with the library, which finds it at this absolute path (TINYNV_BMCLEAR_HELPER overrides it).
+$(BUILD)/tinynv-bmclear: tools/tinynv_bmclear.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ $<
 
 $(BUILD)/test_headers: test/test_headers.c src/nv_structs.h
 	@mkdir -p $(@D)
@@ -126,13 +135,18 @@ $(BUILD)/test_delta: test/test_delta.c $(BUILD)/libtinynv.a
 
 # The teardown witness compiles src/tinynv.c itself - the functions under test are static by design - against stubs
 # it defines, so it links err.o ALONE: the archive would duplicate every symbol the include just compiled.
-$(BUILD)/test_teardown_term: test/test_teardown_term.c $(BUILD)/src/err.o
+# lost.o beside it: the lost-gpu latch the teardown consults (src/lost.c), which needs nothing but err.o and the pci vtable.
+$(BUILD)/test_teardown_term: test/test_teardown_term.c $(BUILD)/src/err.o $(BUILD)/src/lost.o
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc test/test_teardown_term.c $(BUILD)/src/err.o -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc test/test_teardown_term.c $(BUILD)/src/err.o $(BUILD)/src/lost.o -o $@
 
-$(BUILD)/test_teardown_skip: test/test_teardown_skip.c $(BUILD)/src/err.o
+$(BUILD)/test_teardown_skip: test/test_teardown_skip.c $(BUILD)/src/err.o $(BUILD)/src/lost.o
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc test/test_teardown_skip.c $(BUILD)/src/err.o -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc test/test_teardown_skip.c $(BUILD)/src/err.o $(BUILD)/src/lost.o -o $@
+
+$(BUILD)/test_teardown_lost: test/test_teardown_lost.c $(BUILD)/src/err.o $(BUILD)/src/lost.o
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc test/test_teardown_lost.c $(BUILD)/src/err.o $(BUILD)/src/lost.o -o $@
 
 # The real exec.o against recording stand-ins for the command encoders and submit (defined in the test itself) and
 # stops for everything else it could reach (fake_exec_unreachable.c): the archive then supplies exec.o and err.o only.
@@ -175,7 +189,10 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # already wins over the environment, so this changes nothing about how they run - it removes the possibility that a
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
-test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+# and no emergency bus-master clear (src/pci_tinygpu.c: tg_rescue) from a test that latches a lost server: the arms
+# that exercise it turn it on themselves, with the helper, the socket and the app all pointed at stand-ins.
+test: export TINYNV_EMERGENCY_BM := 0
+test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_lost $(BUILD)/test_bmclear $(BUILD)/tinynv-bmclear $(BUILD)/test_teardown_lost $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@mkdir -p $(BUILD); : > $(SKIPS)
 	@if [ -z "$(HAVE_TINYGRAD)" ] && [ -n "$(STRICT)" ]; then echo "FAIL: TINYNV_REQUIRE_TINYGRAD=1 but $(PYTHON) cannot import tinygrad (tinygrad.helpers, tinygrad.runtime.autogen.nv_570, test.unit.test_remote_pci; TINYGRAD_SRC=$${TINYGRAD_SRC:-$(abspath ../../tinygrad)}; see env.sh)"; exit 1; fi
 	@[ -n "$(HAVE_TINYGRAD)" ] || echo "  no tinygrad (TINYGRAD_SRC, see env.sh): the steps that need it say SKIP (no tinygrad) and the rest runs; TINYNV_REQUIRE_TINYGRAD=1 fails instead"
@@ -243,6 +260,16 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@# server: the test plays the server on a socket of its own, so it needs neither python nor tinygrad, and runs
 	@# ahead of the tests that do.
 	@$(BUILD)/test_tg_dead
+	@# ...and what the driver does about it (M2, M7): the first impossible readback is classified (server gone, card off
+	@# the bus, BAR window lost) and latched; nothing more is staged or rung; a long wait finds the loss within half a
+	@# second instead of at its 30 s timeout, while a short one costs no extra round trip; a lost gpu's teardown drains
+	@# nothing and unloads nothing, and with the connection alive clears bus mastering before the socket closes.
+	@$(BUILD)/test_lost
+	@$(BUILD)/test_teardown_lost
+	@# the emergency bus-master clear (M3) against a server this test plays: read, write without MASTER, read back;
+	@# nothing written to a device that reads all ones or through a server that does not answer; the hard timeout holds.
+	@# Every path it could take to the real server or app is overridden, and it is told the helper by absolute path.
+	@$(BUILD)/test_bmclear $(abspath $(BUILD))/tinynv-bmclear
 	@if [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_trace.py --selftest; else echo "SKIP (no tinygrad): nv_trace.py --selftest — the boot-trace recorder's coalescing self-check" | tee -a $(SKIPS); fi
 	@# what a cubin references and does not contain, both halves: the device printf resolves, anything else is refused.
 	@# the cubin is build output and not in the repository, so it is made if it is missing rather than assumed.

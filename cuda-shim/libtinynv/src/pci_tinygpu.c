@@ -11,7 +11,16 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <spawn.h>
 #include <unistd.h>
+
+extern char **environ;
+// tools/tinynv_bmclear.c, built beside this library; the Makefile bakes in where. TINYNV_BMCLEAR_HELPER overrides it.
+#ifndef TINYNV_BMCLEAR_DEFAULT
+#define TINYNV_BMCLEAR_DEFAULT "tinynv-bmclear"
+#endif
 
 enum {
   CMD_PROBE = 0, CMD_MAP_BAR, CMD_MAP_SYSMEM_FD, CMD_CFG_READ, CMD_CFG_WRITE, CMD_RESET,
@@ -45,6 +54,12 @@ typedef struct {
   int ndma;
   struct { void *va; size_t size; } dma[MAX_DMA];
   uint64_t bar_size[TINYNV_MAX_BARS];
+  // For the emergency bus-master clear (tg_rescue): the socket this session was opened on and the server process at
+  // its other end, so the helper reaches the same server path and can tell whether the old server is still alive.
+  char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+  int peer_pid;
+  int rescue_state; // 0 not started, 1 running, 2 finished, refused or turned off
+  pid_t rescue_pid;
 } tg_t;
 
 
@@ -380,6 +395,90 @@ static void tg_quiesce(tinynv_pci_t *p) {
 
 static int tg_transport_dead(tinynv_pci_t *p) { tg_t *tg = p->ctx; return tg && tg->dead; }
 
+// M3 of the 2026-11-18 DART panic analysis. With the server gone this process has no door to the card at all, and the
+// dext has completed every mapping with bus mastering still on, so a running GSP-RM faults on each DMA until the
+// kernel gives up (32 s and a panic that night). A separate process - tinynv-bmclear - opens a fresh connection, to
+// the same server path (starting a server first only if none exists for it) and clears PCI_COMMAND's bus master bit.
+// A separate process because a fresh IOServiceOpen can block behind the dead session in the dext's serial queue (H3):
+// the helper bounds itself and this process bounds its wait for the helper.
+//
+// Gates, in order: only for a loss THIS process latched (tg->dead); once; TINYNV_EMERGENCY_BM=0 turns it off. The
+// helper holds the rest: it never starts a second server while one for the path exists, and it writes nothing until
+// the server has answered its first read, which proves no other client holds the one-client server.
+//
+// posix_spawn only - this can run inside the crash handler. The child gets no descriptor but stdio (no lock file, no
+// dead socket), with stderr shared so its result lands in this process's log, and an empty signal mask (the handler
+// runs with its own signal blocked).
+static void tg_rescue(tinynv_pci_t *p, double wait_s) {
+  tg_t *tg = p->ctx;
+  if (!tg || !tg->dead) return;
+  if (!tg->rescue_state) {
+    tg->rescue_state = 2;
+    const char *off = getenv("TINYNV_EMERGENCY_BM");
+    if (off && !strcmp(off, "0")) {
+      fprintf(stderr, "libtinynv: TINYNV_EMERGENCY_BM=0: no emergency bus-master clear; the card may go on mastering "
+              "into mappings the server has let go\n");
+      return;
+    }
+    const char *helper = getenv("TINYNV_BMCLEAR_HELPER");
+    if (!helper || !*helper) helper = TINYNV_BMCLEAR_DEFAULT;
+    char pid[16];
+    snprintf(pid, sizeof(pid), "%d", tg->peer_pid);
+    char *argv[] = {(char *)helper, "--sock", tg->path, "--old-pid", pid, NULL};
+    posix_spawnattr_t at;
+    posix_spawn_file_actions_t fa;
+    sigset_t none;
+    sigemptyset(&none);
+    posix_spawnattr_init(&at);
+    posix_spawnattr_setsigmask(&at, &none);
+    short flags = POSIX_SPAWN_SETSIGMASK;
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+    posix_spawnattr_setflags(&at, flags);
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, 2, 1);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    posix_spawn_file_actions_addinherit_np(&fa, 2);
+#endif
+    int rc = posix_spawn(&tg->rescue_pid, helper, &fa, &at, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
+    if (rc) {
+      fprintf(stderr, "libtinynv: could not start the emergency bus-master clear (%s): %s\n", helper, strerror(rc));
+      return;
+    }
+    tg->rescue_state = 1;
+    fprintf(stderr, "libtinynv: emergency bus-master clear started: %s --sock %s --old-pid %s (pid %d)\n", helper,
+            tg->path, pid, (int)tg->rescue_pid);
+  }
+  if (tg->rescue_state != 1 || wait_s <= 0) return;
+  // Bounded. The helper stops itself (5 s by default); this is the bound in case it cannot.
+  struct timespec t0, t, nap = {0, 10 * 1000 * 1000};
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int st = 0;
+  pid_t r;
+  for (;;) {
+    r = waitpid(tg->rescue_pid, &st, WNOHANG);
+    if (r != 0 && !(r < 0 && errno == EINTR)) break;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    if ((double)(t.tv_sec - t0.tv_sec) + (double)(t.tv_nsec - t0.tv_nsec) * 1e-9 > wait_s) break;
+    nanosleep(&nap, NULL);
+  }
+  if (r == 0) {
+    kill(tg->rescue_pid, SIGKILL);   // our own child, the helper - never the server
+    waitpid(tg->rescue_pid, &st, 0);
+    fprintf(stderr, "libtinynv: the emergency bus-master clear did not finish in %.0f s and was stopped\n", wait_s);
+  } else if (r > 0 && WIFEXITED(st)) {
+    fprintf(stderr, "libtinynv: the emergency bus-master clear exited %d%s\n", WEXITSTATUS(st),
+            WEXITSTATUS(st) ? " - bus mastering was NOT confirmed off, its lines above say why" : ": bus mastering is off");
+  } else if (r > 0) {
+    fprintf(stderr, "libtinynv: the emergency bus-master clear died of signal %d\n", WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+  }
+  tg->rescue_state = 2;
+}
+
 static void tg_close(tinynv_pci_t *p) {
   tg_t *tg = p->ctx;
   if (!tg) return;
@@ -406,8 +505,13 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
 
   tg_t *tg = calloc(1, sizeof(tg_t));
   tg->fd = fd;
+  snprintf(tg->path, sizeof(tg->path), "%s", sock_path);
+#ifdef LOCAL_PEERPID
+  { pid_t peer = 0; socklen_t len = sizeof(peer); if (!getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &peer, &len)) tg->peer_pid = peer; }
+#endif
   *out = (tinynv_pci_t){.ctx = tg, .live = 1, .name = "usb4", .cfg_read = tg_cfg_read, .cfg_write = tg_cfg_write, .bar_info = tg_bar_info,
                         .bar_map = tg_bar_map, .bar_unmap = tg_bar_unmap, .dma_alloc = tg_dma_alloc, .dma_free = tg_dma_free,
-                        .reset = tg_reset, .quiesce = tg_quiesce, .close = tg_close, .transport_dead = tg_transport_dead};
+                        .reset = tg_reset, .quiesce = tg_quiesce, .close = tg_close, .transport_dead = tg_transport_dead,
+                        .rescue = tg_rescue};
   return 0;
 }

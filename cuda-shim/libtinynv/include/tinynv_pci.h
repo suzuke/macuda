@@ -64,6 +64,11 @@ struct tinynv_pci {
   // no such connection. Every read after that returns the backend's failure sentinel, so all ones from then on says
   // "server lost", not "the device read all ones".
   int (*transport_dead)(tinynv_pci_t *p);
+  // The emergency bus-master clear for a lost server (2026-11-18 DART panic, M3): a separate process reaches the card
+  // through a fresh server connection and turns bus mastering off, because this process's connection is gone. Refused
+  // unless transport_dead is latched; started at most once (TINYNV_EMERGENCY_BM=0: never). wait_s > 0 then waits that
+  // long for it and reports how it ended. NULL on a backend with no server (sysfs, replay, a test's fake).
+  void (*rescue)(tinynv_pci_t *p, double wait_s);
 };
 
 // register access. the compiler must not reorder or merge these, and a bar that is not mapped turns each one into a call

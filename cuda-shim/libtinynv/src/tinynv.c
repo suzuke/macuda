@@ -112,6 +112,28 @@ static void announce(tinynv_device_t d) {
 //
 // Called from whichever entry point first needs the card rather than from init, and it holds the same lock, so two
 // threads racing to be first get one boot between them.
+// The teardown of a gpu latched lost; 0 when it is not lost and the ordinary teardown should run.
+static int put_down_lost(void) {
+  if (!g_dev.gpu.lost) return 0;
+  g_dev.exec_ready = 0;
+  if (g_dev.gpu.lost == TINYNV_LOST_SERVER) {
+    // No connection to clear bus mastering through: the separate process started when the loss was latched does it
+    // through a fresh one. Waited for here, bounded, so its result is in this log before the process exits.
+    fprintf(stderr, "libtinynv: teardown with the tinygpu server gone: no drain, no gsp unload; the emergency bus-master "
+                    "clear is all that can reach the card\n");
+    tinynv_gpu_rescue(&g_dev.gpu, 6.0);
+    return 1;
+  }
+  // The connection still works (a lost window, or a card off the bus): the order is kept - PCI_COMMAND read, bus
+  // mastering cleared, read back - and only then are the mappings let go. The socket closes when this process does,
+  // and that close is the server's CompleteDMA, so the clear has to have landed first. gpu_close's unload refuses on
+  // a lost gpu, so what it does here is the quiesce and then the frees.
+  fprintf(stderr, "libtinynv: teardown with the gpu lost but the server connection alive: no drain, no gsp unload; "
+                  "bus mastering is cleared before anything is let go\n");
+  tinynv_gpu_close(&g_dev.gpu);
+  return 1;
+}
+
 // Put the card down when the process ends, however it ends.
 //
 // This is not tidiness. A process that exits with the GPU still bus mastering leaves it writing into mappings the kernel
@@ -133,11 +155,17 @@ static void put_the_card_down(void) {
     fprintf(stderr, "libtinynv: %llu bytes in %llu mappings were leaked rather than reused, because the mmu never "
                     "acknowledged their invalidate. The card was not asked for memory again after that.\n",
             (unsigned long long)g_dev.gpu.mm.leaked_bytes, (unsigned long long)g_dev.gpu.mm.leaked_n);
+  // A LOST GPU (lost.c; 2026-11-18 DART panic, M7) is not drained, its exec is not torn down and GSP-RM is not told to
+  // unload: each of those waits on a card that cannot answer, 30 s + 30 s + 2 s + the unload's own, while the card may
+  // be faulting on every DMA. A server loss the transport saw first is latched here at no cost.
+  tinynv_gpu_note_transport(&g_dev.gpu, "the teardown");
+  if (put_down_lost()) return;
   // Only when there IS something submitted. A boot that failed before tinynv_exec_init has no ring, no timeline and
   // no `ex->g`, and idling it walks into a null dereference by way of tinynv_submit_ring.
   if (g_dev.exec_ready) {
     int drained = tinynv_exec_idle(&g_dev.exec);   // let what was submitted finish before the mappings under it go away
     g_dev.exec.torn_down = 1;
+    if (put_down_lost()) return;                    // the drain itself found the loss
     // Opt-in (TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL=1, default off): a drain that timed out means the card may still be
     // executing. Unloading the GSP under live DMA is the known MMU-fault wedge; leaving it risks a DART fault when the
     // mappings are reclaimed. Like nv-uefi-unlocker, which halts rather than tear down under possibly-live DMA, this
