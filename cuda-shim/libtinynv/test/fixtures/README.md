@@ -6,7 +6,7 @@ Everything tracked here is built from this repository's own sources (`README-abi
 
 Three tests run on images cut out of NVIDIA's own libraries. Those bytes are NVIDIA's, so they are not in this
 repository. `make test` looks for them in `test/fixtures-nvidia/` (untracked; override with `NV_FIXTURES=<dir>`) and
-prints `SKIPPED:` for each one that is absent - never a silent pass. To run them, extract the images below and check
+prints `SKIP (no fixture):` for each one that is absent - never a silent pass. To run them, extract the images below and check
 the sha256 before trusting a result.
 
 | file | bytes | sha256 | used by | where it comes from |

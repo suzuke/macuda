@@ -6,6 +6,8 @@ export EGPU_ROOT=${EGPU_ROOT:-$(pwd)}
 #   TINYGRAD_SRC    the driver's offline reference tests and mock TinyGPU server (cuda-shim/libtinynv/tools/nv_reference_*.py,
 #                   libtinynv/test/mock_server.py, build_spike_cubin.py): branch egpu-hcq2-remote @ 0ff2c9299 — master-based, it
 #                   has runtime/autogen/nv_570 (the structures the driver is asserted against) and test/unit/test_remote_pci.py.
+#                   Without it `cd cuda-shim && make test` still runs, says SKIP (no tinygrad) for each step that needs it and
+#                   tests against the committed references; TINYNV_REQUIRE_TINYGRAD=1 makes its absence a failure.
 #                   (2026-09-17: the pin here read 084d89582, which is not reachable on the remote. test/reference-hw.txt records
 #                   that it was generated with 0ff2c9299 — the current branch head — so that, not 084d89582, is the operative revision.)
 #   TINYGRAD_STABLE the card-recovery tools (tools/nv_e3_flr.py, nv_temp.py, nv_e2_regs.py, nvmini.py, nv_quiesce.sh), which need

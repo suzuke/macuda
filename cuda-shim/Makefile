@@ -1,6 +1,7 @@
 # cuda-shim — builds the three shim libraries and links them together (no GPU needed; the driver runs as a null device).
 #   make        libtinynv.a (B's driver) + libtinycudart.a + libtinycublas.a + a link smoke test through the real CUDA headers
-#   make test   libtinynv's suite, then the link smoke test
+#   make test   libtinynv's suite, then the link smoke test. Without tinygrad (env.sh's TINYGRAD_SRC) the steps that need it
+#               say SKIP (no tinygrad) and the rest runs; TINYNV_REQUIRE_TINYGRAD=1 makes that a failure instead.
 # `all` is the goal of a bare `make` (setup.sh shim runs one): the per-architecture cubin rules below come before it, and
 # without this the first of them was the default goal, so `make` built build/shim*/cubin/copy1d.cubin and nothing else.
 .DEFAULT_GOAL := all
@@ -122,9 +123,12 @@ $(BUILD)/splitk_card: test/splitk_card.c $(NV_LIB)
 
 # libtinynv's suite reads these as fixtures and stops at the first one missing; they are build output (.gitignore), made
 # through the same nvcc route as ggml-cuda (a CUDA container, or TINYCC_HOST) and only when absent or older than the source
-SPIKE_CUBINS := spike/vecadd.sm86.cubin spike/vecadd.sm90.cubin spike/vecadd.sm120.cubin
+SPIKE_CUBINS := spike/vecadd.sm86.cubin spike/vecadd.sm90.cubin spike/vecadd.sm120.cubin spike/printf_kernel.sm120.cubin
 spike/vecadd.sm%.cubin: spike/vecadd.cu spike/tinycudart_compat.h
 	sh build/spike-cubin.sh $< sm_$* $@
+# test_reloc's cubin, by the same route rather than libtinynv's tools/build_spike_cubin.py, which needs tinygrad
+spike/printf_kernel.sm120.cubin: spike/printf_kernel.cu
+	sh build/spike-cubin.sh $< sm_120 $@
 .PHONY: spike-cubins
 spike-cubins: $(SPIKE_CUBINS)
 
@@ -134,6 +138,8 @@ test: all coverage $(SPIKE_CUBINS)
 	env -u TINYNV_SOCKET -u TINYNV_PCI $(BUILD)/cublas_contract
 	sh test/splitk_check.sh $(BUILD)/splitk_dispatch
 	sh test/batched_capture_check.sh $(BUILD)/batched_capture
+	@n=$$(grep -c '^SKIP' $(NV_BUILD)/test-skips.txt | tr -d ' '); [ -f build/libggml-cuda.a ] || n=$$((n + 1)); \
+	 echo "make test: every test that ran passed; $$n SKIP(s), each listed above as SKIP (...)"
 
 # every cuda*/cublas* symbol the compiled ggml-cuda archive needs must be defined by the shim (skipped if the archive is absent)
 .PHONY: coverage
@@ -144,7 +150,7 @@ coverage: $(CUDART) $(CUBLAS)
 	  missing=$$(comm -13 $(BUILD)/have.txt $(BUILD)/need.txt); \
 	  if [ -n "$$missing" ]; then echo "coverage: libggml-cuda.a needs symbols the shim does not define:"; echo "$$missing" | sed 's/^/  /'; exit 1; fi; \
 	  echo "coverage: all $$(wc -l < $(BUILD)/need.txt | tr -d ' ') cuda*/cublas* symbols libggml-cuda.a needs are defined by the shim"; \
-	else echo "coverage: build/libggml-cuda.a not present, skipped"; fi
+	else echo "SKIP (no fixture): coverage — build/libggml-cuda.a not present, so the shim's symbol coverage of ggml-cuda is unchecked"; fi
 
 clean:
 	rm -rf $(BUILD)

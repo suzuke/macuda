@@ -17,12 +17,23 @@ endif
 # which turns a missing fetch into a test that passes without testing anything
 CFLAGS  += -DTINYNV_FW_DEFAULT_DIR=\"$(abspath third_party/firmware)\"
 PYTHON  ?= python3
+# Whether the tinygrad the oracle steps need is here (env.sh: TINYGRAD_SRC, branch egpu-hcq2-remote), asked once and only
+# for `make test`. It probes what those steps import, through the same path they put first: a bare `import tinygrad`
+# also succeeds on env.sh's PYTHONPATH tinygrad-stable, which has neither module, and the steps would then die mid-run.
+# And, separately, as nv_trace.py imports it - with no path of its own, so only an installed tinygrad will do there.
+# Without it those steps say SKIP (no tinygrad) and the rest runs; TINYNV_REQUIRE_TINYGRAD=1 makes its absence, and a
+# missing trace, norm.cubin or vendored headers (each skipped by default, as before only with TINYNV_ALLOW_NO_*), fail.
+ifneq ($(filter test,$(MAKECMDGOALS)),)
+HAVE_TINYGRAD := $(shell $(PYTHON) -c 'import tinygrad.helpers' >/dev/null 2>&1 && $(PYTHON) -c 'import os, sys; sys.path.insert(0, os.environ.get("TINYGRAD_SRC", "$(abspath ../../tinygrad)")); import tinygrad.runtime.autogen.nv_570, test.unit.test_remote_pci' >/dev/null 2>&1 && echo 1)
+endif
+STRICT  := $(filter 1,$(TINYNV_REQUIRE_TINYGRAD))
 # NVIDIA's own headers, fetched by tools/fetch_nv_headers.sh and never committed (see .gitignore)
 NVSRC   := third_party/open-gpu-kernel-modules-81fe4fb417c8ac3b9bdcc1d56827d116743892a5
 NVINC   := -I$(NVSRC)/src/nvidia/arch/nvalloc/common/inc -I$(NVSRC)/src/common/sdk/nvidia/inc -I$(NVSRC)/src/common/inc \
            -I$(NVSRC)/src/nvidia/inc -I$(NVSRC)/src/common/shared/msgq/inc -I$(NVSRC)/src/common/uproc/os/common/include \
            -I$(NVSRC)/src/nvidia/generated   # rmconfig.h, which gsp_fw_heap.h (the firmware heap formula test_headers pins) includes
 BUILD   := build
+SKIPS    = $(BUILD)/test-skips.txt   # one line per SKIP of the last `make test`; the top level counts it
 # track header dependencies. without this a change to a struct in a header rebuilds only the .c files that were edited,
 # and the rest of the library keeps the old layout: the two halves then disagree about where a field is, which shows up
 # as a value that was set a moment ago reading back as zero. cost me a debugging round; never again.
@@ -165,6 +176,9 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
 test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+	@mkdir -p $(BUILD); : > $(SKIPS)
+	@if [ -z "$(HAVE_TINYGRAD)" ] && [ -n "$(STRICT)" ]; then echo "FAIL: TINYNV_REQUIRE_TINYGRAD=1 but $(PYTHON) cannot import tinygrad (tinygrad.helpers, tinygrad.runtime.autogen.nv_570, test.unit.test_remote_pci; TINYGRAD_SRC=$${TINYGRAD_SRC:-$(abspath ../../tinygrad)}; see env.sh)"; exit 1; fi
+	@[ -n "$(HAVE_TINYGRAD)" ] || echo "  no tinygrad (TINYGRAD_SRC, see env.sh): the steps that need it say SKIP (no tinygrad) and the rest runs; TINYNV_REQUIRE_TINYGRAD=1 fails instead"
 	@# FIRST, before any test runs: do the tests in this directory still report what they find? On 2026-09-15
 	@# test_rm_free.c exited 0 with FAIL printed - it consulted its failure count at line 117 of a 318-line main, the
 	@# file grew past that guard, and the whole C4b decision plus the rows proving the read-only fix landed below it.
@@ -196,7 +210,7 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@# than silent, because "it did not run" and "it passed" should never look the same.
 	@for cb in ../spike/norm.cubin ../spike/mmvq.cubin; do \
 	  if [ -f $$cb ]; then $(BUILD)/test_cubin $$cb - || exit 1; \
-	  else echo "  (skipped: $$cb is not present, so nothing checked it)"; fi; done
+	  else echo "SKIP (no fixture): test_cubin $$cb — not present (ggml build output), so nothing checked it" | tee -a $(SKIPS); fi; done
 	@# a kernel name longer than any in the local corpus. nothing here reaches 256 characters, which is why a fixed
 	@# buffer survived until session A's 8012-kernel survey found two at 474.
 	@$(PYTHON) tools/make_long_name_cubin.py ../spike/vecadd.sm120.cubin $(BUILD)/longname.cubin >/dev/null
@@ -229,22 +243,22 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@# server: the test plays the server on a socket of its own, so it needs neither python nor tinygrad, and runs
 	@# ahead of the tests that do.
 	@$(BUILD)/test_tg_dead
-	@$(PYTHON) tools/nv_trace.py --selftest
+	@if [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_trace.py --selftest; else echo "SKIP (no tinygrad): nv_trace.py --selftest — the boot-trace recorder's coalescing self-check" | tee -a $(SKIPS); fi
 	@# what a cubin references and does not contain, both halves: the device printf resolves, anything else is refused.
 	@# the cubin is build output and not in the repository, so it is made if it is missing rather than assumed.
-	@if [ ! -f ../spike/printf_kernel.sm120.cubin ]; then $(PYTHON) tools/build_spike_cubin.py ../spike/printf_kernel.cu \
+	@if [ ! -f ../spike/printf_kernel.sm120.cubin ] && [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/build_spike_cubin.py ../spike/printf_kernel.cu \
 	   || { echo "  cannot build the cubin test_reloc needs (a compiler server must be reachable; see env.sh)."; \
 	        echo "  set TINYNV_ALLOW_NO_CUBINS=1 to skip this test deliberately."; [ -n "$$TINYNV_ALLOW_NO_CUBINS" ]; }; fi
 	@if [ -f ../spike/printf_kernel.sm120.cubin ]; then $(BUILD)/test_reloc ../spike/printf_kernel.sm120.cubin; \
-	 else echo "  (no printf_kernel cubin, test_reloc skipped by TINYNV_ALLOW_NO_CUBINS)"; fi
+	 else echo "SKIP (no fixture): test_reloc on printf_kernel.sm120.cubin — not built (the top-level make test builds it with build/spike-cubin.sh)" | tee -a $(SKIPS); fi
 	@# ...and the device assert handler, on a real torch sm_120 image that references BOTH allowed names. NVIDIA-built,
 	@# so not shipped: put it in $(NV_FIXTURES) (test/fixtures/README.md says where it comes from) or this arm says SKIPPED.
 	@if [ -f $(NV_FIXTURES)/torch-cu128-assertfail-vprintf.sm120.cubin ]; then $(BUILD)/test_reloc $(NV_FIXTURES)/torch-cu128-assertfail-vprintf.sm120.cubin; \
-	 else echo "  SKIPPED: test_reloc on torch's __assertfail/vprintf image - NVIDIA-built fixture not shipped; see test/fixtures/README.md (NV_FIXTURES=$(NV_FIXTURES))"; fi
+	 else echo "SKIP (no fixture): test_reloc on torch's __assertfail/vprintf image — NVIDIA-built fixture not shipped; see test/fixtures/README.md (NV_FIXTURES=$(NV_FIXTURES))" | tee -a $(SKIPS); fi
 	@# the most threads a block can have: __launch_bounds__ capped by registers (NVIDIA's rule), on a torch image whose
 	@# kernels declare no bound - reported by kernel_info, and one warp over it refused before any card is involved
 	@if [ -f $(NV_FIXTURES)/torch-cu128-unbounded-regs.sm120.cubin ]; then $(BUILD)/test_thread_limit $(NV_FIXTURES)/torch-cu128-unbounded-regs.sm120.cubin; \
-	 else echo "  SKIPPED: test_thread_limit on torch's unbounded-register image - NVIDIA-built fixture not shipped; see test/fixtures/README.md (NV_FIXTURES=$(NV_FIXTURES))"; fi
+	 else echo "SKIP (no fixture): test_thread_limit on torch's unbounded-register image — NVIDIA-built fixture not shipped; see test/fixtures/README.md (NV_FIXTURES=$(NV_FIXTURES))" | tee -a $(SKIPS); fi
 	@# cuFuncGetAttribute values from the image, against what NVIDIA's driver reported for the same cubins
 	@$(BUILD)/test_kernel_attrs test/fixtures
 	@# the architecture from the right byte of e_flags for ELF ABI 7 and 8 (one PTX through ptxas 12.8 and 13.0)
@@ -272,26 +286,32 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@$(BUILD)/test_events
 	@# a module's data object by name (cuModuleGetGlobal) on the cuBLAS image cublasCreate asks it of
 	@if [ -f $(NV_FIXTURES)/cublaslt-cu128-deviceconstants.sm120.cubin ]; then $(BUILD)/test_global $(NV_FIXTURES)/cublaslt-cu128-deviceconstants.sm120.cubin; \
-	 else echo "  SKIPPED: test_global on cuBLASLt's device-constants image - NVIDIA-built fixture not shipped; see test/fixtures/README.md (NV_FIXTURES=$(NV_FIXTURES))"; fi
+	 else echo "SKIP (no fixture): test_global on cuBLASLt's device-constants image — NVIDIA-built fixture not shipped; see test/fixtures/README.md (NV_FIXTURES=$(NV_FIXTURES))" | tee -a $(SKIPS); fi
 	@# the command buffers the card was handed, rebuilt from the oracle's own method numbers and compared word for word
-	@$(PYTHON) tools/nv_reference_submit.py test/reference-submit.txt >/dev/null && $(BUILD)/test_submit test/reference-submit.txt
+	@# without tinygrad the reference is not regenerated and the C test reads the committed one
+	@if [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_reference_submit.py test/reference-submit.txt >/dev/null || exit 1; \
+	 else echo "SKIP (no tinygrad): nv_reference_submit.py — test/reference-submit.txt not regenerated from the oracle; test_submit reads the committed copy" | tee -a $(SKIPS); fi
+	@$(BUILD)/test_submit test/reference-submit.txt
 	@# and the kernel descriptor, against what tinygrad's own QMD class builds for the same cubin. the C side reads the
 	@# cubin itself rather than being handed the numbers, so a divergence in the cubin reader is caught here too.
-	@$(PYTHON) tools/nv_reference_qmd.py ../spike/vecadd.sm120.cubin test/reference-qmd.txt >/dev/null \
-	  && $(BUILD)/test_qmd test/reference-qmd.txt ../spike/vecadd.sm120.cubin
+	@if [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_reference_qmd.py ../spike/vecadd.sm120.cubin test/reference-qmd.txt >/dev/null || exit 1; \
+	 else echo "SKIP (no tinygrad): nv_reference_qmd.py — test/reference-qmd.txt not regenerated from tinygrad's QMD; test_qmd reads the committed copy" | tee -a $(SKIPS); fi
+	@$(BUILD)/test_qmd test/reference-qmd.txt ../spike/vecadd.sm120.cubin
 	@# the loadable image: the stage between reading a cubin and launching from it, and the one where a mistake stays
 	@# silent. A constant bank placed at the wrong offset loads fine, launches fine, and reads a table that is not there,
 	@# so nothing downstream reports it - which is exactly why this has to run rather than merely exist. The corpus is a
 	@# real ggml cubin (49 relocations, 4 kernels) and not the vector add, because the relocated __device__ tables every
 	@# IQ-quantised kernel depends on are the thing at risk. norm.cubin is build output, so it is a guarded skip.
 	@if [ -f ../spike/norm.cubin ]; then \
-	   $(PYTHON) tools/nv_reference_image.py ../spike/norm.cubin test/reference-image.txt >/dev/null \
-	     && $(BUILD)/test_image test/reference-image.txt ../spike/norm.cubin; \
-	 elif [ -n "$$TINYNV_ALLOW_NO_CUBINS" ]; then echo "  (no norm.cubin, test_image skipped by TINYNV_ALLOW_NO_CUBINS)"; \
+	   if [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_reference_image.py ../spike/norm.cubin test/reference-image.txt >/dev/null || exit 1; \
+	   else echo "SKIP (no tinygrad): nv_reference_image.py — test/reference-image.txt not regenerated from tinygrad's elf_loader; test_image reads the committed copy" | tee -a $(SKIPS); fi; \
+	   $(BUILD)/test_image test/reference-image.txt ../spike/norm.cubin; \
+	 elif [ -n "$$TINYNV_ALLOW_NO_CUBINS" ] || [ -z "$(STRICT)" ]; then echo "SKIP (no fixture): test_image — no ../spike/norm.cubin (ggml build output), so the image loader is not checked against the oracle" | tee -a $(SKIPS); \
 	 else echo "  no ../spike/norm.cubin: the image loader would not be checked against the oracle at all. Build it, or set TINYNV_ALLOW_NO_CUBINS=1 to skip it deliberately."; exit 1; fi
 	@# and the same two things against bytes a 5090 actually took, from the recorded session of 2026-09-14. the reference
 	@# is committed because the recording is not something to repeat casually; it is regenerated when the snapshot is there.
-	@if [ -f $(SNAPSHOT) ]; then $(PYTHON) tools/nv_reference_hw.py $(SNAPSHOT) test/reference-hw.txt >/dev/null; fi
+	@if [ -f $(SNAPSHOT) ] && [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_reference_hw.py $(SNAPSHOT) test/reference-hw.txt >/dev/null; \
+	 elif [ -f $(SNAPSHOT) ]; then echo "SKIP (no tinygrad): nv_reference_hw.py — test/reference-hw.txt not regenerated from the snapshot; test_qmd_hw reads the committed copy" | tee -a $(SKIPS); fi
 	@$(BUILD)/test_qmd_hw test/reference-hw.txt
 	@# and the same against descriptors a 3060 was handed, which is a DIFFERENT descriptor generation: 256 bytes of QMD
 	@# v3 where the above is 384 of v5, with the grid under another name, the driver's parameters at the start of
@@ -311,29 +331,36 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	   { TINYNV_UNLOAD=1 TINYNV_FAITHFUL=1 $(BUILD)/test_dev $(TRACE) > $(BUILD)/start-reset-unload.out 2>&1; \
 	     if grep -q 'replay (faithful): [0-9]* of [0-9]* recorded operations reproduced, 0 tolerated, 0 divergences' $(BUILD)/start-reset-unload.out && grep -q 'opens cold without a reset' $(BUILD)/start-reset-unload.out; then echo "start reset: TINYNV_UNLOAD=1 opens cold, the recorded boot exactly (no reset on a board whose reset-on-open does not come back), good"; \
 	     else echo "  FAIL: under TINYNV_UNLOAD=1 a genuine-zero open still reset the card (or the replay diverged)"; grep -E 'divergence|reset' $(BUILD)/start-reset-unload.out | head -3; exit 1; fi; }; \
-	 elif [ -n "$$TINYNV_ALLOW_NO_TRACE" ]; then echo "  (no trace at $(TRACE), skipped by TINYNV_ALLOW_NO_TRACE)"; \
+	 elif [ -n "$$TINYNV_ALLOW_NO_TRACE" ] || [ -z "$(STRICT)" ]; then echo "SKIP (no fixture): test_dev boot replay — no trace at $(TRACE), so the recorded boot (and the start-reset checks) do not run" | tee -a $(SKIPS); \
 	 else echo "  no trace at $(TRACE): the whole boot replay would not run. Record one with tools/nv_trace.py, or set TINYNV_ALLOW_NO_TRACE=1 to skip it deliberately."; exit 1; fi
 	@# and that no control this driver sends carries a pointer, at any nesting depth. A pointer in an rm control's
 	@# parameters is an address in THIS process; the card reads whatever number is there and reports nothing. Session C
 	@# found their own scan for these had two blind spots - nested structs, and raw pointers that are not spelled NvP64 -
 	@# so this looks for both, and reads the control list out of nv_structs.h so it cannot drift from what is sent.
-	@if [ -d $(NVSRC) ]; then $(PYTHON) tools/check_ctrl_pointers.py $(NVSRC)/src/common/sdk/nvidia/inc src/nv_structs.h; fi
+	@if [ -d $(NVSRC) ]; then $(PYTHON) tools/check_ctrl_pointers.py $(NVSRC)/src/common/sdk/nvidia/inc src/nv_structs.h; \
+	 else echo "SKIP (no fixture): check_ctrl_pointers.py — no vendored headers (tools/fetch_nv_headers.sh)" | tee -a $(SKIPS); fi
 	@if [ -d $(NVSRC) ]; then $(MAKE) -s $(BUILD)/test_headers && $(BUILD)/test_headers; \
-	 elif [ -n "$$TINYNV_ALLOW_NO_HEADERS" ]; then echo "  (no vendored headers, skipped by TINYNV_ALLOW_NO_HEADERS)"; \
+	 elif [ -n "$$TINYNV_ALLOW_NO_HEADERS" ] || [ -z "$(STRICT)" ]; then echo "SKIP (no fixture): test_headers — no vendored headers, so the struct cross-checks do not run (tools/fetch_nv_headers.sh)" | tee -a $(SKIPS); \
 	 else echo "  no vendored headers: the struct cross-checks would not run. Run tools/fetch_nv_headers.sh, or set TINYNV_ALLOW_NO_HEADERS=1 to skip them deliberately."; exit 1; fi
 	@# the way out of the driver, on a server of its own so nothing before it has already cleared bus mastering: the mock
 	@# hands over a device with bus mastering on, as the dext does, and the driver has to give it back with that off.
-	@sock=$$(mktemp -d)/tinygpu.sock; \
+	@# the mock server is tinygrad's own (test/unit/test_remote_pci.py), so all three of these need it
+	@if [ -n "$(HAVE_TINYGRAD)" ]; then \
+	sock=$$(mktemp -d)/tinygpu.sock; \
 	$(PYTHON) test/mock_server.py $$sock 60 & srv=$$!; \
 	for i in $$(seq 100); do [ -S $$sock ] && break; sleep 0.05; done; \
 	TINYNV_HW_MOCK=1 $(BUILD)/test_hw $$sock; rc=$$?; \
-	rm -f $$sock; wait $$srv 2>/dev/null; [ $$rc = 0 ] || exit $$rc
-	@sock=$$(mktemp -d)/tinygpu.sock; \
+	rm -f $$sock; wait $$srv 2>/dev/null; [ $$rc = 0 ] || exit $$rc; \
+	sock=$$(mktemp -d)/tinygpu.sock; \
 	$(PYTHON) test/mock_server.py $$sock 60 & srv=$$!; \
 	for i in $$(seq 100); do [ -S $$sock ] && break; sleep 0.05; done; \
 	$(BUILD)/test_pci $$sock; rc=$$?; \
-	rm -f $$sock; wait $$srv 2>/dev/null; [ $$rc = 0 ] || exit $$rc
-	@$(PYTHON) test/test_wire_proxy.py $(BUILD)/test_pci
+	rm -f $$sock; wait $$srv 2>/dev/null; [ $$rc = 0 ] || exit $$rc; \
+	$(PYTHON) test/test_wire_proxy.py $(BUILD)/test_pci; \
+	else echo "SKIP (no tinygrad): test_hw on the mock server — the driver's exit path giving bus mastering back" | tee -a $(SKIPS); \
+	echo "SKIP (no tinygrad): test_pci on the mock server — the TinyGPU wire client against the python driver's own server" | tee -a $(SKIPS); \
+	echo "SKIP (no tinygrad): test_wire_proxy.py — the wire-level recorder (it drives the same mock server)" | tee -a $(SKIPS); fi
+	@echo "libtinynv: $$(grep -c '^SKIP' $(SKIPS) | tr -d ' ') SKIP(s), each listed above"
 
 clean:
 	rm -rf $(BUILD)
