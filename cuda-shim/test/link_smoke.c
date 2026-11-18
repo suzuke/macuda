@@ -85,7 +85,7 @@ int main(void) {
   CHECK(cudaStreamSynchronize(s1) == cudaSuccess && cudaStreamDestroy(s1) == cudaSuccess && cudaEventDestroy(ev) == cudaSuccess, "stream sync/destroy");
   struct cudaDeviceProp prop; CHECK(cudaGetDeviceProperties(&prop, 0) == cudaSuccess && prop.warpSize == 32 && prop.maxThreadsPerBlock >= 1024, "device props (%s, warp %d)", prop.name, prop.warpSize);
   int coop = 1; CHECK(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, 0) == cudaSuccess && coop == 0, "cooperative launch attr must be 0");
-  size_t fr = 0, tot = 0; CHECK(cudaMemGetInfo(&fr, &tot) == cudaSuccess, "memgetinfo");
+  size_t fr = 0, tot = 0; CHECK(cudaMemGetInfo(&fr, &tot) == cudaSuccess && tot > 0 && fr == tot, "memgetinfo on the null device keeps free = total (%zu/%zu)", fr, tot);
   // the graph subset: a capture records instead of running, an instance replays it, an update replaces it, and the
   // stream reports its state; a synchronise inside a capture is refused and spoils it, as CUDA does
   { cudaGraph_t gr = NULL; cudaGraphExec_t ge = NULL; enum cudaStreamCaptureStatus cs = cudaStreamCaptureStatusActive; cudaGraphExecUpdateResultInfo ui;

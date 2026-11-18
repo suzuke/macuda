@@ -208,7 +208,24 @@ static cudaError_t cudaMemcpy2DAsync_noted(void *dst, size_t dpitch, const void 
 cudaError_t cudaMemsetAsync(void *p, int v, size_t n, cudaStream_t s) { if (tinycudart_capturing_nv(st(s))) return tinycudart_capture_memset(p, v, n); double _t0=tinycudart_now_ns(); cudaError_t _r; { TRACE("memsetAsync %zu bytes = %d", n, v); tinycudart_count_copy(0, n); _r=S(tinynv_memset(st(s), (tinynv_devptr_t)p, v, n)); } tinycudart_time_api(2, tinycudart_now_ns()-_t0); return _r; }
 cudaError_t cudaMemset(void *p, int v, size_t n) { tinycudart_capture_note("cudaMemset (synchronous)"); tinynv_status_t r = tinynv_memset(tinycudart_default_stream(), (tinynv_devptr_t)p, v, n); if (r == TINYNV_OK) r = tinynv_stream_sync(tinycudart_default_stream()); return S(r); }
 cudaError_t cudaMallocManaged(void **p, size_t n, unsigned flags) { (void)p; (void)n; (void)flags; return E(cudaErrorNotSupported); } // only under GGML_CUDA_ENABLE_UNIFIED_MEMORY
-cudaError_t cudaMemGetInfo(size_t *free_, size_t *total) { tinynv_device_props_t p = props(); if (total) *total = p.total_mem; if (free_) *free_ = p.total_mem; return E(cudaSuccess); } // TODO: subtract live cudaMalloc bytes
+// total stays the card's size, as cudaGetDeviceProperties reports it. free is what the driver's allocator can still hand
+// out: its own managed range minus everything allocated and not yet freed (firmware reservations, the command arena and
+// every live cudaMalloc included), so ggml's auto-fit and stable-diffusion.cpp's budget see the real headroom. It is a
+// byte count, not the largest contiguous block. The null device has no allocator and keeps the old answer (free = total)
+// on purpose, like props() presenting a card there; a real card whose allocator cannot answer is reported as an error
+// rather than as an empty card.
+cudaError_t cudaMemGetInfo(size_t *free_, size_t *total) {
+  tinynv_device_props_t p = props();
+  uint64_t fr = 0, tot = 0;
+  tinynv_device_t d = tinycudart_device();
+  tinynv_status_t r = d ? tinynv_mem_info(d, &fr, &tot) : TINYNV_ERR_NODEV;
+  if (r == TINYNV_ERR_NODEV) fr = p.total_mem;
+  else if (r != TINYNV_OK) return S(r);
+  if (fr > p.total_mem) fr = p.total_mem;
+  if (total) *total = p.total_mem;
+  if (free_) *free_ = (size_t)fr;
+  return E(cudaSuccess);
+}
 
 // --- device queries ---
 cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *d, int dev) {
