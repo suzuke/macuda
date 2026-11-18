@@ -99,6 +99,9 @@ $(BUILD)/link_smoke: test/link_smoke.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 $(BUILD)/splitk_dispatch: test/splitk_dispatch.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
+# host<->device copy bandwidth, pinned and pageable (a probe for nv_shim_step.sh; not built by `all`)
+$(BUILD)/copy_bw: test/copy_bw.c $(CUDART) $(CUBLAS) $(NV_LIB)
+	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 # the split-K kernel ON THE CARD through libtinynv (D's gate S1 on prereg b79fb72f); a probe, run by nv_shim_step.sh, never by make test
 $(BUILD)/splitk_card: test/splitk_card.c $(NV_LIB)
 	$(CC) $(CFLAGS) $< $(NV_LIB) -o $@
