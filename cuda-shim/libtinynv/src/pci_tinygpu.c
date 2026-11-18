@@ -326,7 +326,9 @@ static int tg_reset(tinynv_pci_t *p) {
 
 static void tg_quiesce(tinynv_pci_t *p) {
   uint32_t cmd = tg_cfg_read(p, PCI_COMMAND, 2);
-  if (cmd == 0xffffffff) return; // already gone from the bus
+  // gone: a failed server call reads 0xffffffff (tg_cfg_read), an absent function's 2-byte read 0xffff. Writing
+  // cmd & ~MASTER back for the second would put 0xfffb in the command register of whatever answers there next.
+  if (cmd == 0xffffffff || (cmd & 0xffff) == 0xffff) return;
   tg_cfg_write(p, PCI_COMMAND, 2, cmd & ~PCI_COMMAND_MASTER);
   tg_cfg_read(p, PCI_COMMAND, 2); // read back, so the write has landed before any mapping is torn down
 }
