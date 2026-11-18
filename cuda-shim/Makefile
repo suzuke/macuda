@@ -1,6 +1,9 @@
 # cuda-shim — builds the three shim libraries and links them together (no GPU needed; the driver runs as a null device).
 #   make        libtinynv.a (B's driver) + libtinycudart.a + libtinycublas.a + a link smoke test through the real CUDA headers
 #   make test   libtinynv's suite, then the link smoke test
+# `all` is the goal of a bare `make` (setup.sh shim runs one): the per-architecture cubin rules below come before it, and
+# without this the first of them was the default goal, so `make` built build/shim*/cubin/copy1d.cubin and nothing else.
+.DEFAULT_GOAL := all
 ROOT     := $(abspath .)
 CC       := /opt/homebrew/opt/llvm/bin/clang
 CXX      := /opt/homebrew/opt/llvm/bin/clang++
