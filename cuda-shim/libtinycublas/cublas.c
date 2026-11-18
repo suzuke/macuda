@@ -64,7 +64,21 @@ static tinynv_kernel_t tinycublas_gemm_tc2_kernel(int bf16, int opA, int opB, in
 static const char* const tc2k_names[2][4]={
   {"tinyblas_gemm_f16_tc2k_nn","tinyblas_gemm_f16_tc2k_nt","tinyblas_gemm_f16_tc2k_tn","tinyblas_gemm_f16_tc2k_tt"},
   {"tinyblas_gemm_bf16_tc2k_nn","tinyblas_gemm_bf16_tc2k_nt","tinyblas_gemm_bf16_tc2k_tn","tinyblas_gemm_bf16_tc2k_tt"}};
-static int splitk_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TINYCUBLAS_SPLITK"); v=(e&&*e=='0')?0:1; } return v; }
+// OFF BY DEFAULT ON sm_8x (Ampere, Ada), ON elsewhere. The flip above was measured and validated on the 5090; on an RTX
+// 3060 through this driver the split GEMMs come back wrong (2026-11-18: SD 1.5, seed 42, 20 steps is noise with split-K
+// and the expected image with TINYCUBLAS_SPLITK=0), while test_splitk passes on a 3090 under NVIDIA's own driver - so the
+// kernel is not the suspect, the way this driver runs it on Ampere is. Until that is found, sm_8x takes the unsplit
+// kernels it took before split-K existed. TINYCUBLAS_SPLITK=1 forces it on anywhere (to reproduce), =0 off anywhere.
+// The null device reports cc_major 0 and keeps the default ON, which is what test/splitk_check.sh traces.
+static int splitk_enabled(void){
+  static int v=-1;
+  if(v<0){
+    const char* e=getenv("TINYCUBLAS_SPLITK");
+    if (e&&*e) v=(*e!='0');
+    else { tinynv_device_props_t p; v = !(tinynv_device_props(tinycudart_device(), &p)==TINYNV_OK && p.cc_major==8); }
+  }
+  return v;
+}
 #define SPLITK_WS_BYTES (8u<<20)   /* S x tiles x 64x64 f32: q/o at n<=64, S 8, 32 tiles = 4 MiB */
 #define SPLITK_CNT_N    16384u     /* one counter per output tile per batch element */
 // The plan is a pure function of the shape (the design's row 1): the number of k-slices, 1 = do not split.
