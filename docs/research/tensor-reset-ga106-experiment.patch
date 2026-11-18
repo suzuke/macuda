@@ -1,0 +1,59 @@
+diff --git a/cuda-shim/libtinynv/src/tensor_unlock.c b/cuda-shim/libtinynv/src/tensor_unlock.c
+index c39e14f..cdf52f8 100644
+--- a/cuda-shim/libtinynv/src/tensor_unlock.c
++++ b/cuda-shim/libtinynv/src/tensor_unlock.c
+@@ -253,19 +253,5 @@ int tinynv_tensor_unlock(tinynv_gpu_t *g) {
+-  // TINYNV_TENSOR_UNLOCK=0: lock — open PLM fully, write SS back to zero, restore PLM
+-  if (strcmp(env, "0") == 0) {
+-    if (ss0 == 0 && ss1 == 0) {
+-      fprintf(stderr, "libtinynv: tensor_unlock: already locked\n");
+-      return 0;
+-    }
+-    // try to push PLM fully open from the host so SS writes are accepted
+-    tinynv_wr32(d, FEAT_OVR_PLM, 0xFFFFFFFFu);
+-    uint32_t plm2 = tinynv_rd32(d, FEAT_OVR_PLM);
+-    fprintf(stderr, "libtinynv: tensor_unlock: lock: PLM %#x -> %#x after host write 0xffffffff\n", plm, plm2);
+-    tinynv_wr32(d, FEAT_SS0, 0);
+-    tinynv_wr32(d, FEAT_SS1, 0);
+-    uint32_t r0 = tinynv_rd32(d, FEAT_SS0), r1 = tinynv_rd32(d, FEAT_SS1);
+-    // restore PLM
+-    tinynv_wr32(d, FEAT_OVR_PLM, plm);
+-    uint32_t plm3 = tinynv_rd32(d, FEAT_OVR_PLM);
+-    fprintf(stderr, "libtinynv: tensor_unlock: locked SS0=%#x SS1=%#x, PLM restored %#x\n", r0, r1, plm3);
+-    if (r0 != 0 || r1 != 0)
+-      fprintf(stderr, "libtinynv: tensor_unlock: WARNING: lock write did not take (need power cycle to clear AON)\n");
++  // Research-only: disable selector overrides after reopening PLM through SEC2.
++  int want_lock = strcmp(env, "0") == 0;
++  if (!want_lock && strcmp(env, "1") != 0) return 0;
++  if (want_lock && !(ss0 & 0x88888888u) && !(ss1 & 8u)) {
++    fprintf(stderr, "libtinynv: tensor_reset research: selector override bits clear, skipping exploit\n");
+@@ -274,6 +260,2 @@ int tinynv_tensor_unlock(tinynv_gpu_t *g) {
+-
+-  if (strcmp(env, "1") != 0) return 0;
+-
+-  // check if already unlocked (previous run — values persist in AON domain across FLR)
+-  if (ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK) {
+-    fprintf(stderr, "libtinynv: tensor_unlock: speed-select already at full speed (AON persisted), skipping exploit\n");
++  if (!want_lock && ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK) {
++    fprintf(stderr, "libtinynv: tensor_unlock: speed-select already at full speed, skipping exploit\n");
+@@ -281,0 +264,2 @@ int tinynv_tensor_unlock(tinynv_gpu_t *g) {
++  uint32_t target0 = want_lock ? (ss0 & 0x77777777u) : SS0_UNLOCK;
++  uint32_t target1 = want_lock ? (ss1 & ~8u) : SS1_UNLOCK;
+@@ -356,2 +340,2 @@ int tinynv_tensor_unlock(tinynv_gpu_t *g) {
+-      fprintf(stderr, "libtinynv: tensor_unlock: exploit fire failed (non-fatal, continuing with locked tensor cores)\n");
+-      return 0;
++      g->gsp.init_timed_out = 1;
++      return tinynv_fail("tensor_reset research: exploit failed; reset required");
+@@ -364,2 +348,2 @@ write_selectors:
+-  tinynv_wr32(d, FEAT_SS0, SS0_UNLOCK);
+-  tinynv_wr32(d, FEAT_SS1, SS1_UNLOCK);
++  tinynv_wr32(d, FEAT_SS0, target0);
++  tinynv_wr32(d, FEAT_SS1, target1);
+@@ -369,2 +353,2 @@ write_selectors:
+-          ss0_rb, SS0_UNLOCK, ss1_rb, SS1_UNLOCK);
+-  if (ss0_rb != SS0_UNLOCK || ss1_rb != SS1_UNLOCK)
++          ss0_rb, target0, ss1_rb, target1);
++  if (ss0_rb != target0 || ss1_rb != target1)
+@@ -373 +357 @@ write_selectors:
+-    fprintf(stderr, "libtinynv: tensor_unlock: tensor cores unlocked to full speed\n");
++    fprintf(stderr, "libtinynv: tensor_reset research: requested selectors accepted\n");

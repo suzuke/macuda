@@ -1,0 +1,22 @@
+# GA106: restoring fused speed selectors without an enclosure power cycle
+
+2026-11-18: an experimental modification in a detached worktree reopened the FEAT PLM via the existing 610.43.03 SEC2/V67 path, cleared the speed-selector override enable bits, and then performed the driver's FLR and full firmware reinitialization. On this RTX 3060 GA106 (`10de:2544`, Razer Core X V2), two restricted→unlocked cycles completed without powering the enclosure off. This is a proof of concept, not production support.
+
+The experiment started from the unlocked selectors `SS0=0x88888888`, `SS1=0x8`, `READOUT_1=0`. The patch preserves the low three bits of each SS0 nibble and clears its high bit; it clears bit 3 of SS1. With the starting values this writes `SS0=0`, `SS1=0`. The first round read back those values after FLR and `READOUT_1=0x00400080`, matching the fused readout observed after a genuine enclosure power cycle. **Zero is not an exact restoration of the cold selector shadow**, which read `0x51000104` and `0x5`; the evidence is that disabling the override restored this card's readout and the tested GEMM speed. The second round likewise showed zero selectors across FLR, though READOUT_1 was not independently sampled during that second restricted phase.
+
+The patch was built separately and is recorded as [tensor-reset-ga106-experiment.patch](tensor-reset-ga106-experiment.patch). It does not modify the main checkout's driver. The experimental benchmark binary identified itself as `c642a73` because it linked the existing build-ID object; its SHA-256 was `d7f94015c9d335ca5a88690cbae3d8dd7017ac490ed608168528d63e79b7720e`. The ordinary unlock benchmark binary SHA-256 was `b6e0e2ac2de21fd3e265bf734719f3848719c5d5281218bdbb0fc14d2f5c7470`. Both used the same GEMM cubin.
+
+| Step | Mode | 4096³ FP16/FP32-accumulate median TFLOP/s | Local log |
+| --- | --- | ---: | --- |
+| 1 | Experimental override clear | 20.672486 | `logs/shim-probe-20261118-213638.log` |
+| 2 | Existing unlock | 29.953568 | `logs/shim-probe-20261118-213658.log` |
+| 3 | Experimental override clear | 20.816514 | `logs/shim-probe-20261118-213713.log` |
+| 4 | Existing unlock | 30.179832 | `logs/shim-probe-20261118-213724.log` |
+
+All four runs checked 16,777,216 outputs, with zero mismatches and max absolute error zero. Each median covers seven host-timed batches of five GEMMs after three warmups, using the deterministic pattern in `cuda-shim/test/tensor_unlock_bench.c`. Prior true-power-cycle stock median was 20.689290 TFLOP/s. See [the preceding experiment](../bench/tensor-unlock-ga106-20261118.md) for methodology and limits. Logs are ignored by Git; this report records the observed values, not the raw log files.
+
+In both override-clear runs the PLM flipped, the selectors read zero, FLR and full reinitialization completed, and attempt 2 skipped another exploit because the override bits were clear. Both subsequent unlocks successfully repeated the normal exploit/FLR path. At the end SS0/SS1 were `0x88888888`/`0x8`, READOUT_1 was `0`, firmware had unloaded, and preflight passed.
+
+Upstream's [transaction code](https://github.com/physicsdolphin/nv-uefi-unlocker/blob/a0da84f207f29501ea395384605ca0ee3b40c7a4/loader/src/tx.rs) uses the GA102 PLM-opening payload followed by host selector writes; its PLM relock closes the gate rather than reverting SS. Its [diagnostic documentation](https://github.com/physicsdolphin/nv-uefi-unlocker/blob/a0da84f207f29501ea395384605ca0ee3b40c7a4/tools/ssdiag/README.md) describes reapplying unlock selectors when the gate remains open, not this exact restore procedure. Upstream does not establish this experiment's behavior on this platform.
+
+Limitations: the experiment uses an undocumented register layout, one GPU, two cycles and one precision/workload. It restores fused behavior for the observed configuration, not the exact power-on state or necessarily every selector on every GA10x. It still relies on SEC2 exploit, FLR and reinit, so it is not an in-place toggle of a live context. The patch inherits the possible DMA lifetime problem on timeout, treats selector readback mismatch as a warning, and does not verify PLM restoration or distinguish an all-ones dead FEAT block from an open PLM. The boot retry flag and fixed attempt limit also need an explicit state machine. Resolve and test these paths, including errors and unexpected selector states, before integrating. `TINYNV_TENSOR_UNLOCK=0` in the main checkout remains the old, unsuccessful host-only attempt; do not interpret this experiment as fixing it.
