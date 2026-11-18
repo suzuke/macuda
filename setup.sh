@@ -24,8 +24,12 @@
 set -eu
 R=$(cd "$(dirname "$0")" && pwd); cd "$R"
 LLAMA_URL=https://github.com/ggml-org/llama.cpp.git
-LLAMA_BASE=ad6c66839af3c5646fba8c6c2e2087a1e4e38948   # ad6c668: the tree the ggml-cuda archive and every number in the README were built from
-LLAMA_FIX=2f539596c6e9a977e91b6bc6344650422c6bc3b0    # 2f53959 (#28882): ggml-cpu rope work-buffer fix; without it test-backend-ops corrupts its heap on arm64
+# 401563f10 (2026-11-17). Before it the pin was ad6c668 + a cherry-pick of 2f53959 (#28882, the ggml-cpu rope work-buffer
+# fix test-backend-ops needs on arm64); 2f53959 is an ancestor of 401563f10, so nothing is applied on top any more.
+# The README's numbers up to 2026-11-18 were measured on ad6c668+2f53959 (fb7e281b2 in an existing checkout).
+# GGML_BACKEND_API_VERSION went 2 -> 3 between the two: the CMake trees, the registry objects and libggml-cuda.*.a must
+# all come from this commit (re-run llama, cuda, link and split after moving it).
+LLAMA_BASE=401563f10ec60754e688cd3165c1343cf4be9642
 SD_URL=https://github.com/leejet/stable-diffusion.cpp.git
 SD_COMMIT=59c23bce0d82be3a922023ab811194f05b3e2faa      # 59c23bc
 JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
@@ -65,11 +69,9 @@ clone_at() { # clone_at <dir> <url> <commit> [local source]
   git -C "$d" checkout -q --detach "$c"
 }
 llama() {
-  # already base + the fix (a cherry-pick on top of LLAMA_BASE)? then leave the tree alone
-  if [ "$(git -C llama.cpp rev-parse HEAD~1 2>/dev/null)" != "$LLAMA_BASE" ] || ! git -C llama.cpp log --format=%s -1 | grep -q 'CACHE_LINE_SIZE'; then
+  # already at the pin? then leave the tree alone (a worktree counts: its .git is a file, not a directory)
+  if [ "$(git -C llama.cpp rev-parse HEAD 2>/dev/null)" != "$LLAMA_BASE" ]; then
     clone_at llama.cpp "$LLAMA_URL" "$LLAMA_BASE" "${LLAMA_SRC:-}"
-    git -C llama.cpp cat-file -e "$LLAMA_FIX^{commit}" 2>/dev/null || git -C llama.cpp fetch -q origin "$LLAMA_FIX"
-    git -C llama.cpp -c user.name=setup -c user.email=setup@localhost cherry-pick -x "$LLAMA_FIX"
   fi
   echo "llama.cpp at $(git -C llama.cpp rev-parse --short HEAD): $(git -C llama.cpp log -1 --format=%s | cut -c1-70)"
   # CPU-only, static, no Metal: the shim replaces the CUDA backend at link time, and every other backend must be absent

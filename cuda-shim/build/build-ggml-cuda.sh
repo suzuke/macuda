@@ -14,7 +14,7 @@ JOBS=${JOBS:-8}
 case "${ARCH:-sm_120a}" in multi) export TINYCC_ARCH=sm_86,sm_120a ;; *) export TINYCC_ARCH=${ARCH:-sm_120a} ;; esac
 ONLY=${ONLY:-}
 if [ -z "$ONLY" ]; then rm -rf "$OBJ" "$LOGD"; fi; mkdir -p "$OBJ" "$LOGD"
-# resolved once here rather than by each of the 188 tinycc invocations, each of which would otherwise link a probe
+# resolved once here rather than by each tinycc invocation (188 on ad6c668, 208 on 401563f10), each of which would otherwise link a probe
 export TINYCC_SYSROOT=${TINYCC_SYSROOT:-$(sh "$R/cuda-shim/build/sdk.sh")}
 export INC="-I$G/include -I$G/src -I$G/src/ggml-cuda"
 # docs/03-cuda-shim-plan.md §1: quantized matmul forced onto MMQ (cuBLAS only for residual GEMMs) and no virtual
@@ -29,7 +29,11 @@ export INC="-I$G/include -I$G/src -I$G/src/ggml-cuda"
 # and lost that, with nothing to say why. GGML_CUDA_FORCE_MMQ is kept for the feature string but is a NO-OP on
 # Blackwell: ggml_cuda_should_use_mmq returns true at turing_mma_available(cc) (mmq.cu:320), above the #ifdef.
 export DEFS="-DGGML_CUDA_FORCE_MMQ -DGGML_CUDA_NO_VMM -DGGML_CUDA_USE_GRAPHS -DNDEBUG ${DEFS_EXTRA:-}"
-FA=""; for k in F16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16; do for v in F16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16; do FA="$FA -DGGML_CUDA_FA_${k}_${v}=1"; done; done
+# Every K/V pair flash attention can dispatch, which is the full template-instances/fattn-vec-instance-* matrix (ggml's
+# CMake with GGML_CUDA_FA_QUANTS=all). F8_E4M3 arrived with llama.cpp 401563f10: fattn.cu tests GGML_CUDA_FA_<K>_<V> for it
+# with `if constexpr`, so an undefined macro there is a compile error, not a disabled kernel. On an older tree the extra
+# F8 defines name nothing and are ignored.
+FA=""; for k in F16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16 F8_E4M3; do for v in F16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16 F8_E4M3; do FA="$FA -DGGML_CUDA_FA_${k}_${v}=1"; done; done
 export FA
 ls "$G"/src/ggml-cuda/*.cu "$G"/src/ggml-cuda/template-instances/*.cu > "$LOGD/tus.txt"
 if [ -n "$ONLY" ]; then for b in $ONLY; do grep "/$b\.cu$" "$LOGD/tus.txt"; done > "$LOGD/tus.only"; mv "$LOGD/tus.only" "$LOGD/tus.txt"; fi

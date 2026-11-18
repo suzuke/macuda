@@ -298,6 +298,28 @@ cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   if (e) { drop_resident(e); free_nodes(e->nodes, e->n); free(e); }
   return E(cudaSuccess);
 }
+// Graph introspection, for ggml-cuda's cluster check (401563f10 ggml-cuda.cu ggml_cuda_graph_get_clusters, Hopper and
+// newer only; on an RTX 30/40 it returns before asking). ggml walks the nodes for kernels launched with a cluster
+// dimension above one, and re-instantiates instead of updating when that set changes. A recording here has no per-node
+// handles to give out, and none of its launches can carry a cluster: cudaLaunchKernelExC drops launch attributes
+// (cudart_api.c), so every recorded kernel runs with a 1x1x1 cluster. Reporting zero nodes therefore gives ggml the
+// answer it would compute from real ones - no clusters - and its update path is the one it takes without the check.
+// With zero nodes ggml never holds a node handle, so the per-node queries can only be handed one this library did not
+// make: they refuse it with cudaErrorInvalidValue rather than describe a node that does not exist.
+cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t *nodes, size_t *numNodes) {
+  (void)nodes;   // a caller's array is left untouched: no entries are written when the count is zero
+  if (!graph || !numNodes) return E(cudaErrorInvalidValue);
+  *numNodes = 0;
+  return E(cudaSuccess);
+}
+cudaError_t cudaGraphNodeGetType(cudaGraphNode_t node, enum cudaGraphNodeType *pType) {
+  (void)node; (void)pType;
+  return E(cudaErrorInvalidValue);
+}
+cudaError_t cudaGraphKernelNodeGetAttribute(cudaGraphNode_t node, cudaKernelNodeAttrID attr, cudaKernelNodeAttrValue *value) {
+  (void)node; (void)attr; (void)value;
+  return E(cudaErrorInvalidValue);
+}
 // At exit, whenever a capture happened: how much of the run was replayed rather than issued by the caller.
 void tinycudart_graph_stats(void) {
   if (!g_captures) return;

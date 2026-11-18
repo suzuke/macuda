@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include "tinynv.h"
 #include <cublas_v2.h>   // cuBLAS types (handle/status/operation/computeType) from the CUDA-13 tree; C-compatible
+#include <cublasLt.h>    // the cuBLASLt types, for the stubs at the end of this file
 
 // A GEMM launch goes through the capture when one is running on this stream, exactly as a ggml kernel does.
 // Without this the GEMMs are invisible to a graph: they run once, while the caller is capturing, and never on a
@@ -331,4 +332,59 @@ cublasStatus_t cublasStrsmBatched(cublasHandle_t h, cublasSideMode_t side, cubla
     }
   }
   free(Ah); free(Bh); return rc;
+}
+
+// --- cuBLASLt: present so ggml-cuda links, and declining every matmul it is asked to plan ---
+// ggml-cuda 401563f10 added an FP8 path (fp8.cu, ggml_cuda_mul_mat_fp8) for F8_E4M3 weights that goes through cuBLASLt.
+// ggml-cuda.cu references it unconditionally, so these symbols are needed to LINK any binary, though the path itself
+// is reached only with an F8_E4M3 weight on an Ada/Hopper/Blackwell card (fp8_mma_hardware_available; never on an
+// RTX 30). There is no FP8 kernel in this library. What fp8.cu does with that:
+//   - handle, descriptor, layout and preference create/set/destroy are each wrapped in CUBLAS_CHECK, which aborts on any
+//     status but SUCCESS, so they succeed and record nothing (ggml's setting of an attribute changes no answer here);
+//   - cublasLtMatmulAlgoGetHeuristic then reports no algorithm (returnAlgoCount = 0, CUBLAS_STATUS_NOT_SUPPORTED, which
+//     is how cuBLASLt answers a configuration it has no kernel for), and fp8.cu, on `status != SUCCESS || returned == 0`,
+//     destroys its descriptors and returns false: ggml_cuda_mul_mat falls through to ggml_cuda_mul_mat_cublas and the
+//     MUL_MAT_ID caller to its non-FP8 path;
+//   - cublasLtMatmul is therefore UNREACHABLE from ggml - fp8.cu calls it only after a heuristic returned an algorithm -
+//     and refuses with NOT_SUPPORTED should anything else call it.
+// Descriptors are real allocations of the header's opaque sizes, so a caller that writes into one cannot corrupt memory.
+struct cublasLtContext { int unused; };
+cublasStatus_t cublasLtCreate(cublasLtHandle_t *h) {
+  if (!h) return CUBLAS_STATUS_INVALID_VALUE;
+  *h = calloc(1, sizeof(struct cublasLtContext));
+  return *h ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_ALLOC_FAILED;
+}
+cublasStatus_t cublasLtDestroy(cublasLtHandle_t h) { free(h); return CUBLAS_STATUS_SUCCESS; }
+#define LT_CREATE(T, out) do { if (!(out)) return CUBLAS_STATUS_INVALID_VALUE; *(out) = calloc(1, sizeof(T)); return *(out) ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_ALLOC_FAILED; } while (0)
+cublasStatus_t cublasLtMatmulDescCreate(cublasLtMatmulDesc_t *d, cublasComputeType_t ct, cudaDataType_t st) {
+  (void)ct; (void)st; LT_CREATE(cublasLtMatmulDescOpaque_t, d);
+}
+cublasStatus_t cublasLtMatmulDescDestroy(cublasLtMatmulDesc_t d) { free(d); return CUBLAS_STATUS_SUCCESS; }
+cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d, cublasLtMatmulDescAttributes_t a, const void *buf, size_t n) {
+  (void)a; (void)n; return d && buf ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+}
+cublasStatus_t cublasLtMatrixLayoutCreate(cublasLtMatrixLayout_t *l, cudaDataType t, uint64_t rows, uint64_t cols, int64_t ld) {
+  (void)t; (void)rows; (void)cols; (void)ld; LT_CREATE(cublasLtMatrixLayoutOpaque_t, l);
+}
+cublasStatus_t cublasLtMatrixLayoutDestroy(cublasLtMatrixLayout_t l) { free(l); return CUBLAS_STATUS_SUCCESS; }
+cublasStatus_t cublasLtMatrixLayoutSetAttribute(cublasLtMatrixLayout_t l, cublasLtMatrixLayoutAttribute_t a, const void *buf, size_t n) {
+  (void)a; (void)n; return l && buf ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+}
+cublasStatus_t cublasLtMatmulPreferenceCreate(cublasLtMatmulPreference_t *p) { LT_CREATE(cublasLtMatmulPreferenceOpaque_t, p); }
+cublasStatus_t cublasLtMatmulPreferenceDestroy(cublasLtMatmulPreference_t p) { free(p); return CUBLAS_STATUS_SUCCESS; }
+#undef LT_CREATE
+cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t h, cublasLtMatmulDesc_t op, cublasLtMatrixLayout_t a, cublasLtMatrixLayout_t b,
+                                              cublasLtMatrixLayout_t c, cublasLtMatrixLayout_t d, cublasLtMatmulPreference_t pref,
+                                              int requested, cublasLtMatmulHeuristicResult_t results[], int *returned) {
+  (void)h; (void)op; (void)a; (void)b; (void)c; (void)d; (void)pref; (void)results;
+  if (!returned || requested <= 0) return CUBLAS_STATUS_INVALID_VALUE;
+  *returned = 0;
+  return CUBLAS_STATUS_NOT_SUPPORTED;
+}
+cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t op, const void *alpha, const void *A, cublasLtMatrixLayout_t ad,
+                              const void *B, cublasLtMatrixLayout_t bd, const void *beta, const void *C, cublasLtMatrixLayout_t cd,
+                              void *D, cublasLtMatrixLayout_t dd, const cublasLtMatmulAlgo_t *algo, void *ws, size_t wsn, cudaStream_t s) {
+  (void)h; (void)op; (void)alpha; (void)A; (void)ad; (void)B; (void)bd; (void)beta; (void)C; (void)cd; (void)D; (void)dd; (void)algo; (void)ws; (void)wsn; (void)s;
+  fprintf(stderr, "[tinycublas] cublasLtMatmul: no cuBLASLt kernels in this library (the heuristic offers no algorithm); refused\n");
+  return CUBLAS_STATUS_NOT_SUPPORTED;
 }

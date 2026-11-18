@@ -302,6 +302,10 @@ cudaError_t cudaDeviceCanAccessPeer(int *can, int a, int b) { (void)a; (void)b; 
 cudaError_t cudaDeviceEnablePeerAccess(int dev, unsigned flags) { (void)dev; (void)flags; return E(cudaErrorNotSupported); }
 cudaError_t cudaSetDeviceFlags(unsigned flags) { (void)flags; return E(cudaSuccess); }
 cudaError_t cudaPeekAtLastError(void) { return tinycudart_peek_error(); }
+// The runtime version this library implements is the one of the headers it and ggml are compiled against (cuda-13,
+// CUDART_VERSION 13000): every struct layout and remapped name here is that version's. ggml-cuda (401563f10) asks for it
+// once, under CUDA_CHECK, in the CUDA-graph cluster check (ggml-cuda.cu ggml_cuda_graph_get_clusters) on every card.
+cudaError_t cudaRuntimeGetVersion(int *v) { if (!v) return E(cudaErrorInvalidValue); *v = CUDART_VERSION; return E(cudaSuccess); }
 
 // --- per-kernel attributes and occupancy ---
 #define MAXATTR 4096

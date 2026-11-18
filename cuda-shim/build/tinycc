@@ -42,7 +42,11 @@ while [ $# -gt 0 ]; do case "$1" in
   -std=*) std="$1";;
 esac; shift; done
 [ -n "$src" ] && [ -n "$out" ] || { echo "tinycc: need <src.cu> -o <out.o>" >&2; exit 2; }
-rel="${src#$GMAC/}"; base=$(basename "$src" .cu); fat="/tmp/tinycc_$base.fatbin"
+# TINYCC_FATBIN_DIR (default /tmp) is where the device half is kept between runs. Fatbins are named by the TU alone, so two
+# checkouts at different llama.cpp commits building into one directory overwrite each other's, and a later
+# TINYCC_REUSE_FATBIN=1 in the first tree would embed the second tree's device code without a word: give each its own.
+FATDIR=${TINYCC_FATBIN_DIR:-/tmp}
+rel="${src#$GMAC/}"; base=$(basename "$src" .cu); fat="$FATDIR/tinycc_$base.fatbin"
 # 1) device compile on the Linux box (source already synced under $GLIN)
 # TINYCC_REUSE_FATBIN=1 skips the device compile when the fatbin from a previous run is still here (host-only rebuilds)
 # A comma list (TINYCC_ARCH=sm_86,sm_120a) builds one SASS image per architecture into the same fatbin, and the host pass
@@ -54,12 +58,12 @@ if [ "${TINYCC_REUSE_FATBIN:-0}" = 1 ] && [ -s "$fat" ]; then :
 elif [ "$BACKEND" = docker ]; then
   # /ggml is the source tree read-only; /out is where the fatbin lands, so it is on the Mac the moment nvcc exits and
   # nothing has to be copied back. --network=none because a compile that reaches the network is a compile to distrust.
-  mkdir -p /tmp/tinycc-fatbin
+  mkdir -p "$FATDIR/tinycc-fatbin"
   # --platform because on Apple silicon the image is native arm64 and must be asked for as such; --user so the fatbin
   # lands owned by whoever ran the build rather than by root, which a later run could not overwrite.
-  $DOCKER run --rm --network=none --platform linux/arm64 --user "$(id -u):$(id -g)" -v "$GMAC:/ggml:ro" -v /tmp/tinycc-fatbin:/out "$CUDA_IMAGE" \
+  $DOCKER run --rm --network=none --platform linux/arm64 --user "$(id -u):$(id -g)" -v "$GMAC:/ggml:ro" -v "$FATDIR/tinycc-fatbin:/out" "$CUDA_IMAGE" \
     nvcc $NVCC_ARGS $devI $defs -o "/out/tinycc_$base.fatbin" "/ggml/$rel" >&2
-  mv "/tmp/tinycc-fatbin/tinycc_$base.fatbin" "$fat"
+  mv "$FATDIR/tinycc-fatbin/tinycc_$base.fatbin" "$fat"
 else
 $SSH "$HOST" "export PATH=/usr/local/cuda/bin:\$PATH; nvcc $NVCC_ARGS $devI $defs -o /tmp/tinycc_$base.fatbin '$GLIN/$rel'"
 scp -q ${KEY:+-i "$KEY"} -o "ControlPath=${TINYCC_CTL_DIR:-/tmp}/tinycc-%C" "$HOST:/tmp/tinycc_$base.fatbin" "$fat"

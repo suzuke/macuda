@@ -7,6 +7,7 @@
 #include <string.h>
 #include <cuda_runtime_api.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include "hostpool.h"
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
@@ -74,6 +75,30 @@ int main(void) {
       if(!bad) printf("f16-out GEMM on hardware: %d of %d correct -- Ctype=CUDA_R_16F honoured\n",M4*M4,M4*M4); }
     free(Ah16); free(Bh16); }
   cublasDestroy(h);
+  { // cuBLASLt (ggml-cuda 401563f10 fp8.cu): everything fp8.cu wraps in CUBLAS_CHECK succeeds, the heuristic offers no
+    // algorithm - fp8.cu's `status != SUCCESS || returned == 0` fallback to the cuBLAS path - and the matmul it would only
+    // call after a returned algorithm refuses
+    cublasLtHandle_t lt = NULL; cublasLtMatmulDesc_t op = NULL; cublasLtMatrixLayout_t la = NULL, lb = NULL, ld = NULL; cublasLtMatmulPreference_t pref = NULL;
+    CHECK(cublasLtCreate(&lt) == CUBLAS_STATUS_SUCCESS && lt, "cublasLtCreate");
+    CHECK(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS && op, "cublasLtMatmulDescCreate");
+    cublasOperation_t tr = CUBLAS_OP_T; int32_t cnt = 2; int64_t stride = 4096;
+    CHECK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tr, sizeof tr) == CUBLAS_STATUS_SUCCESS, "cublasLtMatmulDescSetAttribute");
+    CHECK(cublasLtMatrixLayoutCreate(&la, CUDA_R_8F_E4M3, 64, 64, 64) == CUBLAS_STATUS_SUCCESS && la &&
+          cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, 64, 8, 64) == CUBLAS_STATUS_SUCCESS && lb &&
+          cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, 64, 8, 64) == CUBLAS_STATUS_SUCCESS && ld, "cublasLtMatrixLayoutCreate x3");
+    CHECK(cublasLtMatrixLayoutSetAttribute(lb, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &cnt, sizeof cnt) == CUBLAS_STATUS_SUCCESS &&
+          cublasLtMatrixLayoutSetAttribute(lb, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof stride) == CUBLAS_STATUS_SUCCESS, "cublasLtMatrixLayoutSetAttribute");
+    CHECK(cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS && pref, "cublasLtMatmulPreferenceCreate");
+    cublasLtMatmulHeuristicResult_t heur; int returned = -1;
+    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, ld, ld, pref, 1, &heur, &returned);
+    CHECK(returned == 0 && (hs != CUBLAS_STATUS_SUCCESS || returned == 0), "heuristic offers no algorithm (status %d, returned %d)", hs, returned);
+    CHECK(cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, ld, ld, pref, 1, &heur, NULL) == CUBLAS_STATUS_INVALID_VALUE, "heuristic without a count pointer");
+    float one = 1, zero = 0;
+    CHECK(cublasLtMatmul(lt, op, &one, A, la, B, lb, &zero, C, ld, C, ld, &heur.algo, NULL, 0, NULL) == CUBLAS_STATUS_NOT_SUPPORTED, "cublasLtMatmul refuses");
+    CHECK(cublasLtMatmulPreferenceDestroy(pref) == CUBLAS_STATUS_SUCCESS && cublasLtMatrixLayoutDestroy(ld) == CUBLAS_STATUS_SUCCESS &&
+          cublasLtMatrixLayoutDestroy(lb) == CUBLAS_STATUS_SUCCESS && cublasLtMatrixLayoutDestroy(la) == CUBLAS_STATUS_SUCCESS &&
+          cublasLtMatmulDescDestroy(op) == CUBLAS_STATUS_SUCCESS && cublasLtDestroy(lt) == CUBLAS_STATUS_SUCCESS, "cuBLASLt destroys");
+  }
   // 6. streams, events, async copies, fills, queries, attributes, occupancy, and an explicit launch with marshalled args
   cudaStream_t s1 = NULL; cudaEvent_t ev = NULL; float hbuf[64]; memset(hbuf, 0, sizeof hbuf);
   CHECK(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking) == cudaSuccess && s1, "stream create");
@@ -97,10 +122,20 @@ int main(void) {
     CHECK(cudaGraphInstantiate(&ge, gr, 0) == cudaSuccess && ge != NULL, "graph instantiates");
     CHECK(cudaGraphLaunch(ge, NULL) == cudaSuccess && cudaStreamSynchronize(NULL) == cudaSuccess, "graph launches and completes");
     CHECK(cudaGraphExecUpdate(ge, gr, &ui) == cudaSuccess && ui.result == cudaGraphExecUpdateSuccess, "graph exec updates");
+    // the introspection ggml-cuda 401563f10's cluster check walks (Hopper+): zero nodes, so no clusters and no node handles
+    { size_t nn = 99; cudaGraphNode_t nodes[4] = { 0 }; enum cudaGraphNodeType ty; cudaKernelNodeAttrValue av;
+      CHECK(cudaGraphGetNodes(gr, NULL, &nn) == cudaSuccess && nn == 0, "graph reports zero nodes (count query: %zu)", nn);
+      nn = 4; CHECK(cudaGraphGetNodes(gr, nodes, &nn) == cudaSuccess && nn == 0 && nodes[0] == NULL, "graph reports zero nodes (array query)");
+      CHECK(cudaGraphGetNodes(NULL, NULL, &nn) == cudaErrorInvalidValue && cudaGraphGetNodes(gr, NULL, NULL) == cudaErrorInvalidValue, "GetNodes without a graph or a count");
+      CHECK(cudaGraphNodeGetType(nodes[0], &ty) == cudaErrorInvalidValue &&
+            cudaGraphKernelNodeGetAttribute(nodes[0], cudaLaunchAttributeClusterDimension, &av) == cudaErrorInvalidValue, "no node handle is valid");
+      (void)cudaGetLastError(); }
     CHECK(cudaStreamBeginCapture(NULL, cudaStreamCaptureModeRelaxed) == cudaSuccess && cudaStreamSynchronize(NULL) == cudaErrorStreamCaptureUnsupported &&
           cudaStreamEndCapture(NULL, &gr) == cudaErrorStreamCaptureInvalidated, "a synchronise inside a capture is refused and spoils it");
     (void)cudaGetLastError();
     CHECK(cudaGraphExecDestroy(ge) == cudaSuccess, "graph exec destroys"); }
+  { int rv = 0; CHECK(cudaRuntimeGetVersion(&rv) == cudaSuccess && rv == CUDART_VERSION && rv >= 11080, "runtime version %d (headers %d)", rv, CUDART_VERSION);
+    CHECK(cudaRuntimeGetVersion(NULL) == cudaErrorInvalidValue, "runtime version without a pointer"); (void)cudaGetLastError(); }
   CHECK(cudaGetLastError() == cudaSuccess && cudaPeekAtLastError() == cudaSuccess, "error state clean");
   printf("runtime surface: streams, events, async copies, fills, props, attrs exercised on the null device\n");
   tinycudart_hostpool_stats(&st);
