@@ -461,6 +461,20 @@ int main(void) {
           "B/legacy-after-chain: the legacy copy acquires compute >= %llu, want >= 2 (both chained launches)",
           (unsigned long long)(ce0 >= 0 ? waits_in(ce0, Q_COMPUTE) : 0));
   }
+  { // copy-queue work on stream B (a non-zero fill, a device-to-device copy: anything on gsp.copy_q) BEFORE a routed
+    // copy on B to the same bytes: the routed copy must acquire it (write after write). Only submit_batch's note of the
+    // caller's work records it - the stream has no launch and no earlier routed copy to carry the value otherwise.
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ON(ex, &sb); CHECK(!tinynv_exec_copy(ex, U, D, 4096), "B/copyq-then-routed: copy: %s", tinynv_last_error());
+    CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/copyq-then-routed: upload: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: copy-queue work, then a routed copy, one stream");
+    submitted_only("B/copyq-then-routed", base_route);
+    int c0 = nth_batch(Q_COPY, 0), ce0 = nth_batch(Q_CE, 0);
+    uint64_t r0 = c0 >= 0 ? rel_in(c0, Q_COPY) : 0;
+    CHECK(r0 && ce0 > c0 && waits_in(ce0, Q_COPY) >= r0, "B/copyq-then-routed: the routed copy acquires copy >= %llu, want >= %llu (the copy before it on its stream)",
+          (unsigned long long)(ce0 >= 0 ? waits_in(ce0, Q_COPY) : 0), (unsigned long long)r0);
+  }
   { // TINYNV_CE_CONSERVATIVE: the overlap arm again, now with stage A's ordering
     tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
     ex->ce_conservative = 1;
