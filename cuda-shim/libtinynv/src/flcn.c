@@ -13,6 +13,7 @@
 #include "internal.h"
 #include "nv_regs.h"
 #include "nv_structs.h"
+#include "tensor_unlock.h"
 #include "fw_layout.h"
 #include "vbios.h"
 #include <stdio.h>
@@ -391,6 +392,8 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
     uint32_t sc = tinynv_rd32(d, NV_PBUS_VBIOS_SCRATCH(0x0e));
     return tinynv_fail("fwsec ran and halted but the write-protected region is still unplaced (frts error code %#x)", sc >> 16);
   }
+
+  if (tinynv_tensor_unlock(g)) return -1;
 
   // the same falcon again, now selecting its riscv core, and told where gsp-rm's arguments are
   if (tinynv_flcn_reset(g, f->falcon, 1)) return -1;
