@@ -10,7 +10,8 @@
 // Correctness, each checked with sentinel values through a gemm (C = n * a when A is filled with a and B with 1), the
 // matrix the gemm reads sitting in the LAST 16 MiB of a big copy so a gemm ordered wrongly would read the old value:
 //   raw      copy (a=3) then gemm on the same stream                      -> C = 3n
-//   war      gemms on the old A (a=1) then a copy of a=2 into it, same stream -> C = n (the copy did not overtake them)
+//   war      gemms on a 16 MiB matrix of 1s, then a copy of 2s into that matrix alone, same stream -> C = n. One
+//            chunk, so a copy that overtook the gemms would land while they still run and C would read 2n
 //   ssync    copy (a=5) on B, cudaStreamSynchronize(B), gemm on C          -> C = 5n
 //   dsync    copy (a=6) on B, cudaDeviceSynchronize, gemm on C             -> C = 6n
 //   event    copy (a=7) on B, record on B, cudaStreamWaitEvent(A), gemm on A -> C = 7n
@@ -62,15 +63,14 @@ int main(int argc, char **argv) {
   big = mib << 20; mat = (size_t)n * n * 4;
   if (big < 2 * mat) { fprintf(stderr, "the copy (%zu MiB) must be at least two matrices (%zu bytes each)\n", mib, mat); return 1; }
   int ndev = 0; CK(cudaGetDeviceCount(&ndev)); if (!ndev) { fprintf(stderr, "no device\n"); return 1; }
-  tinynv_device_t tdev = NULL; unsigned et = 0, rl = 0; int routed = 0;
-  if (tinynv_device_get(&tdev, 0) == TINYNV_OK) routed = tinynv_device_copy_route(tdev, &et, &rl);
   hbig = calloc(1, big); hmat = malloc(mat);
-  float *hones = malloc(mat);
-  if (!hbig || !hmat || !hones) { fprintf(stderr, "malloc failed\n"); return 1; }
-  for (size_t i = 0; i < mat / 4; i++) hones[i] = 1.0f;
-  unsigned char *dbig, *dbig2; float *dA;
+  float *hones = malloc(mat), *htwos = malloc(mat);
+  if (!hbig || !hmat || !hones || !htwos) { fprintf(stderr, "malloc failed\n"); return 1; }
+  for (size_t i = 0; i < mat / 4; i++) { hones[i] = 1.0f; htwos[i] = 2.0f; }
+  unsigned char *dbig, *dbig2; float *dA, *dW;
   CK(cudaMalloc((void **)&dbig, big)); CK(cudaMalloc((void **)&dbig2, big));
   CK(cudaMalloc((void **)&dA, mat)); CK(cudaMalloc((void **)&dones, mat)); CK(cudaMalloc((void **)&dC, mat));
+  CK(cudaMalloc((void **)&dW, mat));
   CK(cudaMemcpy(dA, hones, mat, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dones, hones, mat, cudaMemcpyHostToDevice));
   cudaStream_t sa, sb, sc;
   CK(cudaStreamCreateWithFlags(&sa, cudaStreamNonBlocking)); CK(cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking));
@@ -81,6 +81,9 @@ int main(int argc, char **argv) {
   // ---- timing ----
   gemms(sa, dA, 1); CK(cudaStreamSynchronize(sa));                       // warm: module load, first touch
   copy_big(dbig, 1.0f, sb); CK(cudaStreamSynchronize(sb));
+  // asked once the device is up (the warm-up above booted it): routing is decided at boot and may have been refused
+  tinynv_device_t tdev = NULL; unsigned et = 0, rl = 0; int routed = 0;
+  if (tinynv_device_get(&tdev, 0) == TINYNV_OK) routed = tinynv_device_copy_route(tdev, &et, &rl);
   double t0 = now(); gemms(sa, dA, 4); CK(cudaStreamSynchronize(sa)); double one = (now() - t0) / 4;
   t0 = now(); copy_big(dbig, 1.0f, sb); CK(cudaStreamSynchronize(sb)); double tc = now() - t0;
   int reps = (int)(tc / one + 0.5); if (reps < 1) reps = 1;
@@ -94,9 +97,9 @@ int main(int argc, char **argv) {
   // raw: copy a=3 into the matrix the gemm then reads, same stream
   float *tailA = (float *)(dbig + big - mat), *tailB = (float *)(dbig2 + big - mat);
   copy_big(dbig, 3.0f, sb); gemms(sb, tailA, 1); fails += check("raw", sb, 3.0f);
-  // war: the matrix holds 1 (set and synchronised); gemms read it, then a copy of 2 into it on the same stream
-  CK(cudaMemcpy(tailA, hones, mat, cudaMemcpyHostToDevice));
-  gemms(sb, tailA, reps > 8 ? 8 : reps); copy_big(dbig, 2.0f, sb); fails += check("war", sb, 1.0f);
+  // war: W holds 1 (set and synchronised); the gemms read it, then a one-chunk copy of 2s into W on the same stream
+  CK(cudaMemcpy(dW, hones, mat, cudaMemcpyHostToDevice));
+  gemms(sb, dW, reps); CK(cudaMemcpyAsync(dW, htwos, mat, cudaMemcpyHostToDevice, sb)); fails += check("war", sb, 1.0f);
   // ssync / dsync: a copy on B, then a CPU synchronisation, then a gemm on a third stream that knows nothing of B
   copy_big(dbig2, 5.0f, sb); CK(cudaStreamSynchronize(sb)); gemms(sc, tailB, 1); fails += check("ssync", sc, 5.0f);
   copy_big(dbig2, 6.0f, sb); CK(cudaDeviceSynchronize()); gemms(sc, tailB, 1); fails += check("dsync", sc, 6.0f);

@@ -330,6 +330,16 @@ int main(void) {
     CHECK(count_q(Q_COPY) >= 3, "off: the chunks did not go to the graphics copy queue");
   }
 
+  { // the engine TINYNV_CE_ROUTE picks when TINYNV_CE_GROUP names none: the lowest COPYn off the compute runlist
+    const uint32_t e3060[] = {0x1, 0x9, 0xa, 0xb, 0xc, 0xd}, r3060[] = {0, 0, 0, 1, 2, 8};   // the RTX 3060's table
+    const uint32_t e3060s[] = {0xd, 0xc, 0x1, 0xb, 0xa, 0x9}, r3060s[] = {8, 2, 0, 1, 0, 0}; // the same, listed shuffled
+    const uint32_t eall[] = {0x1, 0x9, 0xa}, rall[] = {0, 0, 0};
+    CHECK(tinynv_ce_route_pick(e3060, r3060, 6, 0) == 0xb, "pick: the 3060 table gives %#x, want 0xb", tinynv_ce_route_pick(e3060, r3060, 6, 0));
+    CHECK(tinynv_ce_route_pick(e3060s, r3060s, 6, 0) == 0xb, "pick: the 3060 table out of order gives %#x, want 0xb", tinynv_ce_route_pick(e3060s, r3060s, 6, 0));
+    CHECK(tinynv_ce_route_pick(eall, rall, 3, 0) == 0, "pick: every copy engine on the compute runlist gives %#x, want 0", tinynv_ce_route_pick(eall, rall, 3, 0));
+    CHECK(tinynv_ce_route_pick(e3060, r3060, 6, 1) == 0x9, "pick: compute on runlist 1 gives %#x, want 0x9", tinynv_ce_route_pick(e3060, r3060, 6, 1));
+  }
+
   // ---- stage B: per-stream ordering. ex->ord is what tinynv.c sets for the length of each call; NULL is legacy ----
   static tinynv_exec_order_t sa, sb, sc;
 #define ON(ex, o) ((ex)->ord = (o))
