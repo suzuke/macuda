@@ -60,6 +60,10 @@ struct tinynv_pci {
   int (*reset)(tinynv_pci_t *p);   // function level reset
   void (*quiesce)(tinynv_pci_t *p); // clear bus master, read back. safe to call at any time, including twice
   void (*close)(tinynv_pci_t *p);
+  // 1 once the connection to the process that owns the device is gone (latched, never cleared); NULL on a backend with
+  // no such connection. Every read after that returns the backend's failure sentinel, so all ones from then on says
+  // "server lost", not "the device read all ones".
+  int (*transport_dead)(tinynv_pci_t *p);
 };
 
 // register access. the compiler must not reorder or merge these, and a bar that is not mapped turns each one into a call

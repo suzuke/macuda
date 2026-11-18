@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -29,6 +31,12 @@ _Static_assert(sizeof(resp_t) == 17, "response is 17 packed bytes");
 
 typedef struct {
   int fd;
+  // THE SERVER IS GONE, latched by the first transfer that hit end of file or a socket error and never cleared. On
+  // 2026-11-18 the server's session ended mid-upload and every later read came back 0xffffffff, which submit.c then
+  // reported as the device reading all ones; the investigation chased the card. From here on every call fails at once
+  // without touching the socket, and transport_dead lets a caller name the real cause.
+  int dead;
+  char dead_why[160];
   // A read whose request has been sent and whose reply has not been taken. Any other request must first take that
   // reply (the socket carries one conversation), so rpc() drains it into pending_val and rd32_recv finds it there.
   int pending, pending_done;
@@ -133,11 +141,39 @@ void tinynv_rpc_stats_boot_done(void) {
 }
 static uint64_t rs_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 
-static int xfer_all(int fd, void *buf, size_t len, int sending) {
+// Latch the loss and say so ONCE, then push the line to disk: the 2026-11-18 panic came 32 s after the loss and the
+// client's log (a regular file, tools/serve.sh) lost its last ~30 s, so an unsynced line may as well not be written.
+// Classification only: what each caller gets back is the same sentinel it got before.
+static int tg_lose(tg_t *tg, const char *what) {
+  if (!tg->dead) {
+    tg->dead = 1;
+    snprintf(tg->dead_why, sizeof(tg->dead_why), "%s", what);
+    fprintf(stderr, "libtinynv: tinygpu server connection lost (%s). Every later call to the device fails at once "
+            "without touching the socket, and reads from here on are this transport's 0xffffffff, not the device's\n", what);
+    fflush(stderr);
+    struct stat st;
+    if (fstat(2, &st) == 0 && S_ISREG(st.st_mode)) {
+#ifdef F_FULLFSYNC
+      if (fcntl(2, F_FULLFSYNC) == -1)
+#endif
+        fsync(2);
+    }
+  }
+  return tinynv_fail("tinygpu server connection lost (%s)", tg->dead_why);
+}
+
+static int xfer_all(tg_t *tg, void *buf, size_t len, int sending) {
+  if (tg->dead) return tinynv_fail("tinygpu server connection lost (%s)", tg->dead_why);
   for (size_t off = 0; off < len;) {
-    ssize_t n = sending ? send(fd, (char *)buf + off, len - off, 0) : recv(fd, (char *)buf + off, len - off, 0);
-    if (n <= 0) return tinynv_fail("tinygpu: connection closed after %zu of %zu bytes", off, len);
-    off += (size_t)n;
+    ssize_t n = sending ? send(tg->fd, (char *)buf + off, len - off, 0) : recv(tg->fd, (char *)buf + off, len - off, 0);
+    if (n > 0) { off += (size_t)n; continue; }
+    // An interrupted call fails this transfer as it always did and latches nothing: a signal is not a lost server,
+    // and a latch here would turn the signal handler's bus-master clear (tg_quiesce) into a no-op.
+    if (n < 0 && errno == EINTR) return tinynv_fail("tinygpu: %s interrupted after %zu of %zu bytes", sending ? "send" : "recv", off, len);
+    char what[96];
+    snprintf(what, sizeof(what), "%s %s after %zu of %zu bytes", sending ? "send" : "recv",
+             n == 0 ? "hit end of file" : strerror(errno), off, len);
+    return tg_lose(tg, what);
   }
   return 0;
 }
@@ -148,14 +184,15 @@ static uint32_t tg_take_pending(tg_t *tg) {
   resp_t rp;
   uint32_t v = 0xffffffffu;
   tg->pending = 0;
-  if (xfer_all(tg->fd, &rp, sizeof(rp), 0)) return v;
-  if (rp.status != 0) {
-    char msg[256];
-    size_t n = rp.resp0 < sizeof(msg) ? (size_t)rp.resp0 : sizeof(msg);
-    if (n) xfer_all(tg->fd, msg, n, 0);
+  if (xfer_all(tg, &rp, sizeof(rp), 0)) return v;
+  if (rp.status != 0) { // the server's reason, kept rather than read and dropped
+    char msg[256] = "unknown error";
+    size_t n = rp.resp0 < sizeof(msg) - 1 ? (size_t)rp.resp0 : sizeof(msg) - 1;
+    if (n && !xfer_all(tg, msg, n, 0)) msg[n] = 0;
+    if (!tg->dead) tinynv_fail("tinygpu: split mmio read failed: %s", msg);
     return v;
   }
-  xfer_all(tg->fd, &v, 4, 0);
+  xfer_all(tg, &v, 4, 0);
   return v;
 }
 // one request, one reply. payload is appended to the request; readout is the bulk data that follows the reply.
@@ -166,8 +203,8 @@ static int rpc(tg_t *tg, resp_t *rp, uint8_t cmd, uint32_t bar, uint64_t a0, uin
   rs_count(cmd, RK_TRIP, payload_len + readout_len);
   if (cmd == CMD_MMIO_READ) rs_off(0, bar, a0);
   uint64_t t0 = g_rs > 0 ? rs_now() : 0;
-  if (xfer_all(tg->fd, &rq, sizeof(rq), 1)) return -1;
-  if (payload_len && xfer_all(tg->fd, (void *)payload, payload_len, 1)) return -1;
+  if (xfer_all(tg, &rq, sizeof(rq), 1)) return -1;
+  if (payload_len && xfer_all(tg, (void *)payload, payload_len, 1)) return -1;
 
   if (fd_out) { // the reply carries a descriptor for the shared memory the server just created
     *fd_out = -1;
@@ -175,18 +212,20 @@ static int rpc(tg_t *tg, resp_t *rp, uint8_t cmd, uint32_t bar, uint64_t a0, uin
     struct iovec iov = {.iov_base = rp, .iov_len = sizeof(*rp)};
     struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof(cbuf)};
     ssize_t n = recvmsg(tg->fd, &msg, 0);
+    if (n == 0 || (n < 0 && errno != EINTR)) return tg_lose(tg, n ? strerror(errno) : "recvmsg hit end of file");
     if (n != (ssize_t)sizeof(*rp)) return tinynv_fail("tinygpu: short reply (%zd bytes)", n);
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c))
       if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(fd_out, CMSG_DATA(c), sizeof(int));
-  } else if (xfer_all(tg->fd, rp, sizeof(*rp), 0)) return -1;
+  } else if (xfer_all(tg, rp, sizeof(*rp), 0)) return -1;
 
   if (rp->status != 0) { // the message follows the reply, resp0 bytes of it
     char msg[256] = "unknown error";
     size_t n = rp->resp0 < sizeof(msg) - 1 ? (size_t)rp->resp0 : sizeof(msg) - 1;
-    if (n && !xfer_all(tg->fd, msg, n, 0)) msg[n] = 0;
+    if (n && !xfer_all(tg, msg, n, 0)) msg[n] = 0;
+    if (tg->dead) return -1; // the message itself was cut off by the loss, which tg_lose has already recorded
     return tinynv_fail("tinygpu: command %u failed: %s", cmd, msg);
   }
-  if (readout_len && xfer_all(tg->fd, readout, readout_len, 0)) return -1;
+  if (readout_len && xfer_all(tg, readout, readout_len, 0)) return -1;
   if (t0) atomic_fetch_add_explicit(&g_rwait_ns, rs_now() - t0, memory_order_relaxed);
   return 0;
 }
@@ -228,7 +267,7 @@ static int tg_rd32_send(tinynv_mmio_t *m, uint64_t off) {
   tg->pending_done = 0;
   req_t rq = {.cmd = CMD_MMIO_READ, .bar = (uint32_t)m->bar, .arg0 = m->off + off, .arg1 = 4};
   rs_count(CMD_MMIO_READ, RK_ASYNC, 4); rs_off(0, (uint32_t)m->bar, m->off + off);
-  if (xfer_all(tg->fd, &rq, sizeof(rq), 1)) return -1;
+  if (xfer_all(tg, &rq, sizeof(rq), 1)) return -1;
   tg->pending = 1;
   return 0;
 }
@@ -242,7 +281,7 @@ static void tg_wr32(tinynv_mmio_t *m, uint64_t off, uint32_t v) {
   tg_t *tg = m->ctx;
   req_t rq = {.cmd = CMD_MMIO_WRITE, .bar = (uint32_t)m->bar, .arg0 = m->off + off, .arg1 = 4};
   rs_count(CMD_MMIO_WRITE, RK_POSTED, 4); rs_off(1, (uint32_t)m->bar, m->off + off);
-  if (!xfer_all(tg->fd, &rq, sizeof(rq), 1)) xfer_all(tg->fd, &v, 4, 1);
+  if (!xfer_all(tg, &rq, sizeof(rq), 1)) xfer_all(tg, &v, 4, 1);
 }
 static void tg_rd_block(tinynv_mmio_t *m, uint64_t off, void *dst, size_t n) {
   resp_t rp;
@@ -252,7 +291,7 @@ static void tg_wr_block(tinynv_mmio_t *m, uint64_t off, const void *src, size_t 
   tg_t *tg = m->ctx;
   req_t rq = {.cmd = CMD_MMIO_WRITE, .bar = (uint32_t)m->bar, .arg0 = m->off + off, .arg1 = n};
   rs_count(CMD_MMIO_WRITE, RK_POSTED, n); rs_off(1, (uint32_t)m->bar, m->off + off);
-  if (!xfer_all(tg->fd, &rq, sizeof(rq), 1)) xfer_all(tg->fd, (void *)src, n, 1);
+  if (!xfer_all(tg, &rq, sizeof(rq), 1)) xfer_all(tg, (void *)src, n, 1);
 }
 
 static int tg_bar_map(tinynv_pci_t *p, int bar, uint64_t off, uint64_t size, tinynv_mmio_t *out) {
@@ -324,6 +363,8 @@ static int tg_reset(tinynv_pci_t *p) {
   return rpc(p->ctx, &rp, CMD_RESET, 0, 0, 0, 0, NULL, 0, NULL, 0, NULL);
 }
 
+// With the loss latched, the read below fails at once and reads 0xffffffff, so this returns without a write - which
+// is what it did before the latch existed, when the same read went to a dead socket and came back the same way.
 static void tg_quiesce(tinynv_pci_t *p) {
   uint32_t cmd = tg_cfg_read(p, PCI_COMMAND, 2);
   // gone: a failed server call reads 0xffffffff (tg_cfg_read), an absent function's 2-byte read 0xffff. Writing
@@ -332,6 +373,8 @@ static void tg_quiesce(tinynv_pci_t *p) {
   tg_cfg_write(p, PCI_COMMAND, 2, cmd & ~PCI_COMMAND_MASTER);
   tg_cfg_read(p, PCI_COMMAND, 2); // read back, so the write has landed before any mapping is torn down
 }
+
+static int tg_transport_dead(tinynv_pci_t *p) { tg_t *tg = p->ctx; return tg && tg->dead; }
 
 static void tg_close(tinynv_pci_t *p) {
   tg_t *tg = p->ctx;
@@ -361,6 +404,6 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
   tg->fd = fd;
   *out = (tinynv_pci_t){.ctx = tg, .live = 1, .name = "usb4", .cfg_read = tg_cfg_read, .cfg_write = tg_cfg_write, .bar_info = tg_bar_info,
                         .bar_map = tg_bar_map, .bar_unmap = tg_bar_unmap, .dma_alloc = tg_dma_alloc, .dma_free = tg_dma_free,
-                        .reset = tg_reset, .quiesce = tg_quiesce, .close = tg_close};
+                        .reset = tg_reset, .quiesce = tg_quiesce, .close = tg_close, .transport_dead = tg_transport_dead};
   return 0;
 }

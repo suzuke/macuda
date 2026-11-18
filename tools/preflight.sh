@@ -53,12 +53,20 @@ dart_verdict() { if [ "$1" = 1 ]; then [ "$2" = 1 ] && [ "$3" = 1 ] && echo stal
 # .dext-seen; a newer one refuses until a human runs tools/dart-stale.sh --clear (which forgets both records).
 #   dext_verdict <recorded_epoch|0> <newest_epoch>  ->  first | same | newer
 dext_verdict() { if [ "$1" = 0 ]; then echo first; elif [ "$2" -gt "$1" ]; then echo newer; else echo same; fi; }
+# WHICH KIND OF "NEWER" (M8 of the 2026-11-18 DART panic): every REBOOT starts a new dext instance too, so after that
+# night's panic the reboot alone tripped "re-enumerated" - true by construction, and read as evidence it was not. The
+# record now carries kern.boottime, and the report says which it was. WORDING ONLY: either way the verdict is ABORT and
+# a human runs tools/dart-stale.sh --clear.
+#   boot_verdict <recorded_boot|0> <current_boot>  ->  unknown | rebooted | same-boot
+boot_verdict() { if [ "$1" = 0 ]; then echo unknown; elif [ "$1" != "$2" ]; then echo rebooted; else echo same-boot; fi; }
 if [ "${1:-}" = --selftest ]; then
   ok=1; chk() { r=$(dart_verdict $1 $2 $3); [ "$r" = "$4" ] || { echo "SELFTEST FAIL: dart_verdict $1 $2 $3 = $r, expected $4"; ok=0; }; }
   chk 1 1 1 stale; chk 1 1 0 new-fault; chk 1 0 0 new-fault; chk 1 0 1 new-fault; chk 0 1 0 reenum; chk 0 1 1 reenum; chk 0 0 0 clean; chk 0 0 1 clean
   chd() { r=$(dext_verdict $1 $2); [ "$r" = "$3" ] || { echo "SELFTEST FAIL: dext_verdict $1 $2 = $r, expected $3"; ok=0; }; }
   chd 0 1000 first; chd 1000 1000 same; chd 1000 999 same; chd 1000 1001 newer
-  [ $ok = 1 ] && { echo "preflight --selftest: dart_verdict OK on all 8 combinations (absent+snapshot REFUSES); dext_verdict OK on 4 (a newer instance REFUSES)"; exit 0; } || exit 1
+  chb() { r=$(boot_verdict $1 $2); [ "$r" = "$3" ] || { echo "SELFTEST FAIL: boot_verdict $1 $2 = $r, expected $3"; ok=0; }; }
+  chb 0 1763500000 unknown; chb 1763400000 1763500000 rebooted; chb 1763500000 1763500000 same-boot
+  [ $ok = 1 ] && { echo "preflight --selftest: dart_verdict OK on all 8 combinations (absent+snapshot REFUSES); dext_verdict OK on 4 (a newer instance REFUSES); boot_verdict OK on 3 (wording only)"; exit 0; } || exit 1
 fi
 # FOUR STATES, not two. The property is written by the DART when a fault latches and lives with the NUB: only a
 # re-enumeration removes it. So: present and byte-identical to the snapshot = stale, proceed; present and different = a
@@ -102,13 +110,25 @@ for dp in $(pgrep -f '^/Library/SystemExtensions/[^ ]*/org\.tinygrad\.tinygpu\.d
   [ "$ep" -gt "$dext_newest" ] && { dext_newest=$ep; dext_pid=$dp; }
 done
 rec=0; [ -f "$DEXT_SEEN" ] && rec=$(sed -n 's/^newest=//p' "$DEXT_SEEN" | head -1); rec=${rec:-0}
+boot_now=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\),.*/\1/p'); boot_now=${boot_now:-0}
+rec_boot=0; [ -f "$DEXT_SEEN" ] && rec_boot=$(sed -n 's/^boot=//p' "$DEXT_SEEN" | head -1); rec_boot=${rec_boot:-0}
 case $(dext_verdict "$rec" "$dext_newest") in
-  first) printf 'newest=%s\npid=%s\ncount=%s\nwhen=%s\n' "$dext_newest" "$dext_pid" "$dext_n" "$(date -Iseconds)" > "$DEXT_SEEN"
+  first) printf 'newest=%s\npid=%s\ncount=%s\nwhen=%s\nboot=%s\n' "$dext_newest" "$dext_pid" "$dext_n" "$(date -Iseconds)" "$boot_now" > "$DEXT_SEEN"
          echo "   dext instances: $dext_n, newest pid $dext_pid started $(date -r "$dext_newest" '+%F %T') - recorded (first sighting)" ;;
   same)  echo "   dext instances: $dext_n, newest pid $dext_pid started $(date -r "$dext_newest" '+%F %T') - unchanged since the record" ;;
   newer) echo "   dext instances: $dext_n, NEWEST pid $dext_pid started $(date -r "$dext_newest" '+%F %T') is NEWER than the record ($(date -r "$rec" '+%F %T')):"
-         echo "   the card has been RE-ENUMERATED since the last clean step. A human looks first; then tools/dart-stale.sh --clear."
-         fail "a new dext instance since the record" ;;
+         case $(boot_verdict "$rec_boot" "$boot_now") in
+           rebooted)  echo "   the MACHINE HAS REBOOTED since the record (recorded in the boot of $(date -r "$rec_boot" '+%F %T'), this boot $(date -r "$boot_now" '+%F %T'))."
+                      echo "   Every reboot starts a new dext instance, so this is NOT by itself evidence that the card re-enumerated."
+                      echo "   Still a changed machine: a human looks first (why did it reboot?); then tools/dart-stale.sh --clear."
+                      fail "a new dext instance since the record (machine rebooted since; not by itself a re-enumeration)" ;;
+           same-boot) echo "   same boot as the record ($(date -r "$boot_now" '+%F %T')), so the card has been RE-ENUMERATED since the last clean step."
+                      echo "   A human looks first; then tools/dart-stale.sh --clear."
+                      fail "a new dext instance since the record (same boot: the card re-enumerated)" ;;
+           *)         echo "   the record carries no boot time (written before preflight kept one), so a reboot and a re-enumeration cannot be"
+                      echo "   told apart here. Either way a human looks first; then tools/dart-stale.sh --clear."
+                      fail "a new dext instance since the record (reboot or re-enumeration: the record has no boot time)" ;;
+         esac ;;
 esac
 echo "-- dext / server processes --"
 for p in $(pgrep -f "tinygpu.driver2|org.tinygrad.tinygpu"); do ps -p $p -o pid,state,%cpu,time,command | tail -1 | cut -c1-100 | sed 's/^/   /'; done

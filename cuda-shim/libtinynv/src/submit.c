@@ -370,8 +370,16 @@ int tinynv_submit_ring_complete(tinynv_gpu_t *g) {
   uint32_t want = g->ring_want, got = nv_rd32_recv(&g->dev.vram);
   if (got != want && g->submit_checked < 4) {
     g->submit_checked++;
-    fprintf(stderr, "tinynv: the write pointer read back as %u where %u was just written - the read before the doorbell "
-            "is not reaching the device, so it is not ordering anything the engine sees\n", got, want);
+    // Which failure this is, before anyone chases it: on 2026-11-18 "4294967295" here was the TinyGPU backend's
+    // sentinel for a server that had gone, and it read as a card returning all ones. Only the wording differs.
+    tinynv_pci_t *pci = g->dev.pci;
+    if (pci && pci->transport_dead && pci->transport_dead(pci))
+      fprintf(stderr, "tinynv: the write pointer read back as %u where %u was just written - not from the device: the "
+              "tinygpu server connection is lost, so this is the transport's failure value and neither this read nor "
+              "the doorbells reach the card\n", got, want);
+    else
+      fprintf(stderr, "tinynv: the write pointer read back as %u where %u was just written - the read before the doorbell "
+              "is not reaching the device, so it is not ordering anything the engine sees\n", got, want);
   } else if (got == want && !g->submit_checked) {
     g->submit_checked = 1;
     fprintf(stderr, "tinynv: the write pointer reads back as written, so the read before the doorbell reaches the "
