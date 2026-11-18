@@ -8,8 +8,12 @@
 static void unreachable(const char *f) { printf("  FAIL: the tested path reached %s, a card-only dependency\n", f); exit(1); }
 void tinynv_cmd_local_memory(void);
 void tinynv_cmd_local_memory(void) { unreachable("tinynv_cmd_local_memory"); }
+#ifndef FAKE_EXEC_CE_ROUTE   // test_ce_route records the CE channel's class binding, so it brings these two itself
+void tinynv_cmd_copy_setup(void);
+void tinynv_cmd_copy_setup(void) { unreachable("tinynv_cmd_copy_setup"); }
 void tinynv_cmd_set_object(void);
 void tinynv_cmd_set_object(void) { unreachable("tinynv_cmd_set_object"); }
+#endif
 void tinynv_cmd_shader_window(void);
 void tinynv_cmd_shader_window(void) { unreachable("tinynv_cmd_shader_window"); }
 void tinynv_cubin_image(void);
@@ -20,8 +24,10 @@ void tinynv_image_relocate(void);
 void tinynv_image_relocate(void) { unreachable("tinynv_image_relocate"); }
 void tinynv_local_memory_size(void);
 void tinynv_local_memory_size(void) { unreachable("tinynv_local_memory_size"); }
+#ifndef FAKE_EXEC_CE_ROUTE   // test_ce_route drives the CE bring-up and brings its own allocator, ring state and free
 void tinynv_mm_alloc_buffer(void);
 void tinynv_mm_alloc_buffer(void) { unreachable("tinynv_mm_alloc_buffer"); }
+#endif
 void tinynv_mm_alloc_va(void);
 void tinynv_mm_alloc_va(void) { unreachable("tinynv_mm_alloc_va"); }
 void tinynv_mm_free_va(void);
@@ -60,16 +66,20 @@ void tinynv_qmd_program(void);
 void tinynv_qmd_program(void) { unreachable("tinynv_qmd_program"); }
 void tinynv_qmd_release(void);
 void tinynv_qmd_release(void) { unreachable("tinynv_qmd_release"); }
+#ifndef FAKE_EXEC_CE_ROUTE
 void tinynv_queue_state(void);
 void tinynv_queue_state(void) { unreachable("tinynv_queue_state"); }
+#endif
 void tinynv_ring_entry(void);
 void tinynv_ring_entry(void) { unreachable("tinynv_ring_entry"); }
 void tinynv_ring_entry_read(void);
 void tinynv_ring_entry_read(void) { unreachable("tinynv_ring_entry_read"); }
 void tinynv_sass_version(void);
 void tinynv_sass_version(void) { unreachable("tinynv_sass_version"); }
+#ifndef FAKE_EXEC_CE_ROUTE
 void tinynv_vmap_free(void);
 void tinynv_vmap_free(void) { unreachable("tinynv_vmap_free"); }
+#endif
 void tinynv_submit_ring_complete(void);
 void tinynv_submit_ring_complete(void) { unreachable("tinynv_submit_ring_complete"); }
 void tinynv_submit_ring_send(void);

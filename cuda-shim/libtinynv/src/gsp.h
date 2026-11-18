@@ -81,9 +81,15 @@ typedef struct {
   // shares CE0's PBDMA with GR0 and cannot overlap a kernel; CE1 reports its own runlist and its own PBDMA pair.
   // Allocated and scheduled but not yet routed to - see gsp.c.
   uint32_t ce_group, ce_ctxshare, ce_runlist, ce_engine;
+  // TINYNV_CE_ROUTE=1 was asked for, and whether everything the CE group needs came back with RM status 0: the group,
+  // its context share, the channel and its copy object, and the schedule. Only a ready group is routed to (exec.c).
+  int ce_route_asked, ce_alloc_ok, ce_ready;
   // RM's own status from the last control call. rm_control_as reports but does not enforce it, so a caller that
   // actually depends on a control having worked has to look here.
   uint32_t last_ctrl_status;
+  // The same for allocations: the last status, and how many allocations ever came back with a nonzero one. The count
+  // lets a caller ask "did anything inside this sequence get refused" without threading a status through every call.
+  uint32_t last_alloc_status, alloc_refused;
   tinynv_queue_t ce_copy_q;
   uint64_t gr_size, patch_size; // how big the graphics context and its patch buffer must be, per the firmware
   uint64_t reserved_va;   // the range whose page tables gsp-rm was given
@@ -179,5 +185,17 @@ int tinynv_gsp_sensors_init(tinynv_gpu_t *g, uint64_t poll_mask, uint32_t freq_m
 int tinynv_gsp_sensors_read(tinynv_gpu_t *g, tinynv_rusd_t *out);
 
 void tinynv_gsp_fini(tinynv_gpu_t *g);
+
+// TINYNV_CE_ROUTE's choice of engine when TINYNV_CE_GROUP does not name one: the lowest copy engine type
+// (NV2080_ENGINE_TYPE_COPY0 = 0x9 .. COPY9 = 0x12) whose runlist is not the compute channel's, 0 when there is none.
+// Lowest type rather than table order, so the answer does not depend on how GSP-RM happens to list the engines.
+// RTX 3060 (GA106): CE0/CE1 share GR0's runlist 0, CE2 (0xb) is on runlist 1 -> 0xb. RTX 5090: CE1 (0xa) on runlist 1.
+static inline uint32_t tinynv_ce_route_pick(const uint32_t *engines, const uint32_t *runlists, uint32_t n,
+                                            uint32_t compute_runlist) {
+  for (uint32_t t = 0x9; t <= 0x12; t++)
+    for (uint32_t i = 0; i < n; i++)
+      if (engines[i] == t && runlists[i] != compute_runlist) return t;
+  return 0;
+}
 
 #endif

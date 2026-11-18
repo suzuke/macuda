@@ -91,7 +91,8 @@ struct tinynv_kernel {
 };
 
 struct tinynv_stream { tinynv_device_t dev; uint64_t submitted; };
-struct tinynv_event { tinynv_device_t dev; uint64_t value; };
+// ce: the dedicated copy channel's timeline value at the record (TINYNV_CE_ROUTE), 0 when nothing was routed
+struct tinynv_event { tinynv_device_t dev; uint64_t value, ce; };
 
 static struct tinynv_device g_dev;
 static int g_inited;
@@ -981,6 +982,10 @@ tinynv_status_t tinynv_memset(tinynv_stream_t s, tinynv_devptr_t dst, int v, siz
       size_t m = n - off < chunk ? n - off : chunk;
       bad = tinynv_exec_copy(ex, (uint64_t)dst + off, ex->stage[0].va, m);
     }
+    // Those copies read the pattern out of staging buffer 0 after this returns, so the next writer of that buffer (an
+    // upload chunk, whose claim waits only for what stage_pend names) must wait for them. Nothing recorded it: an upload
+    // straight after a non-zero fill could memcpy over the pattern while the fill's copies still read it.
+    if (!bad) ex->stage_pend[0] = ex->q_last[1];
     pthread_mutex_unlock(&g_lock);
     return bad ? TINYNV_ERR_DRIVER : TINYNV_OK;
   }
@@ -1214,6 +1219,7 @@ tinynv_status_t tinynv_event_record(tinynv_event_t e, tinynv_stream_t s) {
   if (s->dev->has_pci && s->dev->booted) {
     if (WITH_LOCK(tinynv_exec_flush(&s->dev->exec))) return TINYNV_ERR_DRIVER;
     e->value = s->dev->exec.timeline;
+    e->ce = s->dev->exec.ce_route ? s->dev->exec.ce_reserved : 0;   // the copies routed so far, on their own counter
   } else {
     e->value = s->submitted;
   }
@@ -1221,16 +1227,18 @@ tinynv_status_t tinynv_event_record(tinynv_event_t e, tinynv_stream_t s) {
 }
 tinynv_status_t tinynv_event_sync(tinynv_event_t e) {
   if (!e || !e->dev->has_pci || !e->dev->booted) return TINYNV_OK;
-  return WITH_LOCK(tinynv_exec_wait(&e->dev->exec, e->value, 30.0)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+  return WITH_LOCK(tinynv_exec_wait(&e->dev->exec, e->value, 30.0) ||
+                   tinynv_exec_wait_ce(&e->dev->exec, e->ce, 30.0)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
 }
 // Whether tinynv_event_sync would return at once, without waiting. The answer is tinynv_exec_reached - the predicate the
 // wait itself exits on - so "complete" cannot be said of work the engine has not retired. A caching allocator polls
 // this to decide when a block freed on one stream may be reused, and a wrong 1 hands out memory a kernel still writes.
 tinynv_status_t tinynv_event_query(tinynv_event_t e, int *complete) {
   if (!e || !complete) return TINYNV_ERR_INVALID;
-  if (!e->dev->has_pci || !e->dev->booted || !e->value) { *complete = 1; return TINYNV_OK; }
+  if (!e->dev->has_pci || !e->dev->booted || (!e->value && !e->ce)) { *complete = 1; return TINYNV_OK; }
   int r = WITH_LOCK(tinynv_exec_reached(&e->dev->exec, e->value));
   if (r < 0) return TINYNV_ERR_DRIVER;
+  if (r && e->ce) { r = WITH_LOCK(tinynv_exec_reached_ce(&e->dev->exec, e->ce)); if (r < 0) return TINYNV_ERR_DRIVER; }
   *complete = r;
   return TINYNV_OK;
 }
@@ -1269,7 +1277,15 @@ tinynv_status_t tinynv_mem_info(tinynv_device_t d, uint64_t *free_bytes, uint64_
 tinynv_status_t tinynv_stream_wait_event(tinynv_stream_t s, tinynv_event_t e) {
   if (!ON_GPU(s) || !e) return TINYNV_OK;
   NEED_GPU(s);
-  return WITH_LOCK(tinynv_exec_wait(&s->dev->exec, e->value, 30.0)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+  return WITH_LOCK(tinynv_exec_wait(&s->dev->exec, e->value, 30.0) ||
+                   tinynv_exec_wait_ce(&s->dev->exec, e->ce, 30.0)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+}
+
+int tinynv_device_copy_route(tinynv_device_t d, unsigned *engine_type, unsigned *runlist) {
+  int on = d && d->has_pci && d->booted && d->exec.ce_route;
+  if (engine_type) *engine_type = on ? d->gpu.gsp.ce_engine : 0;
+  if (runlist) *runlist = on ? d->gpu.gsp.ce_runlist : 0;
+  return on;
 }
 
 tinynv_status_t tinynv_launch(tinynv_stream_t s, tinynv_kernel_t k, unsigned gx, unsigned gy, unsigned gz,

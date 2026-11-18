@@ -167,6 +167,9 @@ tinynv_status_t tinynv_event_elapsed(float *ms, tinynv_event_t start, tinynv_eve
 // free is total minus what it has handed out and not had back, so a malloc that lands moves it. Refused by name on
 // the null device, which has no allocator to ask.
 tinynv_status_t tinynv_mem_info(tinynv_device_t, uint64_t *free_bytes, uint64_t *total_bytes);
+// Whether bulk host-to-device copies go to a copy engine of their own (TINYNV_CE_ROUTE=1, which the driver checks at
+// boot and may refuse): 1 with that engine's NV2080 type and runlist, 0 when every copy stays on the graphics queue.
+int tinynv_device_copy_route(tinynv_device_t, unsigned *engine_type, unsigned *runlist);
 // A module's data object (__device__ / __constant__ data the image carries) by name: its device address and its size,
 // both from the module - the size is the symbol's st_size, never a guess. What cuModuleGetGlobal and cuLibraryGetGlobal
 // answer. On a card the module is uploaded first if nothing has launched from it. Refused by name for a name the

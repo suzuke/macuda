@@ -476,6 +476,22 @@ typedef struct {
   int refill_armed;     // a head timestamp is in flight and its pair can be read once that batch retires
   uint64_t refill_from; // when the batch before the standstill finished, snapshotted before the refill overwrites it
   uint32_t slm_per_thread;
+
+  // TINYNV_CE_ROUTE=1 (off by default): the bulk host-to-device path's chunks go to gsp.ce_copy_q, a channel on a copy
+  // engine whose runlist is not the compute channel's, so a copy can run while a kernel does. Everything else - inline
+  // and descriptor uploads, downloads, device-to-device, fills - stays where it was. The channel has its OWN timeline:
+  // its own counter and its own slot (SEM_CE in exec.c), never a value of the shared one, and its own command buffers in
+  // host memory (ce_cmd), recycled by that counter. Nothing below is touched while ce_route is 0.
+#define TINYNV_CE_CMD_SLOTS 64
+  int ce_route;
+  tinynv_vmap_t ce_cmd;
+  uint64_t ce_cmd_val[TINYNV_CE_CMD_SLOTS];   // the CE value whose batch last used each command slot
+  uint64_t ce_reserved;      // the CE timeline: the last value handed to a CE batch, which is submitted at once
+  uint64_t ce_high;          // the highest value read back from its slot, so going backwards can be noticed
+  uint64_t ce_acq_q[2];      // compute / copy-queue values the CE channel has already acquired: no need to again
+  uint64_t ce_acq[2];        // CE values compute_q / copy_q have already acquired
+  uint64_t stage_pend_ce[2]; // the CE value of the last routed chunk reading each staging buffer, 0 when none
+  uint64_t ce_n, ce_bytes;   // chunks routed and their bytes, for the summary
 } tinynv_exec_t;
 
 int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex);
@@ -561,7 +577,14 @@ int tinynv_exec_reached(tinynv_exec_t *ex, uint64_t value);
 
 // Wait for everything submitted so far. The caller needs this before it reads a result, before it takes away memory the
 // engine might still be reading, and nowhere else - which is the whole point of submitting without waiting.
-int tinynv_exec_idle(tinynv_exec_t *ex);
+int tinynv_exec_idle(tinynv_exec_t *ex);   // both timelines: the graphics channels' and, when routing, the CE channel's
+// The CE channel's timeline (TINYNV_CE_ROUTE): wait for / ask about one of its values. Both are no-ops (0 / reached)
+// when routing is off or the value is 0.
+// Bring up TINYNV_CE_ROUTE at the end of tinynv_exec_init (exported for test_ce_route): sets ce_route only after the CE
+// channel bound its class and carried a verified self-check copy; otherwise prints one line and leaves routing off.
+int tinynv_exec_ce_route_init(tinynv_exec_t *ex);
+int tinynv_exec_wait_ce(tinynv_exec_t *ex, uint64_t value, double seconds);
+int tinynv_exec_reached_ce(tinynv_exec_t *ex, uint64_t value);
 int tinynv_exec_needs_wait(const tinynv_exec_t *ex);
 void tinynv_exec_set_internal(tinynv_exec_t *ex, int on);
 // Wait until nothing is reading staging buffer 0, so the processor may write it. Anything that fills the stage from

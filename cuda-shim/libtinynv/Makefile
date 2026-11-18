@@ -121,6 +121,12 @@ $(BUILD)/test_upload_order: test/test_upload_order.c test/fake_exec_unreachable.
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc test/test_upload_order.c test/fake_exec_unreachable.c $(BUILD)/libtinynv.a -o $@
 
+# TINYNV_CE_ROUTE's ordering, the same way: the real exec.o against recording stand-ins, plus its own allocator and
+# ring-state stand-ins for the CE bring-up (FAKE_EXEC_CE_ROUTE drops those three from the unreachable set).
+$(BUILD)/test_ce_route: test/test_ce_route.c test/fake_exec_unreachable.c $(BUILD)/libtinynv.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc -DFAKE_EXEC_CE_ROUTE test/test_ce_route.c test/fake_exec_unreachable.c $(BUILD)/libtinynv.a -o $@
+
 # A card probe (test_hw_ce_overlap.c says what it measures and how to run it): built by `make test` so it cannot rot,
 # never run by it. It compiles src/tinynv.c into itself, as test_teardown_term does, to reach the booted gpu and exec
 # through the runtime's own boot and teardown; the archive's tinynv.o is then never pulled in. The kernel's default
@@ -150,7 +156,7 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # already wins over the environment, so this changes nothing about how they run - it removes the possibility that a
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
-test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_teardown_term $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@# FIRST, before any test runs: do the tests in this directory still report what they find? On 2026-09-15
 	@# test_rm_free.c exited 0 with FAIL printed - it consulted its failure count at line 117 of a 318-line main, the
 	@# file grew past that guard, and the whole C4b decision plus the rows proving the read-only fix landed below it.
@@ -233,6 +239,9 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@$(BUILD)/test_module_unload test/fixtures
 	@# an upload never lands before a launch that precedes it (H4): the real exec.c, no card
 	@$(BUILD)/test_upload_order
+	@# TINYNV_CE_ROUTE: what each batch acquires, the flush before a routed copy, no acquire on an unsubmitted value,
+	@# and the fallback when the copy-engine bring-up fails
+	@$(BUILD)/test_ce_route
 	@# a hung exit-path drain must die of ONE SIGTERM (the 2026-09-25 field shape), with the handler shown to return;
 	@# then the same witness re-armed with the PRE-FIX ordering must reproduce the wedge, or it proves nothing
 	@$(BUILD)/test_teardown_term

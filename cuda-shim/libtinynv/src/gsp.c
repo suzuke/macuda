@@ -538,8 +538,11 @@ static int rm_alloc_as(tinynv_gpu_t *g, uint32_t client, uint32_t parent, uint32
   // returning one and working anyway; making it fatal today would break a boot that currently comes up, and finding
   // that out costs a card window. So this reports and carries on, and the caller's own failure - if there is one - is
   // still the thing that stops the run.
-  if (head.status)
+  gsp->last_alloc_status = head.status;
+  if (head.status) {
+    gsp->alloc_refused++;
     fprintf(stderr, "tinynv: gsp-rm returned status %#x allocating class %#x under parent %#x\n", head.status, cls, parent);
+  }
   uint32_t made = cls == TINYNV_CLASS_ROOT ? client : head.hObject;
   if (out) *out = made;
   return 0;
@@ -1066,10 +1069,30 @@ int tinynv_gsp_open_client(tinynv_gpu_t *g) {
   // This is NOT the 2026-09-18 experiment. That one set RUNQUEUE_ONE on a channel whose engine reports one PBDMA,
   // asking for a hardware lane that does not exist, and crashed two different ways (see the engine-table comment
   // above). This asks for a different ENGINE, which genuinely has its own PBDMA and its own runlist.
+  //
+  // TINYNV_CE_ROUTE=1 (exec.c routes big host-to-device copies to this channel) allocates the same group, on the engine
+  // TINYNV_CE_GROUP names or else on the first copy engine whose runlist is not the compute channel's
+  // (tinynv_ce_route_pick). Unset, nothing here runs and no RPC is added.
   {
-    const char *ce = getenv("TINYNV_CE_GROUP");
+    const char *ce = getenv("TINYNV_CE_GROUP"), *route = getenv("TINYNV_CE_ROUTE");
+    gsp->ce_route_asked = route && *route && *route != '0';
+    uint32_t et = 0;
+    int ask = 0;
     if (ce) {
-      uint32_t et = (uint32_t)strtoul(ce, NULL, 0), rl = 0xffffffffu;
+      et = (uint32_t)strtoul(ce, NULL, 0);
+      ask = 1;
+    } else if (gsp->ce_route_asked) {
+      et = tinynv_ce_route_pick(gsp->engines, gsp->runlists, gsp->nengines, gsp->channel_runlist);
+      if (et)
+        fprintf(stderr, "tinynv: TINYNV_CE_ROUTE: picked copy engine type 0x%x (CE%u), the first not on the compute "
+                        "channel's runlist %u\n", et, et - 0x9, gsp->channel_runlist);
+      else
+        fprintf(stderr, "tinynv: TINYNV_CE_ROUTE: every copy engine is on the compute channel's runlist %u, so none can "
+                        "overlap a kernel; not allocating a copy-engine group\n", gsp->channel_runlist);
+      ask = et != 0;
+    }
+    if (ask) {
+      uint32_t rl = 0xffffffffu;
       for (uint32_t i = 0; i < gsp->nengines; i++) if (gsp->engines[i] == et) rl = gsp->runlists[i];
       if (rl == 0xffffffffu) {
         fprintf(stderr, "tinynv: CE group probe: no engine of type 0x%x in the table; not asking\n", et);
@@ -1078,8 +1101,10 @@ int tinynv_gsp_open_client(tinynv_gpu_t *g) {
         memset(&g2, 0, sizeof(g2));
         g2.engineType = et;
         uint32_t h = 0;
+        uint32_t refused0 = gsp->alloc_refused;
         int rc = rm_alloc_as(g, cl, gsp->user_device, 0, TINYNV_CLASS_CHANNEL_GROUP, &g2, sizeof(g2), &h);
-        fprintf(stderr, "tinynv: CE group probe: engineType 0x%x (runlist %u) -> rc %d, handle 0x%x\n", et, rl, rc, h);
+        fprintf(stderr, "tinynv: CE group probe: engineType 0x%x (runlist %u) -> rc %d, rm status %#x, handle 0x%x\n", et,
+                rl, rc, gsp->last_alloc_status, h);
         if (!rc) {
           gsp->ce_group = h; gsp->ce_runlist = rl; gsp->ce_engine = et;
           tinynv_ctxshare_alloc_t cs;
@@ -1094,6 +1119,8 @@ int tinynv_gsp_open_client(tinynv_gpu_t *g) {
           cs.flags = TINYNV_CTXSHARE_FLAGS_SUBCONTEXT_SYNC;
           if (rm_alloc_as(g, cl, h, 0, TINYNV_CLASS_CONTEXT_SHARE, &cs, sizeof(cs), &gsp->ce_ctxshare))
             fprintf(stderr, "tinynv: CE group probe: context share FAILED\n");
+          else
+            gsp->ce_alloc_ok = gsp->alloc_refused == refused0;   // the group and its share, both with status 0
         }
       }
     }
@@ -1404,17 +1431,27 @@ int tinynv_gsp_init_queues(tinynv_gpu_t *g) {
   // TINYNV_CE_GROUP: carry the probe one step further - a real CHANNEL in the copy-engine group, with its own
   // DMA_COPY object, and the group scheduled. Still no traffic: this only answers whether the allocation path
   // works end to end before anyone writes the routing and the cross-channel ordering that would use it.
+  // The rc a call returns is the transport's; RM's own answer is the status beside it, and the group is READY for routing
+  // only if every allocation in it and the schedule came back with status 0. Anything less leaves ce_ready at 0 and
+  // exec.c keeps every copy on the graphics copy queue.
   if (gsp->ce_group) {
+    uint32_t refused0 = gsp->alloc_refused;
     if (new_queue(g, &gsp->ce_copy_q, 0x200000, 0x10000, 0, gsp->ce_group, gsp->ce_runlist, gsp->ce_ctxshare,
                   gsp->ce_engine, TINYNV_NOTIFIER_BYTES)) {
       fprintf(stderr, "tinynv: CE channel probe: FAILED in group 0x%x: %s\n", gsp->ce_group, tinynv_last_error());
+      gsp->ce_copy_q.entries = 0;   // no ring anything may be submitted to
     } else {
+      int queue_ok = gsp->alloc_refused == refused0;
       tinynv_gpfifo_schedule_t cesched;
       memset(&cesched, 0, sizeof(cesched));
       cesched.bEnable = 1;
       int rc = rm_control_as(g, TINYNV_RM_USER_ROOT, gsp->ce_group, TINYNV_CTRL_CMD_GPFIFO_SCHEDULE, &cesched, sizeof(cesched));
-      fprintf(stderr, "tinynv: CE channel probe: channel 0x%x token 0x%x on runlist %u, schedule rc %d\n",
-              gsp->ce_copy_q.channel, gsp->ce_copy_q.token, gsp->ce_runlist, rc);
+      uint32_t st = rc ? 0xffffffffu : gsp->last_ctrl_status;
+      gsp->ce_ready = gsp->ce_alloc_ok && queue_ok && !rc && !st;
+      fprintf(stderr, "tinynv: CE channel probe: channel 0x%x token 0x%x on runlist %u, schedule rc %d rm status %#x; "
+                      "%s\n", gsp->ce_copy_q.channel, gsp->ce_copy_q.token, gsp->ce_runlist, rc, st,
+              gsp->ce_ready ? "every allocation and the schedule returned status 0"
+                            : "NOT ready: an allocation or the schedule was refused (see the status lines above)");
     }
   }
 

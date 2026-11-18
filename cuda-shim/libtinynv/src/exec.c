@@ -62,6 +62,18 @@
 // When the copy engine BEGAN a transfer, as against when it finished. Stamped as the batch's first method after its
 // acquire, so the pair brackets the transfer itself and separates "late to start" from "slow to run".
 #define SEM_TS_CSTART 896
+// TINYNV_CE_ROUTE: the dedicated copy channel's own timeline slot, between the copy queue's (128) and the first profile
+// stamp (384). Written only by that channel - its class-binding batch, then its copy engine's releases - with values of
+// its own counter (ex->ce_reserved), never the shared one: two engines releasing one counter out of order would let a
+// wait for a later value be satisfied by an earlier one.
+#define SEM_CE 256
+// Its command buffers, in host memory as test_hw_ce_overlap's were: one slot per batch, recycled once the CE value that
+// last used the slot has been reached. A routed batch is two acquires, one transfer and a release - about 30 dwords.
+#define CE_CMD_SLOT_BYTES 512u
+// and after the slots, the init self-check's 4 KB source and 4 KB destination
+#define CE_CHECK_OFF ((uint64_t)TINYNV_CE_CMD_SLOTS * CE_CMD_SLOT_BYTES)
+#define CE_CHECK_BYTES 4096u
+#define CE_CMD_BYTES (CE_CHECK_OFF + 2ull * CE_CHECK_BYTES)
 // Command buffers and descriptors both. Large on purpose: the arena wrapping is the only thing that stalls now, so
 // its size is how many batches run between stalls - a few thousand here, against roughly six hundred launches a token.
 #define CMD_BYTES   0x400000
@@ -137,6 +149,50 @@ static int sem_reached(tinynv_exec_t *ex, uint64_t value) {
     if (want && sem_read_slot(ex, q) < want) return 0;
   }
   return 1;
+}
+
+// TINYNV_CE_ROUTE: the CE channel's slot, read the same way. One channel writes it, in order, so it never goes back.
+static uint64_t ce_read(tinynv_exec_t *ex) {
+  uint64_t v = 0;
+  nv_rd_block(&ex->sem.dma.view, SEM_CE, &v, sizeof(v));
+  if (v > ex->ce_high) ex->ce_high = v;
+  else if (v < ex->ce_high && ex->nbackwards++ < 8)
+    fprintf(stderr, "tinynv: the dedicated copy channel's timeline went backwards, %llu after %llu\n", (unsigned long long)v,
+            (unsigned long long)ex->ce_high);
+  return v;
+}
+
+// Wait for the CE channel to reach `value`. Clamped to what has been submitted: a value past that has no batch that
+// will ever release it, and waiting for it is a hang rather than a wait.
+static int ce_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
+  if (value > ex->ce_reserved) value = ex->ce_reserved;
+  if (!value || ce_read(ex) >= value) return 0;
+  if (tinynv_submit_ring(ex->g)) return -1;
+  double deadline = now() + seconds;
+  while (ce_read(ex) < value) {
+    if (now() > deadline) {
+      int bad = tinynv_gsp_poll(ex->g);
+      uint32_t get = 0, put = 0;
+      uint64_t pub = 0;
+      tinynv_queue_state(ex->g, &ex->g->gsp.ce_copy_q, &get, &put, &pub);
+      return tinynv_fail("the dedicated copy channel (engine %#x) did not reach %llu in %.0f s: its slot holds %llu, its "
+                         "ring get %u put %u with %llu published; %s", ex->g->gsp.ce_engine, (unsigned long long)value,
+                         seconds, (unsigned long long)ce_read(ex), get, put, (unsigned long long)pub,
+                         bad ? "gsp-rm reported an error, printed above" : "gsp-rm reports nothing wrong");
+    }
+  }
+  return 0;
+}
+
+int tinynv_exec_wait_ce(tinynv_exec_t *ex, uint64_t value, double seconds) {
+  return ex->ce_route && value ? ce_wait(ex, value, seconds) : 0;
+}
+
+int tinynv_exec_reached_ce(tinynv_exec_t *ex, uint64_t value) {
+  if (!ex->ce_route || !value) return 1;
+  if (value > ex->ce_reserved) value = ex->ce_reserved;
+  if (tinynv_submit_ring(ex->g)) return -1;
+  return ce_read(ex) >= value;
 }
 
 // TINYNV_KERNEL_PROFILE: one row per kernel instantiation, found by the descriptor's address. Resolved at the launch
@@ -904,6 +960,14 @@ static void *arena(tinynv_exec_t *ex, int r, uint64_t bytes, uint64_t align, uin
       // else. With the records zeroed, entering a piece costs a comparison and returns nothing. That is cheap enough
       // that buying it with an argument was the wrong trade.
       memset(ex->sem.dma.va, 0, (size_t)ex->sem.size);
+      // TINYNV_CE_ROUTE: the CE channel keeps its own counter across this (it moves once per 16 MiB, so it never comes
+      // near 32 bits), and the idle above covered it - so its slot is put back at the value it had reached, or every CE
+      // wait after this would sit on a zero nothing will rewrite. What the CE channel had acquired on the graphics
+      // slots is in the old numbering and is forgotten.
+      if (ex->ce_route) {
+        memcpy((uint8_t *)ex->sem.dma.va + SEM_CE, &ex->ce_reserved, sizeof(ex->ce_reserved));
+        ex->ce_acq_q[0] = ex->ce_acq_q[1] = 0;
+      }
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
 
@@ -1014,9 +1078,19 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
     for (unsigned i = 0; i < ex->inline_pend_n; i++) inl += TINYNV_INLINE_DWORDS(ex->inline_pend[i].len);
   // Six dwords for the same-queue acquire below (one semaphore method), which every asynchronous compute batch takes.
   uint32_t sq = q != &ex->g->gsp.copy_q && !ex->sync && ex->q_last[0] ? 6u : 0u;
-  uint32_t *w = cmd_space(ex, dwords + inl + sq + (head_ts ? 12u : 0u), va);
+  // TINYNV_CE_ROUTE: and six for an acquire on the dedicated copy channel's slot, when this batch must follow copies
+  // there it has not yet been ordered after. Every batch on either graphics queue is (a copy-queue download may read
+  // what a routed copy wrote) except the descriptor delivery inside a chain flush, which reads the driver's own mirror
+  // and writes the descriptor region and has nothing to do with a caller's copies.
+  uint64_t ce_need = 0;
+  if (ex->ce_route && !(ex->in_chain_flush && q == &ex->g->gsp.copy_q)) {
+    ce_need = ex->ce_reserved;
+    if (ce_need <= ex->ce_acq[q == &ex->g->gsp.copy_q]) ce_need = 0;
+  }
+  uint32_t cq = ce_need ? 6u : 0u;
+  uint32_t *w = cmd_space(ex, dwords + inl + sq + cq + (head_ts ? 12u : 0u), va);
   if (!w) return -1;
-  *c = (tinynv_cmdbuf_t){.words = w, .n = 0, .cap = dwords + inl + sq + (head_ts ? 12u : 0u)};
+  *c = (tinynv_cmdbuf_t){.words = w, .n = 0, .cap = dwords + inl + sq + cq + (head_ts ? 12u : 0u)};
   // Synchronously there is nothing to order against: the previous batch was waited on before this one was built, so
   // the acquire would always be already satisfied. Leaving it out is what makes TINYNV_SYNC=1 the pre-d29cb32 path
   // rather than the new path with a wait bolted on, which matters when the question is whether the acquire is the bug.
@@ -1058,6 +1132,12 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
   if (sq) {
     if (tinynv_cmd_wait(c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) return -1;
     ex->pending_acquire = ex->q_last[0];
+  }
+  // The CE channel's value is always one already submitted (a CE batch is handed over the moment it is built), so this
+  // can never wait on a release nothing will make. One queue having acquired it orders everything after on that queue.
+  if (ce_need) {
+    if (tinynv_cmd_wait(c, ex->sem.va + SEM_CE, ce_need)) return -1;
+    ex->ce_acq[qi] = ce_need;
   }
   // Emitted here: after both acquires that order this batch, before anything the caller appends, and before the memory
   // barrier a launch batch emits next - so the bytes are written and flushed before any kernel in this batch can read
@@ -1860,6 +1940,8 @@ int tinynv_exec_idle(tinynv_exec_t *ex) {
   if (!ex || !ex->g) return -1;
   if (tinynv_exec_flush(ex)) return -1;
   if (tinynv_exec_wait(ex, ex->timeline, 30.0)) return -1;
+  // and the dedicated copy channel's, which is a different counter: "everything" means both
+  if (ex->ce_route && ce_wait(ex, ex->ce_reserved, 30.0)) return -1;
   ex->needs_wait = 0;
   return 0;
 }
@@ -1885,6 +1967,58 @@ int tinynv_exec_copy(tinynv_exec_t *ex, uint64_t dst_va, uint64_t src_va, uint64
   if (ex->profile && tinynv_cmd_copy_timestamp(&c, ex->sem.va + SEM_TS_CSTART, ex->reserved + 1)) return -1;
   if (tinynv_cmd_copy(&c, dst_va, src_va, bytes)) return -1;
   return run(ex, &ex->g->gsp.copy_q, &c, va);
+}
+
+// TINYNV_CE_ROUTE: one batch on the dedicated copy channel - acquires on the graphics channels' slots for want[0]
+// (compute) and want[1] (copy queue), each only past what the channel has already acquired, then the transfer (none
+// when bytes is 0) and the copy engine's own release of the next CE value. Handed over and announced at once, so a CE
+// value is never one whose batch has not been submitted.
+//
+// INVARIANT: an acquire only ever names a value whose releasing batch is already on a ring. A value past that hangs the
+// channel - and tearing down a hung copy-engine group has never been exercised. So each want is clamped to the last
+// value submitted on its queue; a caller that asks for more gets "everything so far", which is conservative, never a hang.
+static int ce_submit(tinynv_exec_t *ex, const uint64_t want[2], uint64_t dst, uint64_t src, uint64_t bytes) {
+  uint64_t at = ex->ce_reserved + 1;
+  if (at > 0xffffffffull) return tinynv_fail("the dedicated copy channel's timeline has run past 32 bits");
+  unsigned slot = (unsigned)(at % TINYNV_CE_CMD_SLOTS);
+  if (ex->ce_cmd_val[slot] && ce_wait(ex, ex->ce_cmd_val[slot], 30.0)) return -1;   // its last batch is done with it
+  tinynv_cmdbuf_t c = {.words = (uint32_t *)((uint8_t *)ex->ce_cmd.dma.va + (uint64_t)slot * CE_CMD_SLOT_BYTES), .n = 0,
+                       .cap = CE_CMD_SLOT_BYTES / 4};
+  uint64_t acq[2] = {ex->ce_acq_q[0], ex->ce_acq_q[1]};
+  for (int q = 0; q < 2; q++) {
+    uint64_t w = want[q] < ex->q_last[q] ? want[q] : ex->q_last[q];
+    if (w > acq[q]) {
+      if (tinynv_cmd_wait(&c, ex->sem.va + SEM_SLOT(q), w)) return -1;
+      acq[q] = w;
+    }
+  }
+  if (bytes && tinynv_cmd_copy(&c, dst, src, bytes)) return -1;
+  if (tinynv_cmd_copy_release(&c, ex->sem.va + SEM_CE, at)) return -1;
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);   // the batch is in host memory before its ring entry is written
+  if (tinynv_submit(ex->g, &ex->g->gsp.ce_copy_q, ex->ce_cmd.va + (uint64_t)slot * CE_CMD_SLOT_BYTES, c.n)) return -1;
+  ex->ce_reserved = at;
+  ex->ce_cmd_val[slot] = at;
+  ex->ce_acq_q[0] = acq[0];
+  ex->ce_acq_q[1] = acq[1];
+  return 0;
+}
+
+// Before the first routed chunk of an upload: (1) any held inline uploads go out - they were issued before this copy
+// and ride in a compute batch, which nothing would otherwise send before the CE channel writes past them (the first
+// test_hw_ce_overlap run read exactly that back); (2) the pending chain is handed over; (3) everything staged is
+// announced. (2) and (3) are what let kernels already issued start BEFORE the caller blocks in the staging memcpy.
+static int ce_prepare(tinynv_exec_t *ex) {
+  if (tinynv_exec_flush(ex)) return -1;   // the chain, and any held bytes, which ride at its head
+  if (ex->inline_pend_n) {                // nothing was pending to carry them: a compute batch of their own
+    uint64_t va;
+    tinynv_cmdbuf_t c;
+    if (batch_begin(ex, &ex->g->gsp.compute_q, 40, &c, &va)) return -1;
+    ex->submitting_inline = 1;
+    int rc = run(ex, &ex->g->gsp.compute_q, &c, va);
+    ex->submitting_inline = 0;
+    if (rc) return -1;
+  }
+  return tinynv_submit_ring(ex->g);
 }
 
 // Whether a small host-to-device copy rides in the pushbuffer instead of going to the copy engine.
@@ -1968,6 +2102,11 @@ unsigned tinynv_exec_short_chain(const char *e) {
 // implicit - every chunk drained the whole device - and with two it is the only thing keeping a memcpy from landing
 // on top of a transfer that is still in flight. Cheap when nothing is pending, which is the common case.
 static int stage_claim(tinynv_exec_t *ex, int s) {
+  // a routed chunk on the dedicated copy channel may be what is still reading it (TINYNV_CE_ROUTE; 0 otherwise)
+  if (ex->stage_pend_ce[s]) {
+    if (ce_wait(ex, ex->stage_pend_ce[s], 30.0)) return -1;
+    ex->stage_pend_ce[s] = 0;
+  }
   if (!ex->stage_pend[s]) return 0;
   if (tinynv_exec_wait(ex, ex->stage_pend[s], 30.0)) return -1;
   ex->stage_pend[s] = 0;
@@ -2041,6 +2180,10 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
                        (void *)ex, (unsigned long long)ex->stage[0].va);
   ex->up_calls++;
   { unsigned b = 0; for (size_t t = n; t >= (1u << 16) && b < 7; t >>= 2) b++; ex->up_hist[b]++; }
+  // TINYNV_CE_ROUTE: the chunks go to the dedicated copy channel. Not while a token is being recorded - its copies are
+  // ordered against the recording by the replay's batch, which knows only the two graphics queues.
+  int route = ex->ce_route && !ex->rec;
+  if (route && ce_prepare(ex)) return -1;
   unsigned chunk_i = 0;
   for (size_t off = 0; off < n; off += STAGE_BYTES, chunk_i++) {
     size_t chunk = n - off < STAGE_BYTES ? n - off : STAGE_BYTES;
@@ -2065,10 +2208,18 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
     double t0 = now();
     memcpy(ex->stage[sb].dma.va, p + off, chunk);
     double t1 = now();
+    if (route) {
+      // Ordered after everything submitted on both graphics queues (stage A: fully conservative).
+      if (ce_submit(ex, ex->q_last, dst_va + off, ex->stage[sb].va, chunk)) return -1;
+      ex->stage_pend_ce[sb] = ex->ce_reserved;
+      ex->ce_n++;
+      ex->ce_bytes += chunk;
+    } else {
     if (tinynv_exec_copy(ex, dst_va + off, ex->stage[sb].va, chunk)) return -1;
     // What this copy will have reached when it is done reading the buffer. q_last[1] is the copy queue's slot, set
     // by the run() that tinynv_exec_copy just performed.
     ex->stage_pend[sb] = ex->q_last[1];
+    }
     // the arm this replaced: nothing may be in flight when the chunk ends, so the next memcpy is unconditionally safe
     if (ex->stage_single) { if (tinynv_exec_idle(ex)) return -1; ex->stage_pend[sb] = 0; }
     ex->up_memcpy_s += t1 - t0; ex->up_submit_s += now() - t1; ex->up_wait_s += t0 - t2;
@@ -2094,6 +2245,12 @@ int tinynv_exec_download(tinynv_exec_t *ex, void *dst, uint64_t src_va, size_t n
     // Let the compute drain before the copy is issued, so the copy's acquire is already satisfied when the channel is
     // first looked at and it is never switched out waiting. See tinynv_exec_download_sync_first.
     if (ex->download_sync_first && tinynv_exec_idle(ex)) return -1;
+    // TINYNV_CE_ROUTE: the copy below writes staging buffer 0, and a routed chunk on the other channel may still be
+    // reading it - nothing on the copy queue is ordered against that channel by its own position any more.
+    if (ex->stage_pend_ce[0]) {
+      if (ce_wait(ex, ex->stage_pend_ce[0], 30.0)) return -1;
+      ex->stage_pend_ce[0] = 0;
+    }
     if (tinynv_exec_copy(ex, ex->stage[0].va, src_va + off, chunk)) return -1;
     if (tinynv_exec_idle(ex)) return -1;   // reading a result is one of the few places that has to wait
     ex->stage_pend[0] = 0;                 // the idle above covers anything that was reading it
@@ -2732,6 +2889,73 @@ int tinynv_exec_sync_mode(const char *async, const char *sync, const char **why)
   return 0;
 }
 
+// TINYNV_CE_ROUTE=1: bring up routing to the dedicated copy channel, or say in one line why not and leave every copy
+// where it was. Never half-enabled: ce_route is set last, after the channel has bound its class and carried a checked
+// copy in the exact shape a routed chunk has. Returns -1 only for what would also fail without routing.
+int tinynv_exec_ce_route_init(tinynv_exec_t *ex) {
+  const char *e = getenv("TINYNV_CE_ROUTE");
+  if (!(e && *e && *e != '0')) return 0;
+  tinynv_gsp_t *gsp = &ex->g->gsp;
+  const char *why = NULL;
+  // Only the configuration test_hw_ce_overlap measured: asynchronous, doorbells rung in line, no lent kernel.
+  if (ex->sync) why = "TINYNV_SYNC waits on every batch, so nothing could overlap anyway";
+  else if (ex->ring_async) why = "TINYNV_RING_ASYNC defers doorbells, and a CE acquire must only name announced work";
+  else if (ex->keepalive) why = "TINYNV_KEEPALIVE parks a kernel that a CE acquire on the compute slot would wait out";
+  else if (ex->no_chain_deps) why = "TINYNV_NO_CHAIN_DEPS leaves no timeline value that means a kernel finished";
+  else if (!gsp->ce_ready || !gsp->ce_copy_q.entries)
+    why = "the copy-engine group did not come up whole (see the 'CE group' / 'CE channel' lines above)";
+  if (!why && tinynv_mm_alloc_buffer(&ex->g->mm, CE_CMD_BYTES, 1, 1, 1, 0, 0, &ex->ce_cmd)) why = tinynv_last_error();
+  if (!why && !ex->ce_cmd.dma.va) why = "its command buffers came back with no host mapping";
+  if (why) {
+    fprintf(stderr, "libtinynv: TINYNV_CE_ROUTE was asked for and is NOT in effect: %s. Every copy stays on the graphics "
+                    "copy queue.\n", why);
+    return 0;
+  }
+  memset(ex->ce_cmd.dma.va, 0, (size_t)ex->ce_cmd.size);
+  uint8_t *host = ex->ce_cmd.dma.va;
+  // 1. bind the copy class on subchannel 4 - the class new_queue allocated on this channel (TINYNV_CE_CLASS, when set,
+  //    overrides it there and so here) - and release CE value 1, exactly as the probe's P0 did.
+  uint32_t cls = ex->g->dev.class_dma_copy;
+  { const char *cs = getenv("TINYNV_CE_CLASS"); if (cs) cls = (uint32_t)strtoul(cs, NULL, 0); }
+  tinynv_cmdbuf_t c = {.words = (uint32_t *)host, .n = 0, .cap = CE_CMD_SLOT_BYTES / 4};
+  int bad = tinynv_cmd_copy_setup(&c, ex->sem.va + SEM_CE, 0, cls);
+  if (!bad) { __atomic_thread_fence(__ATOMIC_SEQ_CST); bad = tinynv_submit(ex->g, &gsp->ce_copy_q, ex->ce_cmd.va, c.n); }
+  if (!bad) { ex->ce_reserved = 1; ex->ce_cmd_val[0] = 1; bad = ce_wait(ex, 1, 2.0); }
+  // 2. one 4 KB host-to-host copy in the production shape: acquires on both graphics slots (satisfied - the setup batches
+  //    were waited for), the transfer, the copy engine's own release. Its bytes are compared, so a release that landed
+  //    without a transfer cannot pass.
+  int mismatch = 0;
+  if (!bad) {
+    uint32_t *src = (uint32_t *)(host + CE_CHECK_OFF), *dst = (uint32_t *)(host + CE_CHECK_OFF + CE_CHECK_BYTES);
+    for (uint32_t i = 0; i < CE_CHECK_BYTES / 4; i++) src[i] = 0x9E3779B1u * (i + 1);
+    bad = ce_submit(ex, ex->q_last, ex->ce_cmd.va + CE_CHECK_OFF + CE_CHECK_BYTES, ex->ce_cmd.va + CE_CHECK_OFF,
+                    CE_CHECK_BYTES);
+    if (!bad) bad = ce_wait(ex, ex->ce_reserved, 2.0);
+    if (!bad) mismatch = memcmp(src, dst, CE_CHECK_BYTES) != 0;
+  }
+  if (bad || mismatch) {
+    fprintf(stderr, "libtinynv: TINYNV_CE_ROUTE was asked for and is NOT in effect: the copy engine %#x channel %s (%s). "
+                    "Every copy stays on the graphics copy queue.%s\n", gsp->ce_engine,
+            mismatch ? "carried its 4 KB self-check copy and the bytes are WRONG" : "failed its setup or self-check",
+            mismatch ? "compared through the host mapping" : tinynv_last_error(),
+            bad ? " If it timed out the channel may be wedged; its teardown with work stuck on it has never been tried, "
+                  "so treat this run's exit as suspect." : "");
+    ex->ce_reserved = 0;
+    memset(ex->ce_cmd_val, 0, sizeof ex->ce_cmd_val);
+    ex->ce_acq_q[0] = ex->ce_acq_q[1] = 0;
+    return 0;
+  }
+  ex->ce_route = 1;
+  // the CPU waited for both bring-up values, so no graphics batch needs an acquire to be ordered after them
+  ex->ce_acq[0] = ex->ce_acq[1] = ex->ce_reserved;
+  uint32_t et = gsp->ce_engine;
+  fprintf(stderr, "libtinynv: host-to-device copies over %u bytes go to copy engine %#x (CE%u, runlist %u; compute is on "
+                  "runlist %u) on a channel of their own (TINYNV_CE_ROUTE was asked for); self-check copy verified. "
+                  "Ordering: stage A, every routed copy after all earlier work and all later work after it\n",
+          ex->inline_upload ? ex->inline_max : 0u, et, et >= 0x9 ? et - 0x9 : et, gsp->ce_runlist, gsp->channel_runlist);
+  return 0;
+}
+
 int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   memset(ex, 0, sizeof(*ex));
   ex->g = g;
@@ -3029,6 +3253,7 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
     fprintf(stderr, "libtinynv: descriptor region zeroed at open (%llu MB), so the delta baseline is true on a warm card\n",
             (unsigned long long)(n >> 20));
   }
+  if (tinynv_exec_ce_route_init(ex)) return -1;
 
   ex->ready = 1;
   return 0;
@@ -3097,6 +3322,9 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
   if (ex->delta_rewind_n)
     fprintf(stderr, "libtinynv: the descriptor region was started from the bottom at %llu standstills "
                     "(TINYNV_DELTA_REWIND).\n", (unsigned long long)ex->delta_rewind_n);
+  if (ex->ce_n)
+    fprintf(stderr, "libtinynv: %llu bulk upload chunks (%.1f MB) went to the dedicated copy channel (TINYNV_CE_ROUTE).\n",
+            (unsigned long long)ex->ce_n, (double)ex->ce_bytes / 1e6);
   if (ex->inline_n || ex->upload_ce_n)
     fprintf(stderr, "libtinynv: %llu host-to-device copies rode in the pushbuffer (%llu bytes) and %llu went to the "
                     "copy engine.\n           Held list (%u entries, %u bytes): %llu rode in a batch already going "
@@ -3254,6 +3482,7 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
     free(ex->region[r].last_delivered);
   }
   tinynv_vmap_free(&ex->g->mm, &ex->sem);
+  if (ex->ce_cmd.size) tinynv_vmap_free(&ex->g->mm, &ex->ce_cmd);
   if (ex->kring.size) tinynv_vmap_free(&ex->g->mm, &ex->kring);
   for (int i = 0; i < ex->graph_pool_n; i++) { tinynv_vmap_free(&ex->g->mm, &ex->graph_pool[i].mem); tinynv_vmap_free(&ex->g->mm, &ex->graph_pool[i].mirror); }
   if (ex->ka_flag.size) tinynv_vmap_free(&ex->g->mm, &ex->ka_flag);
