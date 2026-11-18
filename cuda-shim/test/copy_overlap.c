@@ -3,10 +3,22 @@
 //   QUIESCE=1 sh tools/nv_shim_step.sh A probe cuda-shim/build/shim-<arch>/copy_overlap [copy MiB=512] [gemm n=2048]
 //   QUIESCE=1 TINYNV_CE_ROUTE=1 sh tools/nv_shim_step.sh A probe cuda-shim/build/shim-<arch>/copy_overlap
 // Timing: R cuBLAS SGEMMs on stream A alone, one cudaMemcpyAsync of the copy size on stream B alone, then both issued
-// together (the gemms first, so they are on the card while the copy streams in). R is calibrated so the gemms take
-// about as long as the copy, capped at 1 s: a routed copy acquires on the compute timeline, and an acquire that waits
-// ~2 s is a channel error (NVOS04_FLAGS_CHANNEL_PBDMA_ACQUIRE_TIMEOUT). r = (both - max) / min: r < 0.3 OVERLAP, r > 0.7
-// SERIAL, else PARTIAL. Routing off is expected to say SERIAL - that is the control.
+// together (the gemms first, so they are on the card while the copy streams in). r = (both - max) / min: r < 0.3
+// OVERLAP, r > 0.7 SERIAL, else PARTIAL. Routing off is expected to say SERIAL - that is the control.
+//
+// HOW MUCH WORK IT MAY QUEUE, AND WHY THAT IS BOUNDED (the 2026-11-18 run queued ~18,500 gemms, ~100 s of work, timed
+// out after 30 s and unloaded the firmware with the engines still busy: two mmu faults, and the card stayed wedged until
+// the enclosure was power-cycled. TEARING DOWN UNDER LOAD WEDGES THE CARD - so this probe must never exit with much
+// queued, on success, on error, or on a timeout):
+//  - one gemm is timed with a BLOCKING read (a 4-byte device-to-host cudaMemcpy, which always idles the device), never
+//    with a stream synchronise; and refused, exit 1 before anything big is queued, if it is implausibly fast (under
+//    0.5 ms at n=2048, scaled by (n/2048)^3) or slower than 0.25 s;
+//  - R is at most 256 and at most 0.5 s of gemms; every batch of kernels is followed by a blocking read;
+//  - the whole run's planned GPU work (3 R gemm batches, 5 big copies, a few single gemms) must be under 3 s, else exit 1
+//    after the two measuring copies (a smaller copy size is the fix);
+//  - a copy never leaves more than two 16 MiB chunks queued: an upload returns only once its last chunk is submitted.
+// So at any moment at most ~0.5 s of gemms plus two chunks are outstanding, which also keeps every semaphore acquire
+// well inside the ~2 s channel acquire timeout (NVOS04_FLAGS_CHANNEL_PBDMA_ACQUIRE_TIMEOUT).
 // Correctness, each checked with sentinel values through a gemm (C = n * a when A is filled with a and B with 1), the
 // matrix the gemm reads sitting in the LAST 16 MiB of a big copy so a gemm ordered wrongly would read the old value:
 //   raw      copy (a=3) then gemm on the same stream                      -> C = 3n
@@ -34,6 +46,10 @@ static unsigned char *hbig;
 static float *hmat, *dones, *dC;
 static cublasHandle_t h;
 
+// Wait for EVERYTHING on the device, by a read that cannot return early: a download idles the device before it copies.
+static void block_read(void) { float v; CK(cudaMemcpy(&v, dC, sizeof v, cudaMemcpyDeviceToHost)); }
+static void drain(cudaStream_t s) { CK(cudaStreamSynchronize(s)); block_read(); }
+
 static void gemms(cudaStream_t s, const float *A, int reps) {
   const float one = 1.0f, zero = 0.0f;
   CB(cublasSetStream_v2(h, s));
@@ -60,6 +76,7 @@ static int check(const char *name, cudaStream_t s, float a) {
 int main(int argc, char **argv) {
   size_t mib = argc > 1 ? (size_t)atoi(argv[1]) : 512;
   n = argc > 2 ? atoi(argv[2]) : 2048;
+  if (mib < 32 || mib > 1024 || n < 256 || n > 4096) { fprintf(stderr, "copy MiB must be 32..1024 and n 256..4096\n"); return 1; }
   big = mib << 20; mat = (size_t)n * n * 4;
   if (big < 2 * mat) { fprintf(stderr, "the copy (%zu MiB) must be at least two matrices (%zu bytes each)\n", mib, mat); return 1; }
   int ndev = 0; CK(cudaGetDeviceCount(&ndev)); if (!ndev) { fprintf(stderr, "no device\n"); return 1; }
@@ -79,17 +96,33 @@ int main(int argc, char **argv) {
   cudaEvent_t ev; CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
 
   // ---- timing ----
-  gemms(sa, dA, 1); CK(cudaStreamSynchronize(sa));                       // warm: module load, first touch
-  copy_big(dbig, 1.0f, sb); CK(cudaStreamSynchronize(sb));
+  gemms(sa, dA, 1); block_read();                                         // warm: module load, first touch
+  double t0 = now(); gemms(sa, dA, 4); block_read(); double one = (now() - t0) / 4;
+  double fast = 0.5e-3 * ((double)n / 2048) * ((double)n / 2048) * ((double)n / 2048);
+  if (one < fast || one > 0.25) {
+    fprintf(stderr, "copy_overlap: one %d^3 gemm measured %.3f ms, outside %.3f..250 ms: the timing cannot be trusted, "
+                    "and planning from it could queue unbounded work. Refusing.\n", n, one * 1e3, fast * 1e3);
+    return 1;
+  }
+  copy_big(dbig, 1.0f, sb); drain(sb);
   // asked once the device is up (the warm-up above booted it): routing is decided at boot and may have been refused
   tinynv_device_t tdev = NULL; unsigned et = 0, rl = 0; int routed = 0;
   if (tinynv_device_get(&tdev, 0) == TINYNV_OK) routed = tinynv_device_copy_route(tdev, &et, &rl);
-  double t0 = now(); gemms(sa, dA, 4); CK(cudaStreamSynchronize(sa)); double one = (now() - t0) / 4;
-  t0 = now(); copy_big(dbig, 1.0f, sb); CK(cudaStreamSynchronize(sb)); double tc = now() - t0;
-  int reps = (int)(tc / one + 0.5); if (reps < 1) reps = 1;
-  if (reps * one > 1.0) reps = (int)(1.0 / one); if (reps < 1) reps = 1;
-  t0 = now(); gemms(sa, dA, reps); CK(cudaStreamSynchronize(sa)); double tg = now() - t0;
-  t0 = now(); gemms(sa, dA, reps); copy_big(dbig, 1.0f, sb); CK(cudaStreamSynchronize(sb)); CK(cudaStreamSynchronize(sa));
+  t0 = now(); copy_big(dbig, 1.0f, sb); drain(sb); double tc = now() - t0;
+  int reps = (int)(tc / one + 0.5);
+  if (reps > 256) reps = 256;
+  if (reps * one > 0.5) reps = (int)(0.5 / one);
+  if (reps < 1) reps = 1;
+  double plan = 3 * reps * one + 5 * tc + 6 * one;
+  if (plan > 3.0) {
+    fprintf(stderr, "copy_overlap: the run would queue %.2f s of GPU work (copy %.0f ms, %d gemms of %.2f ms), over the 3 s "
+                    "ceiling. Refusing; pass a smaller copy size.\n", plan, tc * 1e3, reps, one * 1e3);
+    return 1;
+  }
+  printf("plan: %d gemms of %.2f ms per batch (%.0f ms), copy %.0f ms; %.2f s of GPU work in all\n", reps, one * 1e3,
+         reps * one * 1e3, tc * 1e3, plan);
+  t0 = now(); gemms(sa, dA, reps); drain(sa); double tg = now() - t0;
+  t0 = now(); gemms(sa, dA, reps); copy_big(dbig, 1.0f, sb); CK(cudaStreamSynchronize(sb)); drain(sa);
   double tb = now() - t0;
   int fails = check("timing", sa, 1.0f);   // the gemms of the overlapped run, not disturbed by the copy
 
@@ -100,6 +133,7 @@ int main(int argc, char **argv) {
   // war: W holds 1 (set and synchronised); the gemms read it, then a one-chunk copy of 2s into W on the same stream
   CK(cudaMemcpy(dW, hones, mat, cudaMemcpyHostToDevice));
   gemms(sb, dW, reps); CK(cudaMemcpyAsync(dW, htwos, mat, cudaMemcpyHostToDevice, sb)); fails += check("war", sb, 1.0f);
+  block_read();
   // ssync / dsync: a copy on B, then a CPU synchronisation, then a gemm on a third stream that knows nothing of B
   copy_big(dbig2, 5.0f, sb); CK(cudaStreamSynchronize(sb)); gemms(sc, tailB, 1); fails += check("ssync", sc, 5.0f);
   copy_big(dbig2, 6.0f, sb); CK(cudaDeviceSynchronize()); gemms(sc, tailB, 1); fails += check("dsync", sc, 6.0f);
