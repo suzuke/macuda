@@ -47,3 +47,28 @@ server connection for the crash case (H2 residual) — this is A's `nv_e3_flr.py
 Server/dext (W2, needs SIP off or tinygrad's signing): revoke BM in `cleanup()` before `IOServiceClose` and in `Stop_Impl`; respond to
 `MMIO_WRITE` failures (or log them); a watchdog thread that reports an RPC older than N seconds; reject a second client; per-buffer unmap;
 lift `MAX_SYSMEM` and the 32-segment cap.
+
+### 2026-11-18 DART panic and what followed (3060)
+
+A Metal + CUDA server panicked macOS in AppleT8110DART during model load. The link stayed in L0; the TinyGPU server session
+ended first (cause unknown, no server process in the stackshot) and its teardown completed DMA with BM on: 129 PTE-invalid
+faults over 32 s, then the panic. H2/H10 class. Record: `docs/bench/ampere-3060-20260917.md`, 2026-11-18.
+
+Mitigations, offline step (2026-11-19, f5d964a): libtinynv latches a lost server (`tg->dead`, "tinygpu server connection
+lost" once, fsync'd; later RPCs fail without touching the socket; submit.c says "server gone", not "device all-ones");
+`tools/tinygpu-server.sh` runs the server under script(1), unbuffered, and logs its exit status/signal plus a
+`pci-dart-error-data` snapshot (`logs/dart-at-server-exit-*`); preflight tells "rebooted" from "re-enumerated". Still to do,
+on the card and only with the owner's go: stop submitting on the first impossible readback, health checks in long waits,
+teardown that skips dead drains, and the emergency BM clear through a fresh server connection (the one that would have
+ended the 32 s storm), then a watchdog. The real fix stays in the dext (above).
+
+**Known server killer, neutralised by a sentinel file.** tinygrad's `APLRemotePCIDevice.ensure_app()`
+(`tinygrad-stable/tinygrad/runtime/support/system.py:421-427`, Davinchy/tinygrad 33cd373ad) runs `pkill -f TinyGPU` and
+reinstalls the app unless BOTH `/Applications/TinyGPU.app` and
+`~/Library/Caches/tinygrad/downloads/TinyGPU_c0d024f9ff0e1dc8fdf217f255da7101d91e8323.zip` exist (and `APL_REMOTE_SOCK` is
+unset). macuda's `install.sh` installs the app without that zip, so any Python that opened an APL device through tinygrad
+would kill a serving TinyGPU server, BM on. On this machine an empty file was created at that path on 2026-11-19
+(`touch`; tinygrad checks only `is_file()`), verified with tinygrad's own `_ensure_downloads_dir()`. Not proven to be the
+2026-11-18 cause. The name carries the commit tinygrad pins: a tinygrad that pins another TinyGPU commit needs its own
+file (or `APL_REMOTE_SOCK` set). Remove the file to undo. `extra/usbgpu/tbgpu/kill_tinygpu.sh` in the same checkout
+(`pkill -f "tinygpu.sock"`) is a manual tool and also kills the server.
