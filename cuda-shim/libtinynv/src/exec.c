@@ -188,6 +188,52 @@ int tinynv_exec_wait_ce(tinynv_exec_t *ex, uint64_t value, double seconds) {
   return ex->ce_route && value ? ce_wait(ex, value, seconds) : 0;
 }
 
+// Stage B. The order record of whoever is calling: its stream's, or the legacy one. A record from before a timeline
+// rebase has its graphics values forgotten - the rebase idled everything, so they are all done.
+static tinynv_exec_order_t *dep(tinynv_exec_t *ex, tinynv_exec_order_t *o) {
+  if (o->epoch != ex->ce_epoch) { o->q[0] = o->q[1] = 0; o->epoch = ex->ce_epoch; }
+  return o;
+}
+static tinynv_exec_order_t *caller(tinynv_exec_t *ex) { return dep(ex, ex->ord ? ex->ord : &ex->leg); }
+// The CE value a graphics batch built for the caller must acquire: its stream's own routed copies and the legacy
+// stream's (blocking-stream rule); everything, for the legacy stream itself, or in stage A.
+static uint64_t caller_need_ce(tinynv_exec_t *ex) {
+  if (ex->ce_conservative || !ex->ord) return ex->ce_reserved;
+  uint64_t a = dep(ex, ex->ord)->ce, b = ex->leg.ce;
+  return a > b ? a : b;
+}
+// The graphics values a routed copy for the caller must acquire, by the same rule.
+static void caller_want_q(tinynv_exec_t *ex, uint64_t want[2]) {
+  for (int q = 0; q < 2; q++) {
+    if (ex->ce_conservative || !ex->ord) { want[q] = ex->q_last[q]; continue; }
+    uint64_t a = dep(ex, ex->ord)->q[q], b = dep(ex, &ex->leg)->q[q];
+    want[q] = a > b ? a : b;
+  }
+}
+static void note_q(tinynv_exec_order_t *o, int q, uint64_t v) { if (v > o->q[q]) o->q[q] = v; }
+
+void tinynv_exec_order_record(tinynv_exec_t *ex, uint64_t q[2], uint64_t *ce, uint32_t *epoch) {
+  caller_want_q(ex, q);
+  *ce = ex->ce_route ? caller_need_ce(ex) : 0;
+  *epoch = ex->ce_epoch;
+}
+
+// TINYNV_CE_ROUTE stage B: the launch is its stream's work from here (a routed copy after it on the stream waits for
+// compute >= at), and the chain's batch must acquire what this stream is ordered after on the CE channel.
+void tinynv_exec_order_launch(tinynv_exec_t *ex, uint64_t at) {
+  if (!ex->ce_route) return;
+  note_q(caller(ex), 0, at);
+  uint64_t need = caller_need_ce(ex);
+  if (need > ex->chain_need_ce) ex->chain_need_ce = need;
+}
+
+void tinynv_exec_order_wait(tinynv_exec_t *ex, const uint64_t q[2], uint64_t ce, uint32_t epoch) {
+  if (!ex->ord) return;   // the legacy stream is ordered after everything already
+  tinynv_exec_order_t *o = dep(ex, ex->ord);
+  if (epoch == ex->ce_epoch) { note_q(o, 0, q[0]); note_q(o, 1, q[1]); }
+  if (ce > o->ce) o->ce = ce;
+}
+
 int tinynv_exec_reached_ce(tinynv_exec_t *ex, uint64_t value) {
   if (!ex->ce_route || !value) return 1;
   if (value > ex->ce_reserved) value = ex->ce_reserved;
@@ -968,6 +1014,8 @@ static void *arena(tinynv_exec_t *ex, int r, uint64_t bytes, uint64_t align, uin
         memcpy((uint8_t *)ex->sem.dma.va + SEM_CE, &ex->ce_reserved, sizeof(ex->ce_reserved));
         ex->ce_acq_q[0] = ex->ce_acq_q[1] = 0;
       }
+      ex->ce_epoch++;   // and every stream's graphics values are in the old numbering: dep() forgets them
+      ex->leg.q[0] = ex->leg.q[1] = 0;
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
 
@@ -1082,9 +1130,18 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
   // there it has not yet been ordered after. Every batch on either graphics queue is (a copy-queue download may read
   // what a routed copy wrote) except the descriptor delivery inside a chain flush, which reads the driver's own mirror
   // and writes the descriptor region and has nothing to do with a caller's copies.
+  //
+  // How much: stage A (ce_conservative), everything routed so far. Stage B, what this batch's work needs: a chain's
+  // batch, the most any launch in it needed when it was added (chain_need_ce); any other batch, the caller's
+  // (caller_need_ce); and a compute batch also carries the held inline uploads, so it takes their need too.
   uint64_t ce_need = 0;
   if (ex->ce_route && !(ex->in_chain_flush && q == &ex->g->gsp.copy_q)) {
-    ce_need = ex->ce_reserved;
+    int compute = q != &ex->g->gsp.copy_q;
+    if (ex->ce_conservative) ce_need = ex->ce_reserved;
+    else ce_need = ex->in_chain_flush ? ex->chain_need_ce : caller_need_ce(ex);
+    if (compute && ex->inline_need_ce > ce_need) ce_need = ex->inline_need_ce;
+    if (compute && ex->in_chain_flush) ex->chain_need_ce = 0;   // the chain goes out in this batch
+    if (ce_need > ex->ce_reserved) ce_need = ex->ce_reserved;   // never a value no CE batch was given
     if (ce_need <= ex->ce_acq[q == &ex->g->gsp.copy_q]) ce_need = 0;
   }
   uint32_t cq = ce_need ? 6u : 0u;
@@ -1150,6 +1207,7 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
     ex->inline_batches_saved += ex->inline_pend_n;
     ex->inline_pend_n = 0;
     ex->inline_pend_bytes = 0;
+    ex->inline_need_ce = 0;   // their CE need was taken by this batch's acquire
   }
   if (q != &ex->g->gsp.copy_q) ex->after_stall = 0;
   ex->last_q = q;
@@ -1257,6 +1315,11 @@ static int submit_batch(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c
                        "chain handed over after it releases a lower one, so the timeline would go backwards by the "
                        "length of the chain", (unsigned long long)upto);
   if (!ex->submitting_inline && !ex->internal_work) ex->needs_wait = 1;   // the driver's own work is waited for by the driver
+  // TINYNV_CE_ROUTE stage B: this batch is the caller's work, so a later routed copy on its stream is ordered after it.
+  // Not a chain's batch or its descriptor delivery (each launch was noted when it joined the chain, against ITS stream
+  // - the flush may be running on another's behalf), and not a batch that only carries held uploads (noted when held).
+  if (ex->ce_route && !ex->in_chain_flush && !ex->chain_submit && !ex->submitting_inline)
+    note_q(caller(ex), q == &ex->g->gsp.copy_q, upto);
   if (upto > ex->timeline) ex->timeline = upto;
   ex->q_last[q == &ex->g->gsp.copy_q] = upto;
   return ex->sync ? tinynv_exec_wait(ex, upto, 30.0) : 0;
@@ -1780,7 +1843,10 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // the keep-alive's own timeline value, which it releases the moment it sees the flag. The driver's own work (the
   // keep-alive launch itself, a download by kernel) does not release it.
   if (!ex->internal_work) tinynv_exec_keepalive_release(ex, 0);
-  if (submit_batch(ex, &ex->g->gsp.compute_q, &c, va, chain_upto, n)) return -1;
+  ex->chain_submit = 1;   // TINYNV_CE_ROUTE: its launches were attributed to their streams as they joined
+  int chain_rc = submit_batch(ex, &ex->g->gsp.compute_q, &c, va, chain_upto, n);
+  ex->chain_submit = 0;
+  if (chain_rc) return -1;
   // Once per chain rather than once per launch: see tinynv_exec_run. This reports on work already handed over, which
   // is what it reported on before too - a launch that has not been submitted cannot have faulted.
   { PROF_START(ex); int bad = tinynv_gsp_poll(ex->g); PROF_END(ex, PROF_POLL);
@@ -2163,6 +2229,14 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
         ex->inline_rode_flush_n++;
       }
     }
+    // TINYNV_CE_ROUTE stage B: the bytes ride the first compute batch reserved after this point, so the stream's next
+    // routed copy waits for compute >= reserved + 1 (nothing is pending - a mid-chain upload flushed above); and that
+    // batch must acquire whatever routed copies this stream is ordered after, which may have written the same bytes.
+    if (ex->ce_route) {
+      note_q(caller(ex), 0, ex->reserved + 1);
+      uint64_t need = caller_need_ce(ex);
+      if (need > ex->inline_need_ce) ex->inline_need_ce = need;
+    }
     inline_pend_push(ex, dst_va, src, (uint32_t)n);
     ex->inline_n++;
     ex->inline_bytes += n;
@@ -2209,8 +2283,13 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
     memcpy(ex->stage[sb].dma.va, p + off, chunk);
     double t1 = now();
     if (route) {
-      // Ordered after everything submitted on both graphics queues (stage A: fully conservative).
-      if (ce_submit(ex, ex->q_last, dst_va + off, ex->stage[sb].va, chunk)) return -1;
+      // Stage A (TINYNV_CE_CONSERVATIVE, or the legacy stream): after everything submitted on both graphics queues.
+      // Stage B: after this stream's own graphics work and the legacy stream's. The staging buffer needs nothing on
+      // the GPU: stage_claim above waited, on the CPU, for whatever last read it.
+      uint64_t want[2];
+      caller_want_q(ex, want);
+      if (ce_submit(ex, want, dst_va + off, ex->stage[sb].va, chunk)) return -1;
+      caller(ex)->ce = ex->ce_reserved;
       ex->stage_pend_ce[sb] = ex->ce_reserved;
       ex->ce_n++;
       ex->ce_bytes += chunk;
@@ -2619,6 +2698,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
     if (rc) return -1;
   }
   ex->reserved = at;
+  tinynv_exec_order_launch(ex, at);
 
   // Asking the firmware whether anything faulted happens at the flush, not here. It is two reads across the link every
   // time it is asked - the status queue's read and write pointers - and across a link where a round trip is a
@@ -2896,6 +2976,7 @@ int tinynv_exec_ce_route_init(tinynv_exec_t *ex) {
   const char *e = getenv("TINYNV_CE_ROUTE");
   if (!(e && *e && *e != '0')) return 0;
   tinynv_gsp_t *gsp = &ex->g->gsp;
+  { const char *k = getenv("TINYNV_CE_CONSERVATIVE"); ex->ce_conservative = k && *k && *k != '0'; }
   const char *why = NULL;
   // Only the configuration test_hw_ce_overlap measured: asynchronous, doorbells rung in line, no lent kernel.
   if (ex->sync) why = "TINYNV_SYNC waits on every batch, so nothing could overlap anyway";
@@ -2951,8 +3032,11 @@ int tinynv_exec_ce_route_init(tinynv_exec_t *ex) {
   uint32_t et = gsp->ce_engine;
   fprintf(stderr, "libtinynv: host-to-device copies over %u bytes go to copy engine %#x (CE%u, runlist %u; compute is on "
                   "runlist %u) on a channel of their own (TINYNV_CE_ROUTE was asked for); self-check copy verified. "
-                  "Ordering: stage A, every routed copy after all earlier work and all later work after it\n",
-          ex->inline_upload ? ex->inline_max : 0u, et, et >= 0x9 ? et - 0x9 : et, gsp->ce_runlist, gsp->channel_runlist);
+                  "Ordering: %s\n",
+          ex->inline_upload ? ex->inline_max : 0u, et, et >= 0x9 ? et - 0x9 : et, gsp->ce_runlist, gsp->channel_runlist,
+          ex->ce_conservative ? "conservative (TINYNV_CE_CONSERVATIVE), every routed copy after all earlier work and all "
+                                "later work after it"
+                              : "per stream, with the default stream ordered against all of them");
   return 0;
 }
 

@@ -79,6 +79,9 @@ static void ensure_init(void){
   g_init=1;
   if (tinynv_init()!=TINYNV_OK || tinynv_device_get(&g_dev,0)!=TINYNV_OK || tinynv_stream_create(g_dev,&g_default_stream)!=TINYNV_OK){
     fprintf(stderr,"[tinycudart] driver init failed: %s -- reporting no CUDA devices\n", tinynv_last_error()); g_nodev=1; g_dev=NULL; g_default_stream=NULL; return; }
+  // 0, cudaStreamLegacy and cudaStreamPerThread all land on this stream (st()), so it keeps the legacy default stream's
+  // rule: ordered against every other stream. Only TINYNV_CE_ROUTE has more than one queue for that to matter on.
+  tinynv_stream_set_legacy(g_default_stream, 1);
   tinycudart_hostpool_init(g_dev);
   { tinynv_status_t cr=tinynv_device_cc(g_dev,&g_cc); if (cr!=TINYNV_OK && cr!=TINYNV_ERR_NODEV) fprintf(stderr,"[tinycudart] the card's architecture could not be read (%s): a binary built for several cards cannot choose its code\n", tinynv_last_error()); if (cr!=TINYNV_OK) g_cc=0;
     // The null device presents the 5090 profile to ggml (cudart_api.c, TINYCUDART_NULL_PROFILE), so it takes the images

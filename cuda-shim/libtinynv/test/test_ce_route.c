@@ -179,6 +179,7 @@ static void launch(tinynv_exec_t *ex, uint64_t qmd_va) {
   ex->chain[ex->nchain].host = qmd_host[ex->nchain];
   ex->nchain++;
   ex->reserved++;
+  tinynv_exec_order_launch(ex, ex->reserved);   // tinynv_exec_run's bookkeeping, for the stream in ex->ord
   placed[nplaced].va = qmd_va; placed[nplaced++].value = ex->reserved;
 }
 static void show(const char *arm) {
@@ -327,6 +328,128 @@ int main(void) {
     int on_ce = 0; for (int i = 0; i < nev; i++) if ((ev[i].kind == EV_WAIT || ev[i].kind == EV_RELEASE) && ev[i].a == 2) on_ce++;
     CHECK(count_q(Q_CE) == 0 && on_ce == 0, "off: %d ce batches and %d ce-slot methods with routing off", count_q(Q_CE), on_ce);
     CHECK(count_q(Q_COPY) >= 3, "off: the chunks did not go to the graphics copy queue");
+  }
+
+  // ---- stage B: per-stream ordering. ex->ord is what tinynv.c sets for the length of each call; NULL is legacy ----
+  static tinynv_exec_order_t sa, sb, sc;
+#define ON(ex, o) ((ex)->ord = (o))
+#define RESET_STREAMS() (memset(&sa, 0, sizeof sa), memset(&sb, 0, sizeof sb), memset(&sc, 0, sizeof sc))
+  { // overlap: a kernel on A, a routed copy on B, another kernel on A - nothing waits for anything on another stream
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ON(ex, &sa); launch(ex, A);
+    ON(ex, &sb); CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/overlap: upload: %s", tinynv_last_error());
+    ON(ex, &sa); launch(ex, B); CHECK(!tinynv_exec_flush(ex), "B/overlap: flush: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: overlap");
+    submitted_only("B/overlap", base_route);
+    int a = first(EV_LAUNCH, A), ce0 = nth_batch(Q_CE, 0), b = first(EV_LAUNCH, B);
+    CHECK(a >= 0 && ce0 >= 0 && ev[a].batch < ce0, "B/overlap: A's pending chain was not handed over before the routed copy");
+    CHECK(ce0 >= 0 && !waits_in(ce0, Q_COMPUTE) && !waits_in(ce0, Q_COPY), "B/overlap: B's copy acquires a graphics value (compute %llu, copy %llu); B has no graphics work",
+          (unsigned long long)waits_in(ce0, Q_COMPUTE), (unsigned long long)waits_in(ce0, Q_COPY));
+    CHECK(b >= 0 && !waits_in(ev[b].batch, Q_CE), "B/overlap: A's second kernel acquires ce >= %llu, a copy on another stream",
+          (unsigned long long)(b >= 0 ? waits_in(ev[b].batch, Q_CE) : 0));
+    CHECK(sb.ce == 3 && sa.ce == 0 && sa.q[0] == 2, "B/overlap: stream records: B.ce %llu (want 3), A.ce %llu (0), A.q0 %llu (2)",
+          (unsigned long long)sb.ce, (unsigned long long)sa.ce, (unsigned long long)sa.q[0]);
+  }
+  { // same stream, copy then kernel (read after write): the kernel's batch acquires the copy
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ON(ex, &sb); CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/raw: upload: %s", tinynv_last_error());
+    launch(ex, A); CHECK(!tinynv_exec_flush(ex), "B/raw: flush: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: same-stream RAW");
+    submitted_only("B/raw", base_route);
+    int a = first(EV_LAUNCH, A);
+    CHECK(a >= 0 && waits_in(ev[a].batch, Q_CE) == 3, "B/raw: the kernel after the copy on its stream acquires ce >= %llu, want 3",
+          (unsigned long long)(a >= 0 ? waits_in(ev[a].batch, Q_CE) : 0));
+  }
+  { // same stream, kernel then copy (write after read): the copy acquires the kernel, which is handed over first
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ON(ex, &sa); launch(ex, A);
+    CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/war: upload: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: same-stream WAR");
+    submitted_only("B/war", base_route);
+    int a = first(EV_LAUNCH, A), ce0 = nth_batch(Q_CE, 0);
+    CHECK(a >= 0 && ce0 > ev[a].batch && waits_in(ce0, Q_COMPUTE) >= 1, "B/war: the copy does not acquire the kernel before it on its stream (compute >= 1)");
+  }
+  { // legacy: after every stream's routed copies; and every stream's routed copy after the legacy stream's work
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ON(ex, &sb); CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/legacy: upload: %s", tinynv_last_error());
+    ON(ex, NULL); launch(ex, A); CHECK(!tinynv_exec_flush(ex), "B/legacy: flush: %s", tinynv_last_error());
+    ON(ex, &sc); CHECK(!tinynv_exec_upload(ex, U + (64u << 20), data, STAGE_HALF), "B/legacy: upload 2: %s", tinynv_last_error());
+    ON(ex, NULL); CHECK(!tinynv_exec_upload(ex, U + (128u << 20), data, STAGE_HALF), "B/legacy: upload 3: %s", tinynv_last_error());
+    ON(ex, &sa); launch(ex, B); CHECK(!tinynv_exec_flush(ex), "B/legacy: flush 2: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: legacy");
+    int bl = first(EV_LAUNCH, B);
+    CHECK(bl >= 0 && waits_in(ev[bl].batch, Q_CE) == 5, "B/legacy: stream A's kernel after the legacy stream's copy acquires ce >= %llu, want 5",
+          (unsigned long long)(bl >= 0 ? waits_in(ev[bl].batch, Q_CE) : 0));
+    submitted_only("B/legacy", base_route);
+    int a = first(EV_LAUNCH, A), ce1 = nth_batch(Q_CE, 1);
+    CHECK(a >= 0 && waits_in(ev[a].batch, Q_CE) == 3, "B/legacy: the legacy stream's kernel does not acquire stream B's copy (ce >= 3)");
+    CHECK(ce1 >= 0 && waits_in(ce1, Q_COMPUTE) >= 1, "B/legacy: stream C's copy does not acquire the legacy stream's kernel (compute >= 1)");
+  }
+  { // events: record on B after its copy, A waits -> A's kernel acquires it; record on A after a kernel, B waits ->
+    // B's copy acquires the kernel. No CPU wait in either direction.
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    uint64_t eq[2], ece; uint32_t eep;
+    ON(ex, &sb); CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/event: upload: %s", tinynv_last_error());
+    CHECK(!tinynv_exec_flush(ex), "B/event: flush: %s", tinynv_last_error());
+    tinynv_exec_order_record(ex, eq, &ece, &eep);
+    CHECK(ece == 3, "B/event: the event on B carries ce %llu, want 3", (unsigned long long)ece);
+    ON(ex, &sa); tinynv_exec_order_wait(ex, eq, ece, eep);
+    launch(ex, A); CHECK(!tinynv_exec_flush(ex), "B/event: flush: %s", tinynv_last_error());
+    tinynv_exec_order_record(ex, eq, &ece, &eep);
+    ON(ex, &sc); tinynv_exec_order_wait(ex, eq, ece, eep);
+    CHECK(!tinynv_exec_upload(ex, U + (64u << 20), data, STAGE_HALF), "B/event: upload 2: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: event record + wait");
+    submitted_only("B/event", base_route);
+    int a = first(EV_LAUNCH, A), ce1 = nth_batch(Q_CE, 1);
+    CHECK(a >= 0 && waits_in(ev[a].batch, Q_CE) == 3, "B/event: A's kernel after waiting on B's event does not acquire B's copy (ce >= 3)");
+    CHECK(ce1 >= 0 && waits_in(ce1, Q_COMPUTE) >= 1, "B/event: C's copy after waiting on A's event does not acquire A's kernel (compute >= 1)");
+    int cpu = 0; for (int i = 0; i < nev; i++) cpu += ev[i].kind == EV_CPUWAIT_CE;
+    CHECK(!cpu, "B/event: a stream wait waited on the CPU");
+  }
+  { // held inline on a stream: flushed before that stream's routed copy and acquired by it; and held bytes written
+    // after a routed copy on the same stream ride a batch that acquires that copy, whichever stream's batch it is
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ON(ex, &sb); CHECK(!tinynv_exec_upload(ex, 0x7000, data, 16), "B/held: small: %s", tinynv_last_error());
+    CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/held: upload: %s", tinynv_last_error());
+    CHECK(!tinynv_exec_upload(ex, U, data, 16), "B/held: small 2: %s", tinynv_last_error());
+    ON(ex, &sa); launch(ex, A); CHECK(!tinynv_exec_flush(ex), "B/held: flush: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: held inline");
+    submitted_only("B/held", base_route);
+    int u = first(EV_INLINE, 0x7000), ce0 = nth_batch(Q_CE, 0), u2 = first(EV_INLINE, U);
+    CHECK(u >= 0 && ce0 > ev[u].batch && waits_in(ce0, Q_COMPUTE) >= rel_in(ev[u].batch, Q_COMPUTE),
+          "B/held: B's routed copy is not after B's held bytes");
+    CHECK(u2 >= 0 && waits_in(ev[u2].batch, Q_CE) == 3, "B/held: bytes held after B's routed copy to the same address ride a batch that does not acquire it (ce >= 3)");
+  }
+  { // copy-queue work on a stream: after that stream's routed copy, not after another's
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ON(ex, &sb); CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/copyq: upload: %s", tinynv_last_error());
+    ON(ex, &sa); CHECK(!tinynv_exec_copy(ex, D, D + 0x100000, 4096), "B/copyq: copy on A: %s", tinynv_last_error());
+    ON(ex, &sb); CHECK(!tinynv_exec_copy(ex, D + 0x200000, U, 4096), "B/copyq: copy on B: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: copy-queue work");
+    submitted_only("B/copyq", base_route);
+    int c0 = nth_batch(Q_COPY, 0), c1 = nth_batch(Q_COPY, 1);
+    CHECK(c0 >= 0 && !waits_in(c0, Q_CE), "B/copyq: A's copy acquires B's routed copy");
+    CHECK(c1 >= 0 && waits_in(c1, Q_CE) == 3, "B/copyq: B's copy after its routed copy does not acquire it (ce >= 3)");
+  }
+  { // TINYNV_CE_CONSERVATIVE: the overlap arm again, now with stage A's ordering
+    tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+    ex->ce_conservative = 1;
+    ON(ex, &sa); launch(ex, A);
+    ON(ex, &sb); CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "B/conservative: upload: %s", tinynv_last_error());
+    ON(ex, &sa); launch(ex, B); CHECK(!tinynv_exec_flush(ex), "B/conservative: flush: %s", tinynv_last_error());
+    ON(ex, NULL);
+    show("B: conservative knob");
+    submitted_only("B/conservative", base_route);
+    int ce0 = nth_batch(Q_CE, 0), b = first(EV_LAUNCH, B);
+    CHECK(ce0 >= 0 && waits_in(ce0, Q_COMPUTE) >= 1, "B/conservative: the copy does not acquire the kernel on the other stream");
+    CHECK(b >= 0 && waits_in(ev[b].batch, Q_CE) == 3, "B/conservative: the kernel after does not acquire the copy on the other stream");
   }
 
   // ---- the bring-up and its fallbacks ----

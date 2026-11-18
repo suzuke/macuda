@@ -27,6 +27,7 @@ tinynv_status_t tinynv_host_alloc(tinynv_device_t d,size_t n,void** o){ (void)d;
 tinynv_status_t tinynv_host_free(tinynv_device_t d,void* p){ (void)d; free(p); return TINYNV_OK; }
 tinynv_status_t tinynv_stream_create(tinynv_device_t d,tinynv_stream_t* o){ (void)d; *o=calloc(1,sizeof(struct tinynv_stream)); return TINYNV_OK; }
 tinynv_status_t tinynv_stream_destroy(tinynv_stream_t s){ free(s); return TINYNV_OK; }
+void tinynv_stream_set_legacy(tinynv_stream_t s,int legacy){ (void)s;(void)legacy; }
 tinynv_status_t tinynv_stream_sync(tinynv_stream_t s){ (void)s; return TINYNV_OK; }
 tinynv_status_t tinynv_event_create(tinynv_device_t d,tinynv_event_t* o){ (void)d; *o=calloc(1,sizeof(struct tinynv_event)); return TINYNV_OK; }
 tinynv_status_t tinynv_event_record(tinynv_event_t e,tinynv_stream_t s){ (void)e;(void)s; return TINYNV_OK; }

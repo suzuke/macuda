@@ -90,9 +90,12 @@ struct tinynv_kernel {
   int has_layout;
 };
 
-struct tinynv_stream { tinynv_device_t dev; uint64_t submitted; };
-// ce: the dedicated copy channel's timeline value at the record (TINYNV_CE_ROUTE), 0 when nothing was routed
-struct tinynv_event { tinynv_device_t dev; uint64_t value, ce; };
+// ord: what this stream's next work is ordered after, against the dedicated copy channel (TINYNV_CE_ROUTE stage B; see
+// tinynv_exec_order_t). legacy: the runtime's default stream, which is ordered after everything (tinynv_stream_set_legacy).
+struct tinynv_stream { tinynv_device_t dev; uint64_t submitted; tinynv_exec_order_t ord; int legacy; };
+// ce: the dedicated copy channel's value the recording stream was ordered after (TINYNV_CE_ROUTE), 0 when nothing was
+// routed; q / epoch: the same on the graphics slots, which a GPU-side stream wait takes on
+struct tinynv_event { tinynv_device_t dev; uint64_t value, ce, q[2]; uint32_t epoch; };
 
 static struct tinynv_device g_dev;
 static int g_inited;
@@ -751,11 +754,17 @@ tinynv_status_t tinynv_free(tinynv_device_t d, tinynv_devptr_t p) {
 // buffer to the engine twice. Nothing nests - the public entry points take this and the internals never do - so a plain
 // mutex is enough.
 #define WITH_LOCK(expr) ({ pthread_mutex_lock(&g_lock); int rc_ = (expr); pthread_mutex_unlock(&g_lock); rc_; })
+// The same, with the exec told which stream the work is for (TINYNV_CE_ROUTE stage B orders routed copies per stream).
+// NULL for the legacy stream, which exec.c orders after everything; reset before the lock is let go, so no other call
+// is ever attributed to a stream it did not name, and a destroyed stream's record is never reached.
+static tinynv_exec_order_t *ord_of(tinynv_stream_t s) { return s && !s->legacy ? &s->ord : NULL; }
+#define WITH_STREAM(s, expr) ({ pthread_mutex_lock(&g_lock); (s)->dev->exec.ord = ord_of(s); int rc_ = (expr); \
+                                (s)->dev->exec.ord = NULL; pthread_mutex_unlock(&g_lock); rc_; })
 
 tinynv_status_t tinynv_memcpy_htod(tinynv_stream_t s, tinynv_devptr_t dst, const void *src, size_t n) {
   if (ON_GPU(s)) {
     NEED_GPU(s);
-    return WITH_LOCK(tinynv_exec_upload(&s->dev->exec, (uint64_t)dst, src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+    return WITH_STREAM(s, tinynv_exec_upload(&s->dev->exec, (uint64_t)dst, src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
   }
   memcpy((void *)(uintptr_t)dst, src, n);
   return TINYNV_OK;
@@ -785,7 +794,7 @@ static tinynv_status_t download_by_kernel(tinynv_stream_t s, void *dst, uint64_t
                                                    (unsigned long long)blocks), TINYNV_ERR_INVALID;
     // The kernel WRITES into the staging buffer, so anything still reading it has to be done first - an upload's
     // copy can now outlive the call that issued it.
-    if (WITH_LOCK(tinynv_exec_stage_claim(&d->exec))) return TINYNV_ERR_DRIVER;
+    if (WITH_STREAM(s, tinynv_exec_stage_claim(&d->exec))) return TINYNV_ERR_DRIVER;
     // The driver's own launch, not the caller's: marked so the profile does not stamp it as the token's last kernel.
     tinynv_exec_set_internal(&d->exec, 1);
     tinynv_status_t rc = tinynv_launch(s, d->download_kernel, (unsigned)blocks, 1, 1, d->download_block, 1, 1, 0,
@@ -906,7 +915,7 @@ tinynv_status_t tinynv_memcpy_dtoh(tinynv_stream_t s, void *dst, tinynv_devptr_t
     // copy-end becomes a real interval because this path's release does wait for its kernel.
     tinynv_status_t rc = (s->dev->download_via_compute && s->dev->download_kernel && n)
                              ? download_by_kernel(s, dst, (uint64_t)src, n)
-                             : WITH_LOCK(tinynv_exec_download(&s->dev->exec, dst, (uint64_t)src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+                             : WITH_STREAM(s, tinynv_exec_download(&s->dev->exec, dst, (uint64_t)src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
     // A download waits for itself, so the engine is idle here - on a decode this is the token boundary, and the stream
     // synchronisation the caller issues next is answered without a wait. TINYNV_KEEPALIVE: keep the engine scheduled.
     // Only a download the size of the logits: the ~24 small read-backs a token are not the boundary, and a keep-alive
@@ -957,7 +966,7 @@ tinynv_status_t tinynv_memcpy_dtod(tinynv_stream_t s, tinynv_devptr_t dst, tinyn
       return tinynv_fail("device to device copy of %zu bytes overlaps: the copy engine has no defined order for that", n),
              TINYNV_ERR_INVALID;
     if (s->dev->exec.dtod_via_compute && s->dev->download_kernel && n) return dtod_by_kernel(s, dst, src, n);
-    return WITH_LOCK(tinynv_exec_copy(&s->dev->exec, (uint64_t)dst, (uint64_t)src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+    return WITH_STREAM(s, tinynv_exec_copy(&s->dev->exec, (uint64_t)dst, (uint64_t)src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
   }
   memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
   return TINYNV_OK;
@@ -969,13 +978,14 @@ tinynv_status_t tinynv_memset(tinynv_stream_t s, tinynv_devptr_t dst, int v, siz
     // The copy engine has a fill, and this does not use it yet: a pattern is written into the staging buffer once and
     // copied across in chunks. Correct, and one transfer per chunk more than it needs to be.
     tinynv_exec_t *ex = &s->dev->exec;
-    if (!v) return WITH_LOCK(tinynv_exec_zero(ex, (uint64_t)dst, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+    if (!v) return WITH_STREAM(s, tinynv_exec_zero(ex, (uint64_t)dst, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
     // held across the whole fill: the staging buffer holds the pattern, so another caller copying through it between
     // chunks would write its own bytes into the rest of this one
     pthread_mutex_lock(&g_lock);
+    ex->ord = ord_of(s);
     size_t chunk = ex->stage[0].size < n ? (size_t)ex->stage[0].size : n;
     // An upload may still have a copy reading this buffer: uploads no longer drain the device between chunks.
-    if (tinynv_exec_stage_claim(ex)) { pthread_mutex_unlock(&g_lock); return TINYNV_ERR_DRIVER; }
+    if (tinynv_exec_stage_claim(ex)) { ex->ord = NULL; pthread_mutex_unlock(&g_lock); return TINYNV_ERR_DRIVER; }
     memset(ex->stage[0].dma.va, v, chunk);
     int bad = 0;
     for (size_t off = 0; off < n && !bad; off += chunk) {
@@ -986,6 +996,7 @@ tinynv_status_t tinynv_memset(tinynv_stream_t s, tinynv_devptr_t dst, int v, siz
     // upload chunk, whose claim waits only for what stage_pend names) must wait for them. Nothing recorded it: an upload
     // straight after a non-zero fill could memcpy over the pattern while the fill's copies still read it.
     if (!bad) ex->stage_pend[0] = ex->q_last[1];
+    ex->ord = NULL;
     pthread_mutex_unlock(&g_lock);
     return bad ? TINYNV_ERR_DRIVER : TINYNV_OK;
   }
@@ -1017,6 +1028,7 @@ tinynv_status_t tinynv_stream_create(tinynv_device_t d, tinynv_stream_t *out) {
   return TINYNV_OK;
 }
 tinynv_status_t tinynv_stream_destroy(tinynv_stream_t s) { free(s); return TINYNV_OK; }
+void tinynv_stream_set_legacy(tinynv_stream_t s, int legacy) { if (s) s->legacy = legacy; }
 // Every batch this driver submits is waited on before the call that made it returns, so by the time anything can ask,
 // the work is done. Waiting on the timeline anyway costs one read and keeps this honest if that ever stops being true.
 // Celsius from the card's fixed point: signed, eight fractional bits, so 256ths of a degree.
@@ -1217,9 +1229,17 @@ tinynv_status_t tinynv_event_record(tinynv_event_t e, tinynv_stream_t s) {
   // timeline value will not be released until something hands it over, so an event recorded without flushing names a
   // value that may never arrive.
   if (s->dev->has_pci && s->dev->booted) {
-    if (WITH_LOCK(tinynv_exec_flush(&s->dev->exec))) return TINYNV_ERR_DRIVER;
-    e->value = s->dev->exec.timeline;
-    e->ce = s->dev->exec.ce_route ? s->dev->exec.ce_reserved : 0;   // the copies routed so far, on their own counter
+    pthread_mutex_lock(&g_lock);
+    tinynv_exec_t *ex = &s->dev->exec;
+    if (tinynv_exec_flush(ex)) { pthread_mutex_unlock(&g_lock); return TINYNV_ERR_DRIVER; }
+    e->value = ex->timeline;
+    // TINYNV_CE_ROUTE: what the recording stream is ordered after on every timeline - its own work and the legacy
+    // stream's; everything, for the legacy stream or under TINYNV_CE_CONSERVATIVE. The flush above put every launch it
+    // names on a ring, so a GPU-side wait on these never names an unsubmitted value.
+    ex->ord = ord_of(s);
+    tinynv_exec_order_record(ex, e->q, &e->ce, &e->epoch);
+    ex->ord = NULL;
+    pthread_mutex_unlock(&g_lock);
   } else {
     e->value = s->submitted;
   }
@@ -1277,6 +1297,18 @@ tinynv_status_t tinynv_mem_info(tinynv_device_t d, uint64_t *free_bytes, uint64_
 tinynv_status_t tinynv_stream_wait_event(tinynv_stream_t s, tinynv_event_t e) {
   if (!ON_GPU(s) || !e) return TINYNV_OK;
   NEED_GPU(s);
+  // TINYNV_CE_ROUTE: that second queue exists - the dedicated copy channel - and the wait becomes what this comment
+  // anticipated: no CPU wait, the stream takes on the event's values and its next batches acquire them on the GPU
+  // (the graphics queues are one in-order stream of batches, so only the CE ones ever need an acquire). Routing off:
+  // the CPU wait, unchanged.
+  if (s->dev->exec.ce_route) {
+    pthread_mutex_lock(&g_lock);
+    s->dev->exec.ord = ord_of(s);
+    tinynv_exec_order_wait(&s->dev->exec, e->q, e->ce, e->epoch);
+    s->dev->exec.ord = NULL;
+    pthread_mutex_unlock(&g_lock);
+    return TINYNV_OK;
+  }
   return WITH_LOCK(tinynv_exec_wait(&s->dev->exec, e->value, 30.0) ||
                    tinynv_exec_wait_ce(&s->dev->exec, e->ce, 30.0)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
 }
@@ -1336,7 +1368,9 @@ tinynv_status_t tinynv_launch(tinynv_stream_t s, tinynv_kernel_t k, unsigned gx,
     tinynv_exec_module_t m = k->mod->loaded;
     m.layout = k->layout;
     uint32_t grid[3] = {gx, gy, gz}, block[3] = {bx, by, bz};
+    dev->exec.ord = ord_of(s);   // the module upload above ran as the driver's own (legacy) work; the launch is s's
     int rc = tinynv_exec_run(&dev->exec, &m, d, grid, block, dyn_smem, params, params_len);
+    dev->exec.ord = NULL;
     pthread_mutex_unlock(&g_lock);
     return rc ? TINYNV_ERR_LAUNCH : TINYNV_OK;
   }

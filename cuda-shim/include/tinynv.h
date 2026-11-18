@@ -95,6 +95,10 @@ tinynv_status_t tinynv_host_free(tinynv_device_t, void*);
 // streams / events / launch
 tinynv_status_t tinynv_stream_create(tinynv_device_t, tinynv_stream_t* out);
 tinynv_status_t tinynv_stream_destroy(tinynv_stream_t);
+// Mark a stream as CUDA's legacy default stream: its work is ordered after all earlier work on every stream, and all later
+// work on every stream after it. Only matters when bulk copies are routed to a copy engine of their own (TINYNV_CE_ROUTE);
+// every stream already shares one in-order queue otherwise. tinycudart marks its default stream with this.
+void tinynv_stream_set_legacy(tinynv_stream_t, int legacy);
 tinynv_status_t tinynv_stream_sync(tinynv_stream_t);
 
 // Does a synchronise on this stream have to WAIT, or only hand over what has been built?

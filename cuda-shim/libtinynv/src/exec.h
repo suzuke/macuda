@@ -61,6 +61,12 @@
 // (TINYNV_DESC_MB), checked where it is sized.
 #define TINYNV_DELTA_SPANS_MAX       4096
 #define TINYNV_DELTA_LAUNCH_RUNS_MAX 64
+// TINYNV_CE_ROUTE, stage B: what one stream's next work has to be ordered after. q[0] / q[1]: values on the compute and
+// copy-queue slots of its own earlier work (and of events it waited on); ce: the same on the dedicated copy channel.
+// The graphics queues are shared and in order, so these only ever matter between the CE channel and the graphics ones.
+// epoch: the timeline rebase a q value was taken in (a rebase idles everything, so older q values mean "done").
+typedef struct { uint64_t q[2], ce; uint32_t epoch; } tinynv_exec_order_t;
+
 typedef struct { uint32_t lo, hi; } tinynv_delta_span_t;   // [lo,hi) as offsets into AR_DESC, both dword multiples
 
 // TINYNV_KERNEL_PROFILE: the engine's clock at every kernel's completion, by kernel. See the fields in tinynv_exec_t.
@@ -492,6 +498,17 @@ typedef struct {
   uint64_t ce_acq[2];        // CE values compute_q / copy_q have already acquired
   uint64_t stage_pend_ce[2]; // the CE value of the last routed chunk reading each staging buffer, 0 when none
   uint64_t ce_n, ce_bytes;   // chunks routed and their bytes, for the summary
+  // Stage B: per-stream ordering against the CE channel. `ord` is the calling stream's order, set by tinynv.c for the
+  // length of one locked call; NULL means the legacy default stream or the driver's own work, which is ordered after
+  // EVERYTHING and which every later stream's work is ordered after (`leg`, CUDA's blocking-stream rule - applied to
+  // every stream, cudaStreamNonBlocking included, which is conservative). ce_conservative (TINYNV_CE_CONSERVATIVE=1)
+  // keeps stage A: every routed copy after all earlier work, and all later work after it.
+  tinynv_exec_order_t *ord, leg;
+  int ce_conservative;
+  uint32_t ce_epoch;
+  uint64_t chain_need_ce;    // the CE value the pending chain's batch must acquire: the most any launch in it needs
+  uint64_t inline_need_ce;   // the same for the held inline uploads, which ride the next compute batch
+  int chain_submit;          // submit_batch is handing over a chain's batch (in_chain_flush is already 0 there)
 } tinynv_exec_t;
 
 int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex);
@@ -583,6 +600,13 @@ int tinynv_exec_idle(tinynv_exec_t *ex);   // both timelines: the graphics chann
 // Bring up TINYNV_CE_ROUTE at the end of tinynv_exec_init (exported for test_ce_route): sets ce_route only after the CE
 // channel bound its class and carried a verified self-check copy; otherwise prints one line and leaves routing off.
 int tinynv_exec_ce_route_init(tinynv_exec_t *ex);
+// Stage B, for tinynv.c, called under the lock with `ord` set to the stream concerned (NULL: legacy). What an event
+// recorded now must carry, and what a stream waiting on such an event takes on (a GPU-side acquire, no CPU wait).
+void tinynv_exec_order_record(tinynv_exec_t *ex, uint64_t q[2], uint64_t *ce, uint32_t *epoch);
+// A launch has joined the pending chain with timeline value `at`, on behalf of the calling stream (tinynv_exec_run calls
+// this; exported so test_ce_route can place launches the way it does).
+void tinynv_exec_order_launch(tinynv_exec_t *ex, uint64_t at);
+void tinynv_exec_order_wait(tinynv_exec_t *ex, const uint64_t q[2], uint64_t ce, uint32_t epoch);
 int tinynv_exec_wait_ce(tinynv_exec_t *ex, uint64_t value, double seconds);
 int tinynv_exec_reached_ce(tinynv_exec_t *ex, uint64_t value);
 int tinynv_exec_needs_wait(const tinynv_exec_t *ex);
