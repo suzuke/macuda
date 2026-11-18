@@ -35,7 +35,11 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#endif
+#include <libgen.h>
+#include <limits.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -73,8 +77,25 @@ static void on_alarm(int sig) {
 
 static int pid_alive(int pid) { return pid > 0 && (kill(pid, 0) == 0 || errno == EPERM); }
 
+// One spelling per socket: the directory resolved (symlinks, "//", /var vs /private/var), the name kept - the socket
+// itself may be gone. So a server started as "server $TMPDIR/tinygpu.sock" is found whichever way the client spelt it.
+static void norm(const char *path, char *out, size_t n) {
+  char d[PATH_MAX], b[PATH_MAX], r[PATH_MAX];
+  snprintf(d, sizeof(d), "%s", path);
+  snprintf(b, sizeof(b), "%s", path);
+  if (realpath(dirname(d), r)) snprintf(out, n, "%s/%s", r, basename(b));
+  else snprintf(out, n, "%s", path);
+}
+
 // Any process whose arguments contain "server PATH": a TinyGPU server for this socket, alive whatever its socket says.
+// -1 where processes cannot be listed this way, which the caller treats as "there may be one".
 static int server_process_for(const char *sock) {
+#ifndef __APPLE__
+  (void)sock;
+  return -1;
+#else
+  char want[PATH_MAX], got[PATH_MAX];
+  norm(sock, want, sizeof(want));
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0}, amib[2] = {CTL_KERN, KERN_ARGMAX}, argmax = 0, found = 0;
   size_t len = 0, sz = sizeof(argmax);
   if (sysctl(mib, 3, NULL, &len, NULL, 0) || sysctl(amib, 2, &argmax, &sz, NULL, 0) || argmax <= 0) return 0;
@@ -92,7 +113,7 @@ static int server_process_for(const char *sock) {
       while (q < end && !*q) q++;
       const char *prev = NULL;
       for (int a = 0; a < argc && q < end; a++) {
-        if (prev && !strcmp(prev, "server") && !strcmp(q, sock)) { found = pid; break; }
+        if (prev && !strcmp(prev, "server") && (norm(q, got, sizeof(got)), !strcmp(got, want))) { found = pid; break; }
         prev = q;
         q += strnlen(q, (size_t)(end - q)) + 1;
       }
@@ -101,6 +122,7 @@ static int server_process_for(const char *sock) {
   free(kp);
   free(buf);
   return found;
+#endif
 }
 
 static int connect_to(const char *sock, double reply_timeout) {
@@ -200,7 +222,7 @@ int main(int argc, char **argv) {
   if (fd < 0) {
     int e = errno, other = server_process_for(sock);
     if (pid_alive(old_pid) || other) {
-      say("a server for %s is alive (pid %d) but refuses connections (%s): busy with another client or wedged; not touching it",
+      say("a server for %s may be alive (pid %d) but refuses connections (%s): busy with another client or wedged; not touching it",
           sock, pid_alive(old_pid) ? old_pid : other, strerror(e));
       return 3;
     }

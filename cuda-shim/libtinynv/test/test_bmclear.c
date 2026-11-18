@@ -8,7 +8,8 @@
 //   no answer        the server takes the request and never replies (another client, or wedged): nothing written,
 //                    exit 4 after the reply timeout; and with a longer reply timeout the hard --timeout stops it
 //   start            nobody listening, the old server gone: the app is started as `APP server PATH`
-//   no start         nobody listening, the old server alive: it is NOT replaced, and nothing is started
+//   no start         nobody listening, the old server alive - or another process serving the same path, however
+//                    it is spelt: it is NOT replaced, and nothing is started
 //   usage            no --sock: refused, since the socket is never guessed
 #include <errno.h>
 #include <poll.h>
@@ -162,6 +163,20 @@ int main(int argc, char **argv) {
   rc = reap(pid, 6.0);
   CHECK(rc == 3, "no start: exit %d, want 3", rc);
   CHECK(access(marker, F_OK) != 0, "no start: a server was started while the old one is alive");
+
+  // no start: nothing listening, the old server gone, but ANOTHER process serves this path, spelt differently
+  // ("dir//tinygpu.sock"): a server busy with its one client refuses connects, and must not be replaced
+  char other[160]; snprintf(other, sizeof(other), "%s//tinygpu.sock", dir);
+  const char *sh[] = {"/bin/sh", "-c", "sleep 3; :", "server", other, NULL};
+  pid_t busy;
+  if (posix_spawn(&busy, "/bin/sh", NULL, NULL, (char **)sh, environ)) { perror("spawn"); return 2; }
+  usleep(100000);
+  pid = run((const char *[]){"--old-pid", gp, NULL});
+  rc = reap(pid, 6.0);
+  CHECK(rc == 3, "another server for the path: exit %d, want 3", rc);
+  CHECK(access(marker, F_OK) != 0, "another server for the path: a second server was started");
+  kill(busy, SIGKILL); waitpid(busy, NULL, 0);   // the stand-in this test started
+  unlink(marker);
 
   // usage: the socket is never guessed
   const char *bare[] = {helper, "--old-pid", "1", NULL};

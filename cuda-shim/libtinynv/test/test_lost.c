@@ -189,6 +189,21 @@ int main(void) {
         "an ordinary announcement sent %d requests (%d writes, %d reads), want 3 writes and the fence read", logged() - n1,
         count_since(n1, CMD_MMIO_WRITE), count_since(n1, CMD_MMIO_READ));
   CHECK(count_boot0_since(n1) == 0 && count_since(n1, CMD_CFG_READ) == 0, "an ordinary announcement probed the card");
+  // the rescue refuses a connection that is alive: only a loss this process latched itself may start it
+  char stub[160], out[160];
+  snprintf(stub, sizeof(stub), "%s/bmclear-stub.sh", S.dir);
+  snprintf(out, sizeof(out), "%s/bmclear-stub.out", S.dir);
+  FILE *f = fopen(stub, "w");
+  fprintf(f, "#!/bin/sh\necho \"$@\" >> '%s'\n", out);
+  fclose(f);
+  chmod(stub, 0700);
+  setenv("TINYNV_EMERGENCY_BM", "1", 1);
+  setenv("TINYNV_BMCLEAR_HELPER", stub, 1);
+  setenv("TINYGPU_APP", "/nonexistent/TinyGPU", 1);
+  pci.rescue(&pci, 1.0);
+  CHECK(access(out, F_OK) != 0, "the emergency clear ran on a live connection");
+  setenv("TINYNV_EMERGENCY_BM", "0", 1);
+  unlink(stub);
   session_close();
 
   // ---- window lost: the server answers, every BAR read is all ones, config space is fine ----
@@ -246,18 +261,33 @@ int main(void) {
   CHECK(g.lost == TINYNV_LOST_WINDOW, "the fence read's all ones was not classified as a lost window (%d)", g.lost);
   session_close();
 
-  // ---- server gone mid-wait, and the emergency bus-master clear it starts ----
-  char stub[160], out[160];
+  // ---- server gone, with the emergency clear turned off: latched, and nothing started ----
   session_open();
   snprintf(stub, sizeof(stub), "%s/bmclear-stub.sh", S.dir);
   snprintf(out, sizeof(out), "%s/bmclear-stub.out", S.dir);
-  FILE *f = fopen(stub, "w");
+  f = fopen(stub, "w");
+  fprintf(f, "#!/bin/sh\necho \"$@\" >> '%s'\n", out);
+  fclose(f);
+  chmod(stub, 0700);
+  setenv("TINYNV_EMERGENCY_BM", "0", 1);
+  setenv("TINYNV_BMCLEAR_HELPER", stub, 1);
+  S.mode = M_GONE; shutdown(S.srv, SHUT_WR);
+  CHECK(tinynv_exec_wait(&ex, 5, 1.5) != 0 && g.lost == TINYNV_LOST_SERVER, "TINYNV_EMERGENCY_BM=0: the loss was not latched (%d)", g.lost);
+  tinynv_gpu_rescue(&g, 1.0);
+  CHECK(access(out, F_OK) != 0, "TINYNV_EMERGENCY_BM=0 and the emergency clear ran anyway");
+  unlink(stub); unlink(out);
+  session_close();
+
+  // ---- server gone mid-wait, and the emergency bus-master clear it starts ----
+  session_open();
+  snprintf(stub, sizeof(stub), "%s/bmclear-stub.sh", S.dir);
+  snprintf(out, sizeof(out), "%s/bmclear-stub.out", S.dir);
+  f = fopen(stub, "w");
   fprintf(f, "#!/bin/sh\necho \"$@\" >> '%s'\n", out);
   fclose(f);
   chmod(stub, 0700);
   setenv("TINYNV_EMERGENCY_BM", "1", 1);
   setenv("TINYNV_BMCLEAR_HELPER", stub, 1);
-  setenv("TINYGPU_APP", "/nonexistent/TinyGPU", 1);
   n0 = logged();
   th = after(0.1, -1);
   t0 = now();
