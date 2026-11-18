@@ -102,6 +102,10 @@ $(BUILD)/splitk_dispatch: test/splitk_dispatch.c $(CUDART) $(CUBLAS) $(NV_LIB)
 # host<->device copy bandwidth, pinned and pageable (a probe for nv_shim_step.sh; not built by `all`)
 $(BUILD)/copy_bw: test/copy_bw.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
+# a big host-to-device copy on one stream under cuBLAS gemms on another: OVERLAP/SERIAL, and CUDA's ordering rules still
+# holding when TINYNV_CE_ROUTE moves the copy to its own copy engine (a probe for nv_shim_step.sh; not built by `all`)
+$(BUILD)/copy_overlap: test/copy_overlap.c $(CUDART) $(CUBLAS) $(NV_LIB)
+	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 # the split-K kernel ON THE CARD through libtinynv (D's gate S1 on prereg b79fb72f); a probe, run by nv_shim_step.sh, never by make test
 $(BUILD)/splitk_card: test/splitk_card.c $(NV_LIB)
 	$(CC) $(CFLAGS) $< $(NV_LIB) -o $@
