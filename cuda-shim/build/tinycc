@@ -45,7 +45,11 @@ esac; shift; done
 rel="${src#$GMAC/}"; base=$(basename "$src" .cu); fat="/tmp/tinycc_$base.fatbin"
 # 1) device compile on the Linux box (source already synced under $GLIN)
 # TINYCC_REUSE_FATBIN=1 skips the device compile when the fatbin from a previous run is still here (host-only rebuilds)
-NVCC_ARGS="--fatbin -gencode arch=compute_${ARCH#sm_},code=$ARCH --extended-lambda --expt-relaxed-constexpr"
+# A comma list (TINYCC_ARCH=sm_86,sm_120a) builds one SASS image per architecture into the same fatbin, and the host pass
+# sees every one of them in __CUDA_ARCH_LIST__ - so ggml's dispatch and CUB's namespace agree with the device side.
+# libtinycudart picks the image that fits the card when the module is registered (fatbin.c).
+GEN=""; OFF=""; for a in $(echo "$ARCH" | tr , ' '); do GEN="$GEN -gencode arch=compute_${a#sm_},code=$a"; OFF="$OFF --offload-arch=$a"; done
+NVCC_ARGS="--fatbin$GEN --extended-lambda --expt-relaxed-constexpr"
 if [ "${TINYCC_REUSE_FATBIN:-0}" = 1 ] && [ -s "$fat" ]; then :
 elif [ "$BACKEND" = docker ]; then
   # /ggml is the source tree read-only; /out is where the fatbin lands, so it is on the Mac the moment nvcc exits and
@@ -70,6 +74,6 @@ HOSTOPT=${TINYCC_HOST_OPT:--O2}
 # answers this question by linking a one-line program; TINYCC_SYSROOT lets a caller compute it once for a whole build
 # instead of once per translation unit.
 SYSROOT=${TINYCC_SYSROOT:-$(sh "$ROOT/build/sdk.sh")}
-$CLANG $std $HOSTOPT -DNDEBUG -isysroot "$SYSROOT" -x cuda --cuda-host-only --offload-arch=$ARCH --cuda-path=$ROOT/cuda-13 -nocudalib -Wno-unknown-cuda-version \
+$CLANG $std $HOSTOPT -DNDEBUG -isysroot "$SYSROOT" -x cuda --cuda-host-only$OFF --cuda-path=$ROOT/cuda-13 -nocudalib -Wno-unknown-cuda-version \
   -include $ROOT/spike/tinycudart_compat.h -I$ROOT/cuda-13/include/cccl $hostI $defs \
   -Xclang -fcuda-include-gpubinary -Xclang "$fat" -c "$src" -o "$out"

@@ -13,7 +13,18 @@ enum { cudaSuccess=0, cudaErrorInvalidValue=1, cudaErrorMemoryAllocation=2, cuda
 enum { cudaMemcpyHostToHost=0, cudaMemcpyHostToDevice=1, cudaMemcpyDeviceToHost=2, cudaMemcpyDeviceToDevice=3, cudaMemcpyDefault=4 };
 typedef struct { unsigned x,y,z; } dim3;
 typedef void* cudaStream_t;
-extern int tinycudart_extract_cubin(const void*, const void**, size_t*);
+extern int tinycudart_extract_cubin(const void*, unsigned, const void**, size_t*, unsigned*);
+extern int tinycudart_pick_image(const void*, size_t, unsigned, const void**, size_t*, unsigned*);
+// The card's compute capability (86, 89, 120), read before anything boots so a multi-architecture binary can choose its
+// images at registration. 0 when it could not be read: a blob with one image still loads, one with several refuses.
+static unsigned g_cc;
+unsigned tinycudart_card_cc(void){ return g_cc; }
+// One of the runtime's own kernels, embedded per architecture (Makefile: one cubin, or ARCH=multi's cubins end to end).
+int tinycudart_internal_cubin(const char* what, const unsigned char* blob, unsigned len, const void** cubin, size_t* n){
+  unsigned imgs=0; int r=tinycudart_pick_image(blob,len,g_cc,cubin,n,&imgs);
+  if (r) fprintf(stderr,"[tinycudart] %s: none of its %u images runs on this card (compute %u.%u)\n", what, imgs, g_cc/10, g_cc%10);
+  return r;
+}
 extern int tinycudart_cubin_kernels(const void*, size_t, char***);
 extern char* tinycudart_demangle(const char*); // demangle.cpp, LLVM's demangler
 // Host stubs are mangled by clang on macOS, device code by nvcc on Linux, and they disagree in two places: clang marks a
@@ -69,17 +80,21 @@ static void ensure_init(void){
   if (tinynv_init()!=TINYNV_OK || tinynv_device_get(&g_dev,0)!=TINYNV_OK || tinynv_stream_create(g_dev,&g_default_stream)!=TINYNV_OK){
     fprintf(stderr,"[tinycudart] driver init failed: %s -- reporting no CUDA devices\n", tinynv_last_error()); g_nodev=1; g_dev=NULL; g_default_stream=NULL; return; }
   tinycudart_hostpool_init(g_dev);
+  { tinynv_status_t cr=tinynv_device_cc(g_dev,&g_cc); if (cr!=TINYNV_OK && cr!=TINYNV_ERR_NODEV) fprintf(stderr,"[tinycudart] the card's architecture could not be read (%s): a binary built for several cards cannot choose its code\n", tinynv_last_error()); if (cr!=TINYNV_OK) g_cc=0;
+    // The null device presents the 5090 profile to ggml (cudart_api.c, TINYCUDART_NULL_PROFILE), so it takes the images
+    // that profile would run: the same card on both sides of the dispatch.
+    const char* np=getenv("TINYCUDART_NULL_PROFILE"); if (cr==TINYNV_ERR_NODEV && !(np && *np=='0')) g_cc=120; }
   // Lend the driver a copy kernel for downloads (libtinycudart/copy1d.cu): a download served by a kernel on the compute
   // engine has no copy-engine handoff at the token boundary. Registration alone changes nothing; the driver takes the
   // path only under TINYNV_DOWNLOAD_VIA_COMPUTE=1 and names it at start-up. A refusal is loud and leaves the copy engine.
-  { extern unsigned char copy1d_cubin[]; extern unsigned int copy1d_cubin_len; tinynv_module_t mod=NULL; tinynv_kernel_t k=NULL; tinynv_status_t r;
-    if ((r=tinynv_module_load(g_dev,copy1d_cubin,copy1d_cubin_len,&mod))!=TINYNV_OK || (r=tinynv_get_kernel(mod,"tinycudart_copy1d",&k))!=TINYNV_OK ||
+  { extern unsigned char copy1d_cubin[]; extern unsigned int copy1d_cubin_len; tinynv_module_t mod=NULL; tinynv_kernel_t k=NULL; tinynv_status_t r=TINYNV_ERR_INVALID; const void* c; size_t n;
+    if (tinycudart_internal_cubin("copy1d",copy1d_cubin,copy1d_cubin_len,&c,&n) || (r=tinynv_module_load(g_dev,c,n,&mod))!=TINYNV_OK || (r=tinynv_get_kernel(mod,"tinycudart_copy1d",&k))!=TINYNV_OK ||
         (r=tinynv_set_download_kernel(g_dev,k,256,16))!=TINYNV_OK)
       fprintf(stderr,"[tinycudart] the download kernel was not registered (%s): downloads stay on the copy engine\n", tinynv_last_error()); }
   // And the keep-alive kernel (libtinycudart/keepalive.cu): one warp polling a host flag, launched by the driver after a
   // synchronisation under TINYNV_KEEPALIVE=1 so the compute engine stays scheduled across a token boundary.
-  { extern unsigned char keepalive_cubin[]; extern unsigned int keepalive_cubin_len; tinynv_module_t mod=NULL; tinynv_kernel_t k=NULL; tinynv_status_t r;
-    if ((r=tinynv_module_load(g_dev,keepalive_cubin,keepalive_cubin_len,&mod))!=TINYNV_OK || (r=tinynv_get_kernel(mod,"tinynv_keepalive",&k))!=TINYNV_OK ||
+  { extern unsigned char keepalive_cubin[]; extern unsigned int keepalive_cubin_len; tinynv_module_t mod=NULL; tinynv_kernel_t k=NULL; tinynv_status_t r=TINYNV_ERR_INVALID; const void* c; size_t n;
+    if (tinycudart_internal_cubin("keep-alive",keepalive_cubin,keepalive_cubin_len,&c,&n) || (r=tinynv_module_load(g_dev,c,n,&mod))!=TINYNV_OK || (r=tinynv_get_kernel(mod,"tinynv_keepalive",&k))!=TINYNV_OK ||
         (r=tinynv_set_keepalive_kernel(g_dev,k))!=TINYNV_OK)
       fprintf(stderr,"[tinycudart] the keep-alive kernel was not registered (%s): TINYNV_KEEPALIVE would do nothing\n", tinynv_last_error()); }
   fprintf(stderr,"[tinycudart] libtinynv build %s\n", tinynv_build_id());  // a stale binary announces itself (B's 4892427)
@@ -174,7 +189,9 @@ void** __cudaRegisterFatBinary(void* fatCubin){
   fatbin_handle_t* h=calloc(1,sizeof(*h));
   const void* cubin; size_t len;
   if (g_nodev) return (void**)h;
-  if (tinycudart_extract_cubin(fatCubin,&cubin,&len)!=0){ fprintf(stderr,"[tinycudart] no cubin in fatbin\n"); return (void**)h; }
+  unsigned imgs=0; int x=tinycudart_extract_cubin(fatCubin,g_cc,&cubin,&len,&imgs);
+  if (x==-2){ fprintf(stderr,"[tinycudart] fatbin: none of its %u images runs on this card (compute %u.%u)\n",imgs,g_cc/10,g_cc%10); return (void**)h; }
+  if (x!=0){ fprintf(stderr,"[tinycudart] no cubin in fatbin\n"); return (void**)h; }
   if (tinynv_module_load(g_dev,cubin,len,&h->mod)!=TINYNV_OK){ fprintf(stderr,"[tinycudart] module_load failed (%zu byte cubin)\n",len); h->mod=NULL; }
   else { g_modules++; if (!quiet()) fprintf(stderr,"[tinycudart] loaded module: cubin %zu bytes\n", len); }
   h->nnames=tinycudart_cubin_kernels(cubin,len,&h->names); if (h->nnames<0) h->nnames=0;

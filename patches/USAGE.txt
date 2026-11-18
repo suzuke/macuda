@@ -15,7 +15,20 @@ At run time libtinynv refuses a cubin the card cannot run (for example
 sm_120 code on GA106), naming both architectures; TINYNV_ARCH_CHECK=0
 overrides for diagnostics. Each build still targets one architecture.
 
-When the Mac is available for compilation and GPU work:
+One binary for several cards (ARCH=multi):
+  ARCH=multi sh install.sh
+builds sm_86 (Ampere, Ada) and sm_120a (Blackwell) device code into every
+fatbin and embeds both families' copy/GEMM/keep-alive kernels. At start-up
+the runtime reads the card's architecture register before booting and loads
+the image that runs on it. Binaries go to cuda-shim/build/bin-multi. The
+device compile takes about twice as long, and the archive is about twice the
+size (386 MB vs 181 MB). Measured on the RTX 3060 only:
+  - opverify passed 450/450;
+  - the 16-token text was byte-identical to the sm_86 build;
+  - speed matched the sm_86 build (A-B-B-A, -t 1).
+The Blackwell half has only been tested offline (test_pick_image).
+
+
   ARCH=sm_86 sh install.sh
   . ./env.sh
   sh tools/preflight.sh

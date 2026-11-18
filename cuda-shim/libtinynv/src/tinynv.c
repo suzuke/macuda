@@ -439,6 +439,36 @@ tinynv_status_t tinynv_device_get(tinynv_device_t *out, int ordinal) {
   return TINYNV_OK;
 }
 
+tinynv_status_t tinynv_device_cc(tinynv_device_t d, unsigned *cc) {
+  if (!d || !cc) return TINYNV_ERR_INVALID;
+  *cc = 0;
+  if (!d->has_pci) return tinynv_fail("the null device has no card to read an architecture from"), TINYNV_ERR_NODEV;
+  pthread_mutex_lock(&g_lock);
+  uint32_t arch = 0;
+  int bad = 0;
+  if (d->booted) {
+    arch = d->gpu.dev.architecture;
+  } else {
+    // A peek, not an open: the window is mapped for two reads and dropped. Nothing is written, the card's state is
+    // unchanged, and the boot that follows maps its own window as before.
+    tinynv_mmio_t m;
+    if (d->pci.bar_map(&d->pci, 0, 0, 0x1000, &m)) {
+      bad = 1;
+    } else {
+      uint32_t boot0 = nv_rd32(&m, NV_PMC_BOOT_0), boot42 = nv_rd32(&m, NV_PMC_BOOT_42);
+      if (d->pci.bar_unmap) d->pci.bar_unmap(&d->pci, &m);
+      if (boot0 == 0xffffffff || boot42 == 0xffffffff) bad = 2;
+      else arch = NV_GET(boot42, NV_PMC_BOOT_42, ARCHITECTURE);
+    }
+  }
+  pthread_mutex_unlock(&g_lock);
+  if (bad == 1) return TINYNV_ERR_DRIVER;
+  if (bad == 2) return tinynv_fail("the card's register window reads all ones: it is not decoding"), TINYNV_ERR_DRIVER;
+  *cc = tinynv_arch_cc(arch);
+  if (!*cc) return tinynv_fail("architecture %#x is not one this driver knows", arch), TINYNV_ERR_DRIVER;
+  return TINYNV_OK;
+}
+
 tinynv_status_t tinynv_device_props(tinynv_device_t d, tinynv_device_props_t *p) {
   if (!p) return TINYNV_ERR_INVALID;
   memset(p, 0, sizeof(*p));

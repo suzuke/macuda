@@ -23,6 +23,18 @@ BUILD    := build/shim
 # and BUILD from ARCH, so a second card's libraries build beside the first card's instead of over them.
 CUBIN_ARCH ?=
 CUBIN_SUF  := $(if $(CUBIN_ARCH),.$(CUBIN_ARCH))
+# CUBIN_ARCH=multi embeds EVERY family's cubin, end to end, and the runtime picks the one that runs on the card it finds
+# (libtinycudart/fatbin.c: tinycudart_pick_image). One set of libraries for an RTX 30/40 and a 50; the GGML archive
+# must be multi as well (ARCH=multi sh build/build-ggml-cuda.sh) for the binary as a whole to run on both.
+cubin_in = $(if $(filter multi,$(CUBIN_ARCH)),$(BUILD)/cubin/$(1).cubin,$(2)/$(1)$(CUBIN_SUF).cubin)
+# the order is the families' (Ampere/Ada, then Blackwell); the runtime chooses by fit, not by position
+$(BUILD)/cubin/copy1d.cubin: libtinycudart/copy1d.sm_86.cubin libtinycudart/copy1d.sm_120.cubin
+$(BUILD)/cubin/copy2d.cubin: libtinycudart/copy2d.sm_86.cubin libtinycudart/copy2d.sm_120.cubin
+$(BUILD)/cubin/keepalive.cubin: libtinycudart/keepalive.sm_86.cubin libtinycudart/keepalive.sm_120.cubin
+$(BUILD)/cubin/gemm.cubin: libtinycublas/gemm.sm_86.cubin libtinycublas/gemm.sm_120.cubin
+$(BUILD)/cubin/%.cubin:
+	@mkdir -p $(@D)
+	cat $^ > $@
 # libtinynv is built into OUR build dir, never into libtinynv/build/, which Session B builds in concurrently
 NV_BUILD := $(ROOT)/$(BUILD)/nv
 NV_LIB   := $(NV_BUILD)/libtinynv.a
@@ -38,21 +50,21 @@ $(NV_LIB): FORCE
 $(CUDART): $(BUILD)/cudart.o $(BUILD)/fatbin.o $(BUILD)/hostpool.o $(BUILD)/cudart_api.o $(BUILD)/graph.o $(BUILD)/demangle.o $(BUILD)/copy2d_cubin.o $(BUILD)/copy1d_cubin.o $(BUILD)/keepalive_cubin.o
 	ar rcs $@ $^
 # the strided-copy kernel travels inside the runtime the same way (libtinycudart/copy2d.cu, built by the remote nvcc)
-$(BUILD)/copy2d_cubin.c: libtinycudart/copy2d$(CUBIN_SUF).cubin
+$(BUILD)/copy2d_cubin.c: $(call cubin_in,copy2d,libtinycudart)
 	@mkdir -p $(@D)
-	cd libtinycudart && xxd -i -n copy2d_cubin copy2d$(CUBIN_SUF).cubin > $(ROOT)/$@
+	xxd -i -n copy2d_cubin $< > $@
 $(BUILD)/copy2d_cubin.o: $(BUILD)/copy2d_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 # the 1-D copy kernel the driver launches for downloads when TINYNV_DOWNLOAD_VIA_COMPUTE=1 (libtinycudart/copy1d.cu)
-$(BUILD)/copy1d_cubin.c: libtinycudart/copy1d$(CUBIN_SUF).cubin
+$(BUILD)/copy1d_cubin.c: $(call cubin_in,copy1d,libtinycudart)
 	@mkdir -p $(@D)
-	cd libtinycudart && xxd -i -n copy1d_cubin copy1d$(CUBIN_SUF).cubin > $(ROOT)/$@
+	xxd -i -n copy1d_cubin $< > $@
 $(BUILD)/copy1d_cubin.o: $(BUILD)/copy1d_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 # the keep-alive kernel the driver launches after a synchronisation when TINYNV_KEEPALIVE=1 (libtinycudart/keepalive.cu)
-$(BUILD)/keepalive_cubin.c: libtinycudart/keepalive$(CUBIN_SUF).cubin
+$(BUILD)/keepalive_cubin.c: $(call cubin_in,keepalive,libtinycudart)
 	@mkdir -p $(@D)
-	cd libtinycudart && xxd -i -n keepalive_cubin keepalive$(CUBIN_SUF).cubin > $(ROOT)/$@
+	xxd -i -n keepalive_cubin $< > $@
 $(BUILD)/keepalive_cubin.o: $(BUILD)/keepalive_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(CUBLAS): $(BUILD)/cublas.o $(BUILD)/gemm_cubin.o
@@ -74,9 +86,9 @@ $(BUILD)/cublas.o: libtinycublas/cublas.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) -c $< -o $@
 # the GEMM cubin travels inside the library, so a linked binary needs no files at run time
-$(BUILD)/gemm_cubin.c: libtinycublas/gemm$(CUBIN_SUF).cubin
+$(BUILD)/gemm_cubin.c: $(call cubin_in,gemm,libtinycublas)
 	@mkdir -p $(@D)
-	cd libtinycublas && xxd -i -n gemm_cubin gemm$(CUBIN_SUF).cubin > $(ROOT)/$@
+	xxd -i -n gemm_cubin $< > $@
 $(BUILD)/gemm_cubin.o: $(BUILD)/gemm_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 

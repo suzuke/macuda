@@ -165,13 +165,15 @@ cudaError_t cudaMemcpyPeerAsync(void *dst, int ddev, const void *src, int sdev, 
 // copy-engine batch and one socket round trip per row (docs/SHARED-STATUS.md 2026-09-15). The kernel is loaded once, on
 // first use, from the cubin embedded in this archive; if it cannot be loaded the row loop is still correct, only slow.
 extern unsigned char copy2d_cubin[]; extern unsigned int copy2d_cubin_len;
+extern int tinycudart_internal_cubin(const char*, const unsigned char*, unsigned, const void**, size_t*);
 static tinynv_status_t copy2d_kernel(tinynv_stream_t s, void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height) {
   static tinynv_module_t mod; static tinynv_kernel_t k; static int tried, ok;
   if (!tried) {
     tried = 1;
-    tinynv_device_props_t p; memset(&p, 0, sizeof p);
+    tinynv_device_props_t p; memset(&p, 0, sizeof p); const void *c2; size_t n2;
     if (tinynv_device_props(tinycudart_device(), &p) == TINYNV_OK && p.cc_major > 0 &&
-        tinynv_module_load(tinycudart_device(), copy2d_cubin, copy2d_cubin_len, &mod) == TINYNV_OK &&
+        !tinycudart_internal_cubin("copy2d", copy2d_cubin, copy2d_cubin_len, &c2, &n2) &&
+        tinynv_module_load(tinycudart_device(), c2, n2, &mod) == TINYNV_OK &&
         tinynv_get_kernel(mod, "tinycudart_copy2d", &k) == TINYNV_OK) ok = 1;
     else fprintf(stderr, "[tinycudart] strided copies go row by row: the copy2d kernel is not available on this device\n");
   }

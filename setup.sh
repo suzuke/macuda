@@ -45,7 +45,8 @@ case "$ARCH" in
   sm_120a) SUF=""; CUBIN_ARCH="" ;;                          # the tree's own default: nothing moves
   sm_8[0-9]) SUF="-$ARCH"; CUBIN_ARCH=sm_86 ;;               # Ampere and Ada: sm_89 runs the sm_86 kernels as they are
   sm_12[0-9]*) SUF="-$ARCH"; CUBIN_ARCH=sm_120 ;;
-  *) echo "ARCH=$ARCH: no committed copy/GEMM kernels for that family (have sm_86 and sm_120)" >&2; exit 2 ;;
+  multi) SUF="-multi"; CUBIN_ARCH=multi ;;                  # one binary for both families: sm_86 and sm_120a code, chosen per card at run time
+  *) echo "ARCH=$ARCH: no committed copy/GEMM kernels for that family (have sm_86 and sm_120; ARCH=multi builds both)" >&2; exit 2 ;;
 esac
 export ARCH
 step=${1:-all}

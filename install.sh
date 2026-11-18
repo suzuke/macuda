@@ -149,7 +149,7 @@ head_ "Building (llama.cpp ~5 min; the CUDA half ~3-5 min once the image is here
 set -e
 # One ARCH for every stage below, resolved once (setup.sh detects it from the card when unset)
 want=${ARCH:-}
-ARCH=$(sh setup.sh arch) || { echo "== stopping: ARCH=$want is not one this tree builds (sm_86, sm_89, sm_120a)"; exit 2; }; export ARCH
+ARCH=$(sh setup.sh arch) || { echo "== stopping: ARCH=$want is not one this tree builds (sm_86, sm_89, sm_120a, multi)"; exit 2; }; export ARCH
 echo "== target architecture: $ARCH (binaries in cuda-shim/build/bin$([ "$ARCH" = sm_120a ] || echo "-$ARCH"))"
 echo "== 1/6 headers and firmware (NVIDIA's open-gpu-kernel-modules headers, GSP firmware, CUDA headers)"
 sh setup.sh deps

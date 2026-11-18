@@ -9,7 +9,9 @@ export TINYCC=$R/cuda-shim/build/tinycc OBJ=$R/cuda-shim/build/obj-${ARCH:-sm_12
 JOBS=${JOBS:-8}
 # the architecture is passed to tinycc EXPLICITLY: the FP4 MMQ instances use Blackwell's block-scaled tensor-core MMA,
 # which ptxas only accepts for the architecture-specific target, and an inherited environment variable proved too easy to lose
-export TINYCC_ARCH=${ARCH:-sm_120a}
+# ARCH=multi builds Ampere/Ada (sm_86) and Blackwell (sm_120a) images into every fatbin: one archive, one binary,
+# the runtime choosing per card. Twice the device compile and roughly twice the archive.
+case "${ARCH:-sm_120a}" in multi) export TINYCC_ARCH=sm_86,sm_120a ;; *) export TINYCC_ARCH=${ARCH:-sm_120a} ;; esac
 ONLY=${ONLY:-}
 if [ -z "$ONLY" ]; then rm -rf "$OBJ" "$LOGD"; fi; mkdir -p "$OBJ" "$LOGD"
 # resolved once here rather than by each of the 188 tinycc invocations, each of which would otherwise link a probe
@@ -41,11 +43,11 @@ if [ "$ok" -gt 0 ]; then
   # ONE ARCHIVE PER ARCHITECTURE, and the plain name is a symlink to whichever one the tree links against. This used to
   # be a single libggml-cuda.a, so building for a second card silently destroyed the first card's archive - an hour of
   # compiling, gone, and nothing to say which arch the surviving file held. Now `ls -l` answers that.
-  A="$R/cuda-shim/build/libggml-cuda.$TINYCC_ARCH.a"
+  A="$R/cuda-shim/build/libggml-cuda.${ARCH:-sm_120a}.a"
   rm -f "$A"
   /opt/homebrew/opt/llvm/bin/llvm-ar rcs "$A" "$OBJ"/*.o && {
-    ln -sfn "libggml-cuda.$TINYCC_ARCH.a" "$R/cuda-shim/build/libggml-cuda.a"
-    echo "archived libggml-cuda.$TINYCC_ARCH.a = $(stat -f%z "$A") bytes ($(ls "$OBJ"/*.o | wc -l | tr -d ' ') objects); libggml-cuda.a now points at it"
+    ln -sfn "libggml-cuda.${ARCH:-sm_120a}.a" "$R/cuda-shim/build/libggml-cuda.a"
+    echo "archived libggml-cuda.${ARCH:-sm_120a}.a = $(stat -f%z "$A") bytes ($(ls "$OBJ"/*.o | wc -l | tr -d ' ') objects); libggml-cuda.a now points at it"
   }
 fi
 [ "$fail" -eq 0 ]

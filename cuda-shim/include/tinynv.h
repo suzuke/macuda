@@ -42,6 +42,11 @@ typedef struct {
   size_t total_mem; int max_threads_per_block; int max_shared_per_block; int max_shared_per_sm;
 } tinynv_device_props_t;
 tinynv_status_t tinynv_device_props(tinynv_device_t, tinynv_device_props_t* out);
+// The card's compute capability as major*10+minor (86, 89, 120) WITHOUT booting it: before the first boot this is two
+// register reads through the PCI window (BOOT_0 to see the window decodes, BOOT_42 for the architecture), afterwards
+// the booted card's own field. For a runtime that must choose among a binary's per-architecture images before anything
+// boots. The null device has no card: TINYNV_ERR_NODEV and *cc = 0. An architecture this driver does not boot is refused.
+tinynv_status_t tinynv_device_cc(tinynv_device_t, unsigned *cc);
 
 // modules & kernels (cubin is a raw ELF, already extracted from the fatbin by the shim)
 tinynv_status_t tinynv_module_load(tinynv_device_t, const void* cubin, size_t len, tinynv_module_t* out);

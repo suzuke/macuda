@@ -24,11 +24,12 @@ static tinynv_status_t blas_launch(tinynv_stream_t s, tinynv_kernel_t k, const c
 extern tinynv_device_t tinycudart_device(void);       // provided by libtinycudart
 extern tinynv_stream_t tinycudart_default_stream(void);
 extern int tinycudart_trace(void); extern void tinycudart_count_launch(const char*); extern void tinycudart_time_launch(const char*, double); extern double tinycudart_now_ns(void);   // the runtime's trace/stats, so cuBLAS launches are seen too
+extern int tinycudart_internal_cubin(const char*, const unsigned char*, unsigned, const void**, size_t*);
 extern unsigned char gemm_cubin[]; extern unsigned int gemm_cubin_len;   // gemm.cubin embedded by the Makefile (xxd -i)
 static tinynv_module_t g_mod; static int g_mod_tried;
 static tinynv_kernel_t tinycublas_kernel(const char* name){   // any kernel in the embedded cubin, resolved once
   static struct { const char* name; tinynv_kernel_t k; int tried; } cache[32];   /* 27 names since split-K; a full cache returns NULL */
-  if (!g_mod && !g_mod_tried){ g_mod_tried=1; if (tinynv_module_load(tinycudart_device(), gemm_cubin, gemm_cubin_len, &g_mod)!=TINYNV_OK){ fprintf(stderr,"[tinycublas] cubin failed to load\n"); g_mod=NULL; } }
+  if (!g_mod && !g_mod_tried){ g_mod_tried=1; const void* c; size_t n; if (tinycudart_internal_cubin("gemm", gemm_cubin, gemm_cubin_len, &c, &n) || tinynv_module_load(tinycudart_device(), c, n, &g_mod)!=TINYNV_OK){ fprintf(stderr,"[tinycublas] cubin failed to load\n"); g_mod=NULL; } }
   if (!g_mod) return NULL;
   for (int i=0;i<32;i++){
     if (cache[i].name && !strcmp(cache[i].name,name)) return cache[i].k;
