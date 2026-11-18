@@ -12,7 +12,7 @@ row() { if [ "$2" = 0 ]; then echo "   ok:   $1"; else echo "   FAIL: $1"; fails
 has() { printf '%s\n' "$1" | grep -cF -- "$2" || true; }
 row "both arms ran to the end (rc $rc_on and $rc_off, plan rows included)" "$([ $rc_on = 0 ] && [ $rc_off = 0 ] && echo 0 || echo 1)"
 # ON arm: the design's grids, and the entry print
-row "ON: split-K announces itself on entry" "$([ "$(has "$ON" 'split-K ON (default off on sm_8x; TINYCUBLAS_SPLITK=0/1 forces)')" = 1 ] && echo 0 || echo 1)"
+row "ON: split-K announces itself on entry" "$([ "$(has "$ON" 'split-K ON (the default; TINYCUBLAS_SPLITK=0 turns it off)')" = 1 ] && echo 0 || echo 1)"
 row "ON: k/v -> tc2k grid (4,1,16)" "$([ "$(has "$ON" 'launch tinyblas_gemm_bf16_tc2k_tn grid=(4,1,16)')" = 1 ] && echo 0 || echo 1)"
 row "ON: q/o and down -> tc2k grid (32,1,8), twice" "$([ "$(has "$ON" 'launch tinyblas_gemm_bf16_tc2k_tn grid=(32,1,8)')" = 2 ] && echo 0 || echo 1)"
 row "ON: gate/up unchanged -> tc2s grid (172,1,1)" "$([ "$(has "$ON" 'launch tinyblas_gemm_bf16_tc2s_tn grid=(172,1,1)')" = 1 ] && echo 0 || echo 1)"

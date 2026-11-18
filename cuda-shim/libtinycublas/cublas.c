@@ -64,28 +64,11 @@ static tinynv_kernel_t tinycublas_gemm_tc2_kernel(int bf16, int opA, int opB, in
 static const char* const tc2k_names[2][4]={
   {"tinyblas_gemm_f16_tc2k_nn","tinyblas_gemm_f16_tc2k_nt","tinyblas_gemm_f16_tc2k_tn","tinyblas_gemm_f16_tc2k_tt"},
   {"tinyblas_gemm_bf16_tc2k_nn","tinyblas_gemm_bf16_tc2k_nt","tinyblas_gemm_bf16_tc2k_tn","tinyblas_gemm_bf16_tc2k_tt"}};
-// OFF BY DEFAULT ON sm_8x (Ampere, Ada), ON elsewhere. The flip above was measured and validated on the 5090. The 3060's
-// noise image of 2026-11-18 (SD 1.5, seed 42, 20 steps; correct with TINYCUBLAS_SPLITK=0) is explained by the split
-// launch bypassing graph capture, fixed below in launch_gemm_tc. sm_8x stays off only until a card run
-// confirms split-K there with graphs on and off; then this exception goes. TINYCUBLAS_SPLITK=1 forces it on
-// anywhere (to reproduce), =0 off anywhere.
-// The null device (cc_major 0, cudart_api.c:60; or no device handle at all) keeps the default ON, which is what
-// test/splitk_check.sh traces - nothing executes there. A device whose properties cannot be read is treated as unknown
-// and gets OFF: the unsplit kernels are correct everywhere, the split ones are only known good on sm_120. Decided once
-// per process, from the one device this runtime drives.
-static int splitk_enabled(void){
-  static int v=-1;
-  if(v<0){
-    const char* e=getenv("TINYCUBLAS_SPLITK");
-    if (e&&*e) v=(*e!='0');
-    else {
-      tinynv_device_t d=tinycudart_device(); tinynv_device_props_t p;
-      if (!d) v=1;
-      else v = tinynv_device_props(d, &p)==TINYNV_OK && p.cc_major!=8;
-    }
-  }
-  return v;
-}
+// ON on every card. 2026-11-18/19 it was off by default on sm_8x for a day: SD 1.5 on the 3060 rendered noise with split-K,
+// which turned out to be the split launch bypassing graph capture (fixed in launch_gemm_tc), not Ampere. Rerun on the
+// 3060 after that fix (SD 1.5, seed 42, 20 steps): the expected image with graphs on and with GGML_CUDA_DISABLE_GRAPHS=1,
+// byte-identical to each other, capture 7 at 46 launches. Not yet run on an Ada card.
+static int splitk_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TINYCUBLAS_SPLITK"); v=(e&&*e=='0')?0:1; } return v; }
 #define SPLITK_WS_BYTES (8u<<20)   /* S x tiles x 64x64 f32: q/o at n<=64, S 8, 32 tiles = 4 MiB */
 #define SPLITK_CNT_N    16384u     /* one counter per output tile per batch element */
 // The plan is a pure function of the shape (the design's row 1): the number of k-slices, 1 = do not split.
@@ -192,7 +175,7 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
                      && offsetof(__typeof__(q2), S) == 0x68 && sizeof(q2) == 0x6c, "tc2k param blob must match the cubin's KPARAM_INFO");
       unsigned gx=(unsigned)((m+63)/64), gy=(unsigned)((n+63)/64), gz=(unsigned)(batch*S);
       const char* kname=tc2k_names[in_dtype==2?1:0][oa*2+ob];
-      static int said; if (!said++) fprintf(stderr,"[tinycublas] split-K ON (default off on sm_8x; TINYCUBLAS_SPLITK=0/1 forces): first %s m=%d n=%d k=%d batch=%d S=%d grid=(%u,%u,%u)\n",kname,m,n,k,batch,S,gx,gy,gz);
+      static int said; if (!said++) fprintf(stderr,"[tinycublas] split-K ON (the default; TINYCUBLAS_SPLITK=0 turns it off): first %s m=%d n=%d k=%d batch=%d S=%d grid=(%u,%u,%u)\n",kname,m,n,k,batch,S,gx,gy,gz);
       if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%u) block=(128,1,1) m=%d n=%d k=%d out=%d S=%d\n",kname,gx,gy,gz,m,n,k,out_dtype,S);
       tinycudart_count_launch(kname); double t0=tinycudart_now_ns();
       // Through blas_launch like every other GEMM: a direct tinynv_launch ran past an active capture, once, and was absent
