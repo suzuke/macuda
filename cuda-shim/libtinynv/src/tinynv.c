@@ -316,6 +316,7 @@ static int device_boot(tinynv_device_t d) {
   }
   BOOT_STAGE(tinynv_exec_init(&d->gpu, &d->exec));
   d->exec_ready = 1; // from here, and not before, there is a ring for the teardown to idle
+  tinynv_rpc_stats_boot_done();
 #undef BOOT_STAGE
 
   // Sensors, unless refused. Arming costs one 464-byte host buffer, one object and two controls, all once; after that

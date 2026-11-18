@@ -104,6 +104,8 @@ static inline void tinynv_dma_bind_host(tinynv_dma_t *d) {
 
 // backends. each returns 0 on success and fills *out; on failure it reports through tinynv_last_error().
 int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out); // any host with the TinyGPU.app server (macOS)
+// TINYNV_RPC_STATS=1: mark the end of the boot, so the exit report separates what the boot cost from what came after
+void tinynv_rpc_stats_boot_done(void);
 #ifdef __linux__
 int tinynv_pci_open_sysfs(const char *bdf, tinynv_pci_t *out);         // the device unbound from its driver, this process privileged
 #endif
