@@ -8,6 +8,7 @@
 //
 // Behavioural port of nv-uefi-unlocker (GPL-2.0-only), adapted for macuda's boot flow.
 #include "tensor_unlock.h"
+#include "tensor_unlock_state.h"
 #include "internal.h"
 #include "flcn.h"
 #include "gsp.h"
@@ -29,6 +30,7 @@ static void tu_usleep(int us) {
 
 // ---- FEAT / speed-select registers (undocumented, from nv-uefi-unlocker) ----
 #define FEAT_OVR_PLM    0x00823804u
+#define FEAT_READOUT_1  0x00823818u
 #define FEAT_SS0        0x0082381cu
 #define FEAT_SS1        0x00823820u
 #define SS0_UNLOCK      0x88888888u
@@ -138,8 +140,11 @@ static int fire_v67(tinynv_gpu_t *g, const btl1_hdr_t *h, const uint8_t *patched
   uint64_t sec2 = g->flcn.sec2;
 
   // allocate VRAM for the booter image
-  tinynv_bootmem_t img_mem;
-  if (tinynv_alloc_boot_mem(&g->mm, h->image_size, patched_image, 0, &img_mem)) return -1;
+  tinynv_bootmem_t *img_mem = &g->tensor.image;
+  if (tinynv_alloc_boot_mem(&g->mm, h->image_size, patched_image, 0, img_mem)) return -1;
+  // From here an engine reset or DMA may be in flight. The caller must cold-reset
+  // the device before freeing any of the three buffers, including on timeouts.
+  g->tensor.pending = 1;
 
   // load the booter into SEC2 exactly as flcn_execute_hs does
   if (tinynv_flcn_reset(g, sec2, 0)) goto fail_img;
@@ -159,8 +164,8 @@ static int fire_v67(tinynv_gpu_t *g, const btl1_hdr_t *h, const uint8_t *patched
                  NV_SET(NV_PFALCON_FALCON_DMATRFCMD, SIZE, NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B) |
                  NV_SET(NV_PFALCON_FALCON_DMATRFCMD, CTXDMA, 0) |
                  NV_SET(NV_PFALCON_FALCON_DMATRFCMD, IMEM, 1) | NV_SET(NV_PFALCON_FALCON_DMATRFCMD, SEC, 1);
-  tinynv_wr32(d, sec2 + NV_PFALCON_FALCON_DMATRFBASE, (uint32_t)(img_mem.paddr >> 8));
-  tinynv_wr32(d, sec2 + NV_PFALCON_FALCON_DMATRFBASE1, (uint32_t)((img_mem.paddr >> 8) >> 32) & 0x1ff);
+  tinynv_wr32(d, sec2 + NV_PFALCON_FALCON_DMATRFBASE, (uint32_t)(img_mem->paddr >> 8));
+  tinynv_wr32(d, sec2 + NV_PFALCON_FALCON_DMATRFBASE1, (uint32_t)((img_mem->paddr >> 8) >> 32) & 0x1ff);
   for (uint32_t done = 0; done < h->app_code_size; done += 256) {
     if (tinynv_wait_reg(d, sec2 + NV_PFALCON_FALCON_DMATRFCMD, FLD(NV_PFALCON_FALCON_DMATRFCMD, FULL), 0,
                         5000, "tensor_unlock: IMEM DMA queue")) goto fail_img;
@@ -176,9 +181,9 @@ static int fire_v67(tinynv_gpu_t *g, const btl1_hdr_t *h, const uint8_t *patched
         NV_SET(NV_PFALCON_FALCON_DMATRFCMD, SIZE, NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B) |
         NV_SET(NV_PFALCON_FALCON_DMATRFCMD, CTXDMA, 0) |
         NV_SET(NV_PFALCON_FALCON_DMATRFCMD, IMEM, 0) | NV_SET(NV_PFALCON_FALCON_DMATRFCMD, SEC, 0);
-  tinynv_wr32(d, sec2 + NV_PFALCON_FALCON_DMATRFBASE, (uint32_t)((img_mem.paddr + h->data_off) >> 8));
+  tinynv_wr32(d, sec2 + NV_PFALCON_FALCON_DMATRFBASE, (uint32_t)((img_mem->paddr + h->data_off) >> 8));
   tinynv_wr32(d, sec2 + NV_PFALCON_FALCON_DMATRFBASE1,
-              (uint32_t)(((img_mem.paddr + h->data_off) >> 8) >> 32) & 0x1ff);
+              (uint32_t)(((img_mem->paddr + h->data_off) >> 8) >> 32) & 0x1ff);
   for (uint32_t done = 0; done < h->data_size; done += 256) {
     if (tinynv_wait_reg(d, sec2 + NV_PFALCON_FALCON_DMATRFCMD, FLD(NV_PFALCON_FALCON_DMATRFCMD, FULL), 0,
                         5000, "tensor_unlock: DMEM DMA queue")) goto fail_img;
@@ -209,29 +214,34 @@ static int fire_v67(tinynv_gpu_t *g, const btl1_hdr_t *h, const uint8_t *patched
   tinynv_flcn_start_cpu(d, sec2);
 
   // poll FEAT_OVR_PLM for flip (adapted from nv-uefi-unlocker BooterWait::PlmFlip)
-  int ok = 0;
-  for (int i = 0; i < 70000; i++) {  // ~5 seconds at 75us per iteration
+  double start = tinynv_now_s(), deadline = start + 5.0;
+  enum tinynv_tensor_poll_result poll = TINYNV_TENSOR_POLL_WAIT;
+  for (;;) {
     uint32_t cpuctl = tinynv_rd32(d, sec2 + NV_PFALCON_FALCON_CPUCTL);
     uint32_t plm = tinynv_rd32(d, FEAT_OVR_PLM);
-    if (plm == 0xFFFFFFFFu) {
-      fprintf(stderr, "libtinynv: tensor_unlock: PLM opened (%#x -> 0xffffffff) after ~%d us\n",
-              tinynv_rd32(d, FEAT_OVR_PLM), i * 75);
-      ok = 1;
+    uint32_t witness = tinynv_rd32(d, FEAT_SS0);
+    poll = tinynv_tensor_poll_status(plm, witness,
+        NV_GET(cpuctl, NV_PFALCON_FALCON_CPUCTL, HALTED), tinynv_now_s() >= deadline);
+    if (poll == TINYNV_TENSOR_POLL_OPEN) {
+      fprintf(stderr, "libtinynv: tensor_unlock: PLM opened after %.3f s\n", tinynv_now_s() - start);
       break;
     }
-    if (NV_GET(cpuctl, NV_PFALCON_FALCON_CPUCTL, HALTED)) {
-      uint32_t mbox0 = tinynv_rd32(d, sec2 + NV_PFALCON_FALCON_MAILBOX0);
-      fprintf(stderr, "libtinynv: tensor_unlock: booter halted without flipping PLM (plm %#x, mbox %#x)\n", plm, mbox0);
-      break;
-    }
+    if (poll != TINYNV_TENSOR_POLL_WAIT) break;
     tu_usleep(75);
   }
 
-  tinynv_free_boot_mem(&g->mm, &img_mem);
-  return ok ? 0 : -1;
+  if (poll == TINYNV_TENSOR_POLL_FEAT_UNREADABLE)
+    return tinynv_fail("tensor_unlock: FEAT block unreadable while polling PLM");
+  if (poll == TINYNV_TENSOR_POLL_HALTED) {
+    uint32_t plm = tinynv_rd32(d, FEAT_OVR_PLM);
+    uint32_t mbox0 = tinynv_rd32(d, sec2 + NV_PFALCON_FALCON_MAILBOX0);
+    return tinynv_fail("tensor_unlock: booter halted without opening PLM (PLM %#x, mailbox %#x)", plm, mbox0);
+  }
+  if (poll == TINYNV_TENSOR_POLL_TIMEOUT)
+    return tinynv_fail("tensor_unlock: timed out after 5 seconds waiting for PLM to open");
+  return 0;
 
 fail_img:
-  tinynv_free_boot_mem(&g->mm, &img_mem);
   return -1;
 }
 
@@ -245,40 +255,33 @@ int tinynv_tensor_unlock(tinynv_gpu_t *g) {
     return 0;
   }
 
+  int want_lock = strcmp(env, "0") == 0;
+  if (!want_lock && strcmp(env, "1") != 0) return 0;
   uint32_t plm = tinynv_rd32(d, FEAT_OVR_PLM);
   uint32_t ss0 = tinynv_rd32(d, FEAT_SS0);
   uint32_t ss1 = tinynv_rd32(d, FEAT_SS1);
   fprintf(stderr, "libtinynv: tensor_unlock: PLM=%#x SS0=%#x SS1=%#x\n", plm, ss0, ss1);
 
-  // TINYNV_TENSOR_UNLOCK=0: lock — open PLM fully, write SS back to zero, restore PLM
-  if (strcmp(env, "0") == 0) {
-    if (ss0 == 0 && ss1 == 0) {
-      fprintf(stderr, "libtinynv: tensor_unlock: already locked\n");
-      return 0;
-    }
-    // try to push PLM fully open from the host so SS writes are accepted
-    tinynv_wr32(d, FEAT_OVR_PLM, 0xFFFFFFFFu);
-    uint32_t plm2 = tinynv_rd32(d, FEAT_OVR_PLM);
-    fprintf(stderr, "libtinynv: tensor_unlock: lock: PLM %#x -> %#x after host write 0xffffffff\n", plm, plm2);
-    tinynv_wr32(d, FEAT_SS0, 0);
-    tinynv_wr32(d, FEAT_SS1, 0);
-    uint32_t r0 = tinynv_rd32(d, FEAT_SS0), r1 = tinynv_rd32(d, FEAT_SS1);
-    // restore PLM
-    tinynv_wr32(d, FEAT_OVR_PLM, plm);
-    uint32_t plm3 = tinynv_rd32(d, FEAT_OVR_PLM);
-    fprintf(stderr, "libtinynv: tensor_unlock: locked SS0=%#x SS1=%#x, PLM restored %#x\n", r0, r1, plm3);
-    if (r0 != 0 || r1 != 0)
-      fprintf(stderr, "libtinynv: tensor_unlock: WARNING: lock write did not take (need power cycle to clear AON)\n");
+  // A PLM of all ones also denotes an inaccessible MMIO block. Require a
+  // non-error read in the same block before interpreting that value as open.
+  if (!tinynv_feat_block_responds(ss0) || !tinynv_feat_block_responds(ss1) || plm == TINYNV_FEAT_BADF ||
+      !tinynv_feat_block_responds(tinynv_rd32(d, FEAT_READOUT_1)))
+    return tinynv_fail("tensor_unlock: FEAT block is unreadable");
+  if (g->tensor.verify_after_reset) {
+    g->tensor.verify_after_reset = 0;
+    if (ss0 != g->tensor.expected_ss0 || ss1 != g->tensor.expected_ss1)
+      return tinynv_fail("tensor_unlock: selectors changed across reset (SS0 %#x SS1 %#x)", ss0, ss1);
+  }
+  if (want_lock && !(ss0 & 0x88888888u) && !(ss1 & 8u)) {
+    fprintf(stderr, "libtinynv: tensor_unlock: selector override enable bits already clear\n");
     return 0;
   }
-
-  if (strcmp(env, "1") != 0) return 0;
-
-  // check if already unlocked (previous run — values persist in AON domain across FLR)
-  if (ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK) {
-    fprintf(stderr, "libtinynv: tensor_unlock: speed-select already at full speed (AON persisted), skipping exploit\n");
+  if (!want_lock && ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK) {
+    fprintf(stderr, "libtinynv: tensor_unlock: speed-select overrides already present\n");
     return 0;
   }
+  uint32_t target0 = want_lock ? ss0 & 0x77777777u : SS0_UNLOCK;
+  uint32_t target1 = want_lock ? ss1 & ~8u : SS1_UNLOCK;
 
   int did_exploit = 0;
   if (plm == 0xFFFFFFFFu) {
@@ -321,8 +324,9 @@ int tinynv_tensor_unlock(tinynv_gpu_t *g) {
     if (!v67) { free(image); tinynv_fw_free(&btl1_fw); return tinynv_fail("tensor_unlock: no memory for V67"); }
     build_v67(v67);
 
-    tinynv_bootmem_t v67_mem, meta_mem;
-    if (tinynv_alloc_boot_mem(&g->mm, V67_SIZE, v67, -1, &v67_mem)) {
+    tinynv_bootmem_t *v67_mem = &g->tensor.payload, *meta_mem = &g->tensor.meta;
+    if (tinynv_alloc_boot_mem(&g->mm, V67_SIZE, v67, -1, v67_mem)) {
+      tinynv_tensor_cleanup(g);
       free(v67); free(image); tinynv_fw_free(&btl1_fw);
       return -1;
     }
@@ -331,61 +335,66 @@ int tinynv_tensor_unlock(tinynv_gpu_t *g) {
     // build a modified WprMeta: copy macuda's existing meta, replace signature with V67
     tinynv_wpr_meta_t meta;
     if (g->gsp.wpr_meta.size < sizeof(meta)) {
-      tinynv_free_boot_mem(&g->mm, &v67_mem);
+      tinynv_tensor_cleanup(g);
       free(image); tinynv_fw_free(&btl1_fw);
       return tinynv_fail("tensor_unlock: existing WprMeta too small");
     }
     nv_rd_block(&g->gsp.wpr_meta.view, 0, &meta, sizeof(meta));
-    meta.sysmemAddrOfSignature = v67_mem.addrs[0];
+    meta.sysmemAddrOfSignature = v67_mem->addrs[0];
     meta.sizeOfSignature = V67_SIZE;
 
-    if (tinynv_alloc_boot_mem(&g->mm, sizeof(meta), &meta, -1, &meta_mem)) {
-      tinynv_free_boot_mem(&g->mm, &v67_mem);
+    if (tinynv_alloc_boot_mem(&g->mm, sizeof(meta), &meta, -1, meta_mem)) {
+      tinynv_tensor_cleanup(g);
       free(image); tinynv_fw_free(&btl1_fw);
       return -1;
     }
 
-    int rc = fire_v67(g, &hdr, image, &v67_mem, &meta_mem);
+    int rc = fire_v67(g, &hdr, image, v67_mem, meta_mem);
 
-    tinynv_free_boot_mem(&g->mm, &meta_mem);
-    tinynv_free_boot_mem(&g->mm, &v67_mem);
+    if (!g->tensor.pending) tinynv_tensor_cleanup(g);
     free(image);
     tinynv_fw_free(&btl1_fw);
 
-    if (rc) {
-      fprintf(stderr, "libtinynv: tensor_unlock: exploit fire failed (non-fatal, continuing with locked tensor cores)\n");
-      return 0;
-    }
+    if (rc) return -1;
     did_exploit = 1;
   }
 
 write_selectors:
-  fprintf(stderr, "libtinynv: tensor_unlock: writing speed-select overrides\n");
-  tinynv_wr32(d, FEAT_SS0, SS0_UNLOCK);
-  tinynv_wr32(d, FEAT_SS1, SS1_UNLOCK);
-  uint32_t ss0_rb = tinynv_rd32(d, FEAT_SS0);
-  uint32_t ss1_rb = tinynv_rd32(d, FEAT_SS1);
-  fprintf(stderr, "libtinynv: tensor_unlock: SS0 = %#x (want %#x), SS1 = %#x (want %#x)\n",
-          ss0_rb, SS0_UNLOCK, ss1_rb, SS1_UNLOCK);
-  if (ss0_rb != SS0_UNLOCK || ss1_rb != SS1_UNLOCK)
-    fprintf(stderr, "libtinynv: tensor_unlock: WARNING: speed-select readback mismatch (PLM may not be fully open)\n");
-  else
-    fprintf(stderr, "libtinynv: tensor_unlock: tensor cores unlocked to full speed\n");
-
-  // restore PLM toward its locked state; SS0/SS1 persist in AON regardless.
-  tinynv_wr32(d, FEAT_OVR_PLM, 0xffffff8fu);
+  tinynv_wr32(d, FEAT_SS0, target0);
+  tinynv_wr32(d, FEAT_SS1, target1);
+  uint32_t ss0_rb = tinynv_rd32(d, FEAT_SS0), ss1_rb = tinynv_rd32(d, FEAT_SS1);
+  uint32_t readout = tinynv_rd32(d, FEAT_READOUT_1);
+  fprintf(stderr, "libtinynv: tensor_unlock: SS0=%#x SS1=%#x readout=%#x\n", ss0_rb, ss1_rb, readout);
+  int selectors_ok = tinynv_tensor_selectors_match(target0, target1, ss0_rb, ss1_rb, readout);
+  // Restore the observed gate where possible. GA106 has been observed to retain
+  // bit 6 (8f -> ef); accept that known closed readback but never all-ones.
+  if (did_exploit || plm != 0xffffffffu) tinynv_wr32(d, FEAT_OVR_PLM, plm);
   uint32_t plm_rb = tinynv_rd32(d, FEAT_OVR_PLM);
-  ss0_rb = tinynv_rd32(d, FEAT_SS0);
-  ss1_rb = tinynv_rd32(d, FEAT_SS1);
-  fprintf(stderr, "libtinynv: tensor_unlock: PLM restored %#x, SS0=%#x SS1=%#x (should persist)\n", plm_rb, ss0_rb, ss1_rb);
-
+  ss0_rb = tinynv_rd32(d, FEAT_SS0); ss1_rb = tinynv_rd32(d, FEAT_SS1);
+  int plm_ok = tinynv_tensor_plm_restore_matches(plm, plm_rb);
+  if (!selectors_ok || ss0_rb != target0 || ss1_rb != target1 || !plm_ok) {
+    int rollback_ok = 0;
+    if (tinynv_feat_block_responds(ss0_rb) && tinynv_feat_block_responds(ss1_rb) &&
+        tinynv_feat_block_responds(tinynv_rd32(d, FEAT_READOUT_1))) {
+      tinynv_wr32(d, FEAT_SS0, ss0);
+      tinynv_wr32(d, FEAT_SS1, ss1);
+      rollback_ok = tinynv_rd32(d, FEAT_SS0) == ss0 && tinynv_rd32(d, FEAT_SS1) == ss1;
+    }
+    return tinynv_fail("tensor_unlock: selector/PLM verification failed (SS0 %#x SS1 %#x PLM %#x; "
+                       "expected %#x/%#x/%#x, rollback %s)",
+                       ss0_rb, ss1_rb, plm_rb, target0, target1, plm, rollback_ok ? "verified" : "unverified");
+  }
   if (!did_exploit) return 0;
+  g->tensor.expected_ss0 = target0; g->tensor.expected_ss1 = target1;
+  g->tensor.verify_after_reset = 1;
+  g->tensor.retry = 1;
+  return tinynv_fail("tensor_unlock: selector change requires cold reset and fresh firmware boot");
+}
 
-  // The exploit leaves SEC2 in a self-loop with EXCI and PLM-class gates latched across
-  // engine resets. nv-uefi-unlocker solves this with FLR then a fresh OS-driver boot.
-  // We do the same: signal the boot_firmware retry loop to tear everything down (FLR +
-  // re-upload firmware) and re-run the full init. SS0/SS1 persist in AON across FLR, so
-  // the second pass hits the AON-skip path and boots normally.
-  g->gsp.init_timed_out = 1;
-  return tinynv_fail("tensor_unlock: exploit fired, full reinit needed (SS persists in AON across FLR)");
+void tinynv_tensor_cleanup(tinynv_gpu_t *g) {
+  if (g->tensor.image.size) tinynv_free_boot_mem(&g->mm, &g->tensor.image);
+  if (g->tensor.payload.size) tinynv_free_boot_mem(&g->mm, &g->tensor.payload);
+  if (g->tensor.meta.size) tinynv_free_boot_mem(&g->mm, &g->tensor.meta);
+  g->tensor.pending = 0;
+  g->tensor.retry = 0;
 }

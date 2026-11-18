@@ -6,6 +6,8 @@
 #include "gpu.h"
 #include "internal.h"
 #include "nv_regs.h"
+#include "tensor_unlock.h"
+#include "tensor_unlock_state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +43,7 @@ static int unmake_boot(tinynv_gpu_t *g) {
   // reset through the backend is what the quiesce does after every failed boot, and every boot after one of those came
   // up cold today, so it is what a retry is made of.
   if (tinynv_dev_reset_cold(&g->dev)) return -1;
+  tinynv_tensor_cleanup(g);
   tinynv_gsp_fini(g);
   tinynv_flcn_fini(g);
   memset(&g->gsp, 0, sizeof(g->gsp));
@@ -65,6 +68,20 @@ int tinynv_gpu_boot_firmware(tinynv_gpu_t *g) {
     if (!tinynv_gpu_init_hw(g)) {
       if (attempt > 1) fprintf(stderr, "tinynv: the firmware came up on boot attempt %d\n", attempt);
       return 0;
+    }
+    // SEC2 may still be running or have DMA in flight. Always reset before
+    // releasing its buffers, even on the last attempt or a terminal error.
+    if (g->tensor.pending) {
+      char why[512];
+      snprintf(why, sizeof why, "%s", tinynv_last_error());
+      int retry = tinynv_tensor_retry_after_reset(1, g->tensor.retry, attempt, attempts);
+      fprintf(stderr, "tinynv: tensor transaction requires a cold reset (%s)\n", why);
+      if (unmake_boot(g)) {
+        fprintf(stderr, "tinynv: tensor reset failed; retaining DMA buffers until device quiesce\n");
+        return tinynv_fail("%s; device reset failed", why);
+      }
+      if (!retry) return tinynv_fail("%s", why);
+      continue;
     }
     if (attempt >= attempts || !g->gsp.init_timed_out) return -1;
     char why[512];
@@ -139,6 +156,7 @@ void tinynv_gpu_close(tinynv_gpu_t *g) {
   // doing, a card that is not a bus master cannot reach host memory.
   tinynv_gpu_unload(g);
   tinynv_dev_quiesce(&g->dev);
+  tinynv_tensor_cleanup(g);
   tinynv_gsp_fini(g);
   tinynv_flcn_fini(g);
 }

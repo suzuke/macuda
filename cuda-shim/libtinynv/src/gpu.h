@@ -23,6 +23,12 @@ struct tinynv_gpu {
   int ring_pending, ring_n;
   uint32_t ring_want;
   tinynv_queue_t *ring_q[64];
+  // Held until a cold reset or bus-master quiesce makes SEC2 DMA impossible.
+  struct {
+    tinynv_bootmem_t image, payload, meta;
+    int pending, retry, verify_after_reset;
+    uint32_t expected_ss0, expected_ss1;
+  } tensor;
   tinynv_flcn_t flcn;
   tinynv_gsp_t gsp;
 };

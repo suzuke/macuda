@@ -92,6 +92,10 @@ $(BUILD)/test_arena: test/test_arena.c src/arena.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Isrc -o $@ test/test_arena.c src/arena.c
 
+$(BUILD)/test_tensor_unlock_state: test/test_tensor_unlock_state.c src/tensor_unlock_state.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Isrc -o $@ test/test_tensor_unlock_state.c
+
 # The check floors are grepped out of each test at build time, never written as literals: a count stated as a constant
 # stops counting the moment the file changes, and stops silently. Same reason test_headers' summary is grepped.
 $(BUILD)/test_submit: test/test_submit.c $(BUILD)/libtinynv.a
@@ -160,7 +164,7 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # already wins over the environment, so this changes nothing about how they run - it removes the possibility that a
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
-test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@# FIRST, before any test runs: do the tests in this directory still report what they find? On 2026-09-15
 	@# test_rm_free.c exited 0 with FAIL printed - it consulted its failure count at line 117 of a 318-line main, the
 	@# file grew past that guard, and the whole C4b decision plus the rows proving the read-only fix landed below it.
@@ -204,6 +208,7 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@# recycling the scratch region a piece at a time, against a byte-by-byte record of who wrote what. the failure
 	@# it exists for - bytes handed back while an engine still reads them - produces a wrong answer and no fault, so
 	@# there is nothing on the card that would report it.
+	@$(BUILD)/test_tensor_unlock_state
 	@$(BUILD)/test_arena
 	@# the crash witness, which only ever runs during a crash on a live card - so a bug in it costs a whole run to
 	@# find. checked here against the containment question its file exists to answer, in both directions.
