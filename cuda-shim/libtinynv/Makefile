@@ -115,6 +115,10 @@ $(BUILD)/test_teardown_term: test/test_teardown_term.c $(BUILD)/src/err.o
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc test/test_teardown_term.c $(BUILD)/src/err.o -o $@
 
+$(BUILD)/test_teardown_skip: test/test_teardown_skip.c $(BUILD)/src/err.o
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc test/test_teardown_skip.c $(BUILD)/src/err.o -o $@
+
 # The real exec.o against recording stand-ins for the command encoders and submit (defined in the test itself) and
 # stops for everything else it could reach (fake_exec_unreachable.c): the archive then supplies exec.o and err.o only.
 $(BUILD)/test_upload_order: test/test_upload_order.c test/fake_exec_unreachable.c $(BUILD)/libtinynv.a
@@ -156,7 +160,7 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # already wins over the environment, so this changes nothing about how they run - it removes the possibility that a
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
-test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@# FIRST, before any test runs: do the tests in this directory still report what they find? On 2026-09-15
 	@# test_rm_free.c exited 0 with FAIL printed - it consulted its failure count at line 117 of a 318-line main, the
 	@# file grew past that guard, and the whole C4b decision plus the rows proving the read-only fix landed below it.
@@ -246,6 +250,8 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@# then the same witness re-armed with the PRE-FIX ordering must reproduce the wedge, or it proves nothing
 	@$(BUILD)/test_teardown_term
 	@TEARDOWN_MUTANT=1 $(BUILD)/test_teardown_term
+	@# TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL=1: a failed drain skips gpu_close/exec_fini; unset/0 and a good drain unload as before
+	@$(BUILD)/test_teardown_skip
 	@# BARRIER_COUNT from EIATTR_NUM_BARRIERS, not a constant 1 (the C8 FP8 fault); 0 declared still grants 1.
 	@# test_hw_namedbar is its card-side arm: BUILT above so it cannot rot, never run by this offline suite.
 	@# (test_hw_ce_overlap likewise: the TINYNV_CE_GROUP overlap probe, built above, run only on a card.)

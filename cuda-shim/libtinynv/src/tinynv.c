@@ -136,8 +136,20 @@ static void put_the_card_down(void) {
   // Only when there IS something submitted. A boot that failed before tinynv_exec_init has no ring, no timeline and
   // no `ex->g`, and idling it walks into a null dereference by way of tinynv_submit_ring.
   if (g_dev.exec_ready) {
-    tinynv_exec_idle(&g_dev.exec);   // let what was submitted finish before the mappings under it go away
+    int drained = tinynv_exec_idle(&g_dev.exec);   // let what was submitted finish before the mappings under it go away
     g_dev.exec.torn_down = 1;
+    // Opt-in (TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL=1, default off): a drain that timed out means the card may still be
+    // executing. Unloading the GSP under live DMA is the known MMU-fault wedge; leaving it risks a DART fault when the
+    // mappings are reclaimed. Like nv-uefi-unlocker, which halts rather than tear down under possibly-live DMA, this
+    // chooses to touch nothing: no exec_fini, no gpu_close.
+    if (drained) {
+      const char *skip = getenv("TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL");
+      if (skip && *skip == '1') {
+        fprintf(stderr, "libtinynv: the exit-path drain failed; TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL=1, so the GSP is NOT "
+                        "unloaded and bus mastering is NOT cleared (the card may still be executing)\n");
+        return;
+      }
+    }
     tinynv_exec_fini(&g_dev.exec);
     g_dev.exec_ready = 0;
   }

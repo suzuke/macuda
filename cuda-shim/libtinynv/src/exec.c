@@ -2005,9 +2005,12 @@ int tinynv_exec_idle(tinynv_exec_t *ex) {
   // that afternoon was in the unreadability rather than in the mistake.
   if (!ex || !ex->g) return -1;
   if (tinynv_exec_flush(ex)) return -1;
-  if (tinynv_exec_wait(ex, ex->timeline, 30.0)) return -1;
+  // Both channels are tried even when the first fails: a teardown deciding whether the card is quiet needs both answers,
+  // and the copy channel's wait must not be skipped because compute timed out.
+  int bad = tinynv_exec_wait(ex, ex->timeline, 30.0) != 0;
   // and the dedicated copy channel's, which is a different counter: "everything" means both
-  if (ex->ce_route && ce_wait(ex, ex->ce_reserved, 30.0)) return -1;
+  if (ex->ce_route && ce_wait(ex, ex->ce_reserved, 30.0)) bad = 1;
+  if (bad) return -1;
   ex->needs_wait = 0;
   return 0;
 }
