@@ -26,9 +26,25 @@ For small-model generation after successful hardware validation:
 
 The latest offline-test change extracts signature selection into a shared
 header and uses subtraction-based ROM bounds checks to avoid overflow.
-Existing local binaries predate this refactor. No whole-project rebuild or
-hardware test was run for this change; earlier hardware evidence is recorded
-separately in VALIDATION.txt. Rebuild before testing the latest source on GPU.
+The sm_86 binaries were relinked after this refactor and report libtinynv
+build 15db106; the 2026-11-18 hardware runs in VALIDATION.txt used them.
+
+CPU thread count (llama-bench / llama-server -t)
+
+llama.cpp keeps the input embedding on the CPU, so every token wakes the
+CPU threadpool even with -ngl 99. The default -t equals the P-core count
+(12 on the tested 16-core M3 Max). When other processes occupy the P-cores,
+decode slows sharply. The measurements point to this CPU threadpool rather
+than the driver (see VALIDATION.txt, 2026-11-18).
+  Full offload (-ngl 99):  use -t 1.
+  Partial offload:         use fewer threads than P-cores (-t 4 was best
+                           of the values tried).
+Only llama-bench with -t 1, 4 and 12 was measured, on Qwen2.5-7B Q4_K_M.
+llama-server takes the same -t flag but was not measured. Example:
+  BENCH_ARGS="-t 1" QUIESCE=1 BIN="$PWD/cuda-shim/build/bin-sm_86" \
+    sh tools/nv_shim_step.sh A bench models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+The runner's default stays -t unset so results remain comparable with the
+published author numbers.
 
 Profiling report and ABBA tools (default: no GPU work)
 

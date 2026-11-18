@@ -47,3 +47,36 @@ mask 0xf regression, sparse signature masks, the highest supported version,
 missing versions, invalid counts, truncated blocks and ROM-offset overflow.
 The driver and C test use the same pure helper in src/fwsec_signature.h.
 No GPU access or full rebuild was performed for this refactor.
+
+Hardware rerun and host-load diagnosis: 2026-11-18
+Same sm_86 binaries (libtinynv build 15db106, relinked after the refactor),
+Qwen2.5-7B-Instruct-Q4_K_M, -p 256 -n 128 -r 3, QUIESCE=1 on every step.
+opverify: 450/450 passed, CUDA0 OK (runner reported exit 0).
+Full offload, -ngl 99, default -t 12, no extra load (uptime load avg about
+5.8 before the first run; existing background jobs were running):
+  08:28 pp256 2138.71 +/- 5.02,  tg128 66.57 +/- 0.02
+  08:28 pp256 2130.47 +/- 11.44, tg128 64.30 +/- 3.48
+  08:59 pp256 2127.45 +/- 14.77, tg128 66.31 +/- 0.06
+  (author 2026-09-17: 2106.19 +/- 4.91, 65.11 +/- 0.38)
+
+Load sensitivity, A-B-B-A x2 per row, load = 12 busy `yes` processes:
+                                    tg128 tok/s range, A vs B
+  no extra load vs load              64.5-65.7 vs 26.7-33.8
+  load vs load + main-thread QoS UI  32.2-37.7 vs 32.1-34.1 (no improvement)
+  load vs background-QoS load        29.6-38.5 vs 62.7-66.4
+  load (-t 12) vs load with -t 1     27.8-34.4 vs 66.3-66.5
+All 32 ABBA runs: exit 0 and quiesce verdict in the saved runner output.
+CPU samples during the unloaded 08:59 run, steady state: TinyGPU server
+about 2.4%, llama-bench 426-453%. The server peaked at 92% during setup.
+Server CPU was not sampled under load. -t 1 with no extra load:
+pp256 2143.28 +/- 4.71, tg128 66.95 +/- 0.03.
+
+Partial offload, -ngl 20 of 28 layers, two runs with reversed -t order:
+  -t 12: tg128 14.22 +/- 2.81, 13.57 +/- 4.91
+  -t 4:  tg128 41.52 +/- 0.03, 41.79 +/- 0.06
+  -t 1:  tg128 17.88 +/- 0.04, 17.89 +/- 0.04
+  pp256 444.9-453.8 for all three.
+For the non-ABBA runs, exit status and quiesce verdicts were printed by the
+runner to the console but are not in the saved logs. Preflight reported OK
+before each batch. Raw logs, scripts and commands stay local
+(logs/load-sensitivity-20261118/) and are not included.
