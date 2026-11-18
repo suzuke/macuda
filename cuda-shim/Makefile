@@ -106,6 +106,10 @@ $(BUILD)/copy_bw: test/copy_bw.c $(CUDART) $(CUBLAS) $(NV_LIB)
 # holding when TINYNV_CE_ROUTE moves the copy to its own copy engine (a probe for nv_shim_step.sh; not built by `all`)
 $(BUILD)/copy_overlap: test/copy_overlap.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
+# TINYNV_CE_ROUTE's two hardware hazards (acquire timeout, teardown under load), reproduced on purpose; its header gives
+# the run order and the worst case (a probe for nv_shim_step.sh; not built by `all`)
+$(BUILD)/ce_hazard: test/ce_hazard.c $(CUDART) $(CUBLAS) $(NV_LIB)
+	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 # the split-K kernel ON THE CARD through libtinynv (D's gate S1 on prereg b79fb72f); a probe, run by nv_shim_step.sh, never by make test
 $(BUILD)/splitk_card: test/splitk_card.c $(NV_LIB)
 	$(CC) $(CFLAGS) $< $(NV_LIB) -o $@

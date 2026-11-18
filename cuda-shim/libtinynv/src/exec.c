@@ -2053,6 +2053,28 @@ static int ce_submit(tinynv_exec_t *ex, const uint64_t want[2], uint64_t dst, ui
   if (at > 0xffffffffull) return tinynv_fail("the dedicated copy channel's timeline has run past 32 bits");
   unsigned slot = (unsigned)(at % TINYNV_CE_CMD_SLOTS);
   if (ex->ce_cmd_val[slot] && ce_wait(ex, ex->ce_cmd_val[slot], 30.0)) return -1;   // its last batch is done with it
+  // HAZARD H1, the ~2 s acquire timeout every channel is allocated with (NVOS04_FLAGS_CHANNEL_PBDMA_ACQUIRE_TIMEOUT,
+  // gsp.c new_queue): "if a host semaphore acquire does not complete in about 2 sec, it will time out and trigger a RC
+  // error". A routed copy ordered after compute that is still queued would park this channel on that acquire for as
+  // long as the backlog takes - and nothing bounds a backlog. So the HOST waits for those values first, with the
+  // ordinary bounded, diagnosed wait, and the acquires below are only ever already satisfied: they stay as the
+  // ordering's statement and as a guard. A copy that has to follow compute cannot overlap that compute anyway; what is
+  // lost is only that the host blocks here instead of the channel. TINYNV_CE_NO_HOSTWAIT=1 skips this, for the probe
+  // that reproduces the hazard (test/ce_hazard.c), and never otherwise.
+  if (!ex->ce_no_hostwait) {
+    uint64_t need = 0;
+    for (int q = 0; q < 2; q++) {
+      uint64_t w = want[q] < ex->q_last[q] ? want[q] : ex->q_last[q];
+      if (w > ex->ce_acq_q[q] && sem_read_slot(ex, q) < w && w > need) need = w;
+    }
+    if (need) {
+      ex->ce_gfx_waiting = 1;
+      int rc = tinynv_exec_wait(ex, need, 30.0);
+      ex->ce_gfx_waiting = 0;
+      if (rc) return -1;
+      ex->ce_gfx_waits++;
+    }
+  }
   tinynv_cmdbuf_t c = {.words = (uint32_t *)((uint8_t *)ex->ce_cmd.dma.va + (uint64_t)slot * CE_CMD_SLOT_BYTES), .n = 0,
                        .cap = CE_CMD_SLOT_BYTES / 4};
   uint64_t acq[2] = {ex->ce_acq_q[0], ex->ce_acq_q[1]};
@@ -2982,6 +3004,11 @@ int tinynv_exec_ce_route_init(tinynv_exec_t *ex) {
   if (!(e && *e && *e != '0')) return 0;
   tinynv_gsp_t *gsp = &ex->g->gsp;
   { const char *k = getenv("TINYNV_CE_CONSERVATIVE"); ex->ce_conservative = k && *k && *k != '0'; }
+  { const char *k = getenv("TINYNV_CE_NO_HOSTWAIT"); ex->ce_no_hostwait = k && *k && *k != '0'; }
+  if (ex->ce_no_hostwait)
+    fprintf(stderr, "libtinynv: TINYNV_CE_NO_HOSTWAIT=1: a routed copy that must follow queued compute ACQUIRES it on the "
+                    "copy channel instead of the host waiting first - over ~2 s of backlog that is an RC error. For the "
+                    "hazard probe only.\n");
   const char *why = NULL;
   // Only the configuration test_hw_ce_overlap measured: asynchronous, doorbells rung in line, no lent kernel.
   if (ex->sync) why = "TINYNV_SYNC waits on every batch, so nothing could overlap anyway";
@@ -3412,8 +3439,9 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
     fprintf(stderr, "libtinynv: the descriptor region was started from the bottom at %llu standstills "
                     "(TINYNV_DELTA_REWIND).\n", (unsigned long long)ex->delta_rewind_n);
   if (ex->ce_n)
-    fprintf(stderr, "libtinynv: %llu bulk upload chunks (%.1f MB) went to the dedicated copy channel (TINYNV_CE_ROUTE).\n",
-            (unsigned long long)ex->ce_n, (double)ex->ce_bytes / 1e6);
+    fprintf(stderr, "libtinynv: %llu bulk upload chunks (%.1f MB) went to the dedicated copy channel (TINYNV_CE_ROUTE); "
+                    "%llu of them first waited on the host for the compute they follow.\n",
+            (unsigned long long)ex->ce_n, (double)ex->ce_bytes / 1e6, (unsigned long long)ex->ce_gfx_waits);
   if (ex->inline_n || ex->upload_ce_n)
     fprintf(stderr, "libtinynv: %llu host-to-device copies rode in the pushbuffer (%llu bytes) and %llu went to the "
                     "copy engine.\n           Held list (%u entries, %u bytes): %llu rode in a batch already going "

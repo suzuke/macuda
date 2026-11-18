@@ -509,6 +509,10 @@ typedef struct {
   uint64_t chain_need_ce;    // the CE value the pending chain's batch must acquire: the most any launch in it needs
   uint64_t inline_need_ce;   // the same for the held inline uploads, which ride the next compute batch
   int chain_submit;          // submit_batch is handing over a chain's batch (in_chain_flush is already 0 there)
+  // Hazard H1 (ce_submit): the host waits for the graphics values a routed copy follows before submitting it, so the
+  // CE channel never sits on an acquire. ce_gfx_waiting: inside that wait. ce_no_hostwait: TINYNV_CE_NO_HOSTWAIT=1.
+  int ce_gfx_waiting, ce_no_hostwait;
+  uint64_t ce_gfx_waits;
 } tinynv_exec_t;
 
 int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex);

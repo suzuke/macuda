@@ -34,7 +34,7 @@ static int fails, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
 
 // ---- the record ----
-enum { EV_WAIT, EV_INLINE, EV_LAUNCH, EV_BARRIER, EV_RELEASE, EV_COPY, EV_SUBMIT, EV_SETOBJ, EV_CPUWAIT_CE };
+enum { EV_WAIT, EV_INLINE, EV_LAUNCH, EV_BARRIER, EV_RELEASE, EV_COPY, EV_SUBMIT, EV_SETOBJ, EV_CPUWAIT_CE, EV_CPUWAIT_GFX };
 enum { Q_COMPUTE, Q_COPY, Q_CE };
 static const char *QN[] = {"compute", "copy", "ce"};
 static struct { int kind, batch; uint64_t a, b; } ev[1024];
@@ -82,6 +82,12 @@ static uint8_t sem_host[4096] __attribute__((aligned(128)));
 static struct { uint64_t va, value; } placed[64];
 static int nplaced;
 static uint64_t ce_held;   // ce_hold: the highest ce release submitted and not yet mirrored
+// gfx_hold: graphics releases (and launched descriptors' values) are held, as a busy compute engine would hold them, and
+// land only when exec.c rings from inside its host wait for a routed copy's dependencies (ce_gfx_waiting). Every ce
+// batch submitted meanwhile is checked: an acquire on a graphics value not yet released is a channel parked on an
+// acquire - hazard H1, an RC error after ~2 s on the card.
+static int gfx_hold, ce_parked;
+static uint64_t gfx_held[2];
 static void mirror(int slot, uint64_t v) { uint64_t o; memcpy(&o, sem_host + slot * 128, 8); if (v > o) memcpy(sem_host + slot * 128, &v, 8); }
 int tinynv_submit(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, uint32_t dwords) {
   (void)cmdbuf_va; (void)dwords;
@@ -99,9 +105,17 @@ int tinynv_submit(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, uint32
     if (ev[i].batch != batch) continue;
     if (ev[i].kind == EV_RELEASE && ev[i].a < 3) {
       if (ev[i].a == 2 && ce_hold) { if (ev[i].b > ce_held) ce_held = ev[i].b; }
+      else if (ev[i].a < 2 && gfx_hold) { if (ev[i].b > gfx_held[ev[i].a]) gfx_held[ev[i].a] = ev[i].b; }
       else mirror((int)ev[i].a, ev[i].b);
     }
-    if (ev[i].kind == EV_LAUNCH) for (int k = 0; k < nplaced; k++) if (placed[k].va == ev[i].a) mirror(0, placed[k].value);
+    if (ev[i].kind == EV_LAUNCH) for (int k = 0; k < nplaced; k++) if (placed[k].va == ev[i].a) {
+      if (gfx_hold) { if (placed[k].value > gfx_held[0]) gfx_held[0] = placed[k].value; }
+      else mirror(0, placed[k].value);
+    }
+    if (qi == Q_CE && ev[i].kind == EV_WAIT && ev[i].a < 2) {
+      uint64_t have; memcpy(&have, sem_host + ev[i].a * 128, 8);
+      if (ev[i].b > have) ce_parked++;
+    }
   }
   rec(EV_SUBMIT, (uint64_t)qi, 0); batch++; return 0;
 }
@@ -110,6 +124,10 @@ int tinynv_submit(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, uint32
 int tinynv_submit_ring(tinynv_gpu_t *g) {
   (void)g;
   if (ce_hold == 1 && ce_held) { rec(EV_CPUWAIT_CE, ce_held, 0); mirror(2, ce_held); ce_held = 0; }
+  if (gfx_hold && cur && cur->ce_gfx_waiting) {
+    rec(EV_CPUWAIT_GFX, gfx_held[0], gfx_held[1]);
+    for (int q = 0; q < 2; q++) { mirror(q, gfx_held[q]); gfx_held[q] = 0; }
+  }
   return 0;
 }
 int tinynv_submit_stage(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, uint32_t dwords) { return tinynv_submit(g, q, cmdbuf_va, dwords); }
@@ -171,6 +189,7 @@ static tinynv_exec_t *fresh(int route) {
     uint64_t two = 2; memcpy(sem_host + 256, &two, 8);
   }
   nev = 0; batch = 0; nplaced = 0; cur = &ex; ce_hold = 0; ce_held = 0; copy_corrupt = 0; alloc_fail = 0;
+  gfx_hold = 0; ce_parked = 0; gfx_held[0] = gfx_held[1] = 0;
   return &ex;
 }
 static void launch(tinynv_exec_t *ex, uint64_t qmd_va) {
@@ -194,6 +213,7 @@ static void show(const char *arm) {
     else if (ev[i].kind == EV_COPY) printf(" copy(%#llx)", (unsigned long long)ev[i].a);
     else if (ev[i].kind == EV_SETOBJ) printf(" setobj(%#llx)", (unsigned long long)ev[i].b);
     else if (ev[i].kind == EV_CPUWAIT_CE) printf(" CPU-WAIT(ce>=%llu)", (unsigned long long)ev[i].a);
+    else if (ev[i].kind == EV_CPUWAIT_GFX) printf(" CPU-WAIT(compute>=%llu)", (unsigned long long)ev[i].a);
   }
   printf("\n");
 }
@@ -474,6 +494,28 @@ int main(void) {
     uint64_t r0 = c0 >= 0 ? rel_in(c0, Q_COPY) : 0;
     CHECK(r0 && ce0 > c0 && waits_in(ce0, Q_COPY) >= r0, "B/copyq-then-routed: the routed copy acquires copy >= %llu, want >= %llu (the copy before it on its stream)",
           (unsigned long long)(ce0 >= 0 ? waits_in(ce0, Q_COPY) : 0), (unsigned long long)r0);
+  }
+  { // H1: kernels on A still RUNNING (their releases held), then a routed copy on A that must follow them. The host waits
+    // for them before the ce batch goes out, so the copy channel never sits on an acquire (the ~2 s RC timeout); the
+    // acquire is still emitted, already satisfied. TINYNV_CE_NO_HOSTWAIT=1 (the probe's knob) parks it, by design.
+    for (int nohw = 0; nohw < 2; nohw++) {
+      tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
+      ex->ce_no_hostwait = nohw; gfx_hold = 1;
+      ON(ex, &sa); launch(ex, A); launch(ex, B);
+      CHECK(!tinynv_exec_upload(ex, U, data, STAGE_HALF), "H1: upload: %s", tinynv_last_error());
+      ON(ex, NULL);
+      show(nohw ? "H1: busy compute, then a routed copy after it (TINYNV_CE_NO_HOSTWAIT)" : "H1: busy compute, then a routed copy after it");
+      int ce0 = nth_batch(Q_CE, 0), w = -1;
+      for (int i = 0; i < nev; i++) if (ev[i].kind == EV_CPUWAIT_GFX) w = i;
+      CHECK(ce0 >= 0 && waits_in(ce0, Q_COMPUTE) >= 2, "H1: the routed copy does not acquire the kernels it follows (compute >= 2)");
+      if (!nohw) {
+        CHECK(ce_parked == 0, "H1: %d ce acquire(s) named a graphics value not yet released: the copy channel would sit on them", ce_parked);
+        CHECK(w >= 0 && ev[w].batch <= ce0 && ex->ce_gfx_waits == 1, "H1: the host did not wait for the kernels before the routed copy (%llu waits)",
+              (unsigned long long)ex->ce_gfx_waits);
+      } else {
+        CHECK(ce_parked > 0 && ex->ce_gfx_waits == 0, "H1/no-hostwait: the knob did not leave the acquire to the channel");
+      }
+    }
   }
   { // TINYNV_CE_CONSERVATIVE: the overlap arm again, now with stage A's ordering
     tinynv_exec_t *ex = fresh(1); RESET_STREAMS();
