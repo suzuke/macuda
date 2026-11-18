@@ -224,6 +224,11 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@$(BUILD)/test_mm
 	@# and a sequence a real caller issued - ggml's k=129 f16 matmul cases, which is where the mapping check went wrong
 	@$(BUILD)/test_mm test/allocseq-k129.txt
+	@# the transport after its server is gone (2026-11-18 DART panic, M1): the loss latches, every later call fails without
+	@# a byte on the socket, it is said once, and the write-pointer check names the server rather than the device. No mock
+	@# server: the test plays the server on a socket of its own, so it needs neither python nor tinygrad, and runs
+	@# ahead of the tests that do.
+	@$(BUILD)/test_tg_dead
 	@$(PYTHON) tools/nv_trace.py --selftest
 	@# what a cubin references and does not contain, both halves: the device printf resolves, anything else is refused.
 	@# the cubin is build output and not in the repository, so it is made if it is missing rather than assumed.
@@ -329,10 +334,6 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	$(BUILD)/test_pci $$sock; rc=$$?; \
 	rm -f $$sock; wait $$srv 2>/dev/null; [ $$rc = 0 ] || exit $$rc
 	@$(PYTHON) test/test_wire_proxy.py $(BUILD)/test_pci
-	@# the transport after its server is gone (2026-11-18 DART panic, M1): the loss latches, every later call fails without
-	@# a byte on the socket, it is said once, and the write-pointer check names the server rather than the device. No mock
-	@# server: the test plays the server on a socket of its own, so it needs neither python nor tinygrad.
-	@$(BUILD)/test_tg_dead
 
 clean:
 	rm -rf $(BUILD)

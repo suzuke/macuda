@@ -27,18 +27,19 @@ static int checks, fails;
 typedef struct { uint8_t cmd; uint32_t dev_id, bar; uint64_t arg0, arg1, arg2; } req_t;
 typedef struct { uint8_t status; uint64_t resp0, resp1; } resp_t;
 #pragma pack(pop)
-enum { CMD_MAP_BAR = 1, CMD_CFG_READ = 3, CMD_MMIO_READ = 6 };
+enum { CMD_MAP_BAR = 1, CMD_CFG_READ = 3, CMD_CFG_WRITE = 4, CMD_MMIO_READ = 6 };
 
 static void reply(int srv, uint8_t status, uint64_t r0, uint64_t r1, const void *tail, size_t n) {
   resp_t rp = {.status = status, .resp0 = r0, .resp1 = r1};
   if (write(srv, &rp, sizeof(rp)) != (ssize_t)sizeof(rp) || (n && write(srv, tail, n) != (ssize_t)n)) { perror("reply"); exit(2); }
 }
 // what the client has sent since the last call, without waiting for more
+static uint8_t g_sent[4096];
 static size_t drain(int srv, uint8_t *first_cmd) {
-  uint8_t buf[4096];
+  uint8_t *buf = g_sent;
   size_t total = 0;
   for (;;) {
-    ssize_t n = recv(srv, buf, sizeof(buf), MSG_DONTWAIT);
+    ssize_t n = recv(srv, buf + total, sizeof(g_sent) - total, MSG_DONTWAIT);
     if (n <= 0) break;
     if (!total && first_cmd) *first_cmd = buf[0];
     total += (size_t)n;
@@ -103,6 +104,18 @@ int main(void) {
   CHECK(pci.transport_dead != NULL, "the backend has no transport_dead, so a caller cannot tell a lost server from all ones");
   CHECK(!pci.transport_dead || !pci.transport_dead(&pci), "a live connection reads as dead");
 
+  // the quiesce on a LIVE connection still clears bus mastering: read PCI_COMMAND, write it back without MASTER, read
+  // it back. The latch must not have turned this into a no-op - it is the one thing that stops a card's DMA.
+  reply(srv, 0, 0x0407, 0, NULL, 0);
+  reply(srv, 0, 0, 0, NULL, 0);
+  reply(srv, 0, 0x0403, 0, NULL, 0);
+  pci.quiesce(&pci);
+  size_t q = drain(srv, &cmd);
+  req_t qr[3];
+  if (q == sizeof(qr)) memcpy(qr, g_sent, sizeof(qr));
+  CHECK(q == sizeof(qr) && qr[0].cmd == CMD_CFG_READ && qr[0].arg0 == 4 && qr[1].cmd == CMD_CFG_WRITE && qr[1].arg0 == 4 &&
+        qr[1].arg2 == 0x0403 && qr[2].cmd == CMD_CFG_READ, "the live quiesce sent %zu bytes, not read / write 0x0403 / read-back", q);
+
   // a split read whose reply is an error: the server's words must survive, not be dropped on the floor
   nv_rd32_send(&regs, 0x40);
   const char why[] = "bar 0 offset out of range";
@@ -154,6 +167,7 @@ int main(void) {
   int said = 0;
   for (const char *s = log; n > 0 && (s = strstr(s, "tinygpu server connection lost")); s++) said++;
   CHECK(said == 1, "the loss was said %d times on stderr, not once", said);
+  CHECK(strstr(log, "split mmio read failed at the server: bar 0 offset out of range") != NULL, "the split read's error never reached stderr");
   if (said != 1 || fails) fprintf(stderr, "--- stderr of the run ---\n%s---\n", log);
 
   close(srv); close(lfd); close(errfd);

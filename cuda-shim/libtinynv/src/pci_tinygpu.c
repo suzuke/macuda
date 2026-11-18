@@ -37,6 +37,7 @@ typedef struct {
   // without touching the socket, and transport_dead lets a caller name the real cause.
   int dead;
   char dead_why[160];
+  int split_err_said; // a split read's error reply is printed the first time only; tinynv_last_error keeps the latest
   // A read whose request has been sent and whose reply has not been taken. Any other request must first take that
   // reply (the socket carries one conversation), so rpc() drains it into pending_val and rd32_recv finds it there.
   int pending, pending_done;
@@ -189,7 +190,10 @@ static uint32_t tg_take_pending(tg_t *tg) {
     char msg[256] = "unknown error";
     size_t n = rp.resp0 < sizeof(msg) - 1 ? (size_t)rp.resp0 : sizeof(msg) - 1;
     if (n && !xfer_all(tg, msg, n, 0)) msg[n] = 0;
-    if (!tg->dead) tinynv_fail("tinygpu: split mmio read failed: %s", msg);
+    if (!tg->dead) {
+      tinynv_fail("tinygpu: split mmio read failed: %s", msg);
+      if (!tg->split_err_said++) fprintf(stderr, "libtinynv: tinygpu: a split mmio read failed at the server: %s (said once)\n", msg);
+    }
     return v;
   }
   xfer_all(tg, &v, 4, 0);
