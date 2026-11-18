@@ -50,9 +50,9 @@ $(BUILD)/copy1d_cubin.c: libtinycudart/copy1d$(CUBIN_SUF).cubin
 $(BUILD)/copy1d_cubin.o: $(BUILD)/copy1d_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 # the keep-alive kernel the driver launches after a synchronisation when TINYNV_KEEPALIVE=1 (libtinycudart/keepalive.cu)
-$(BUILD)/keepalive_cubin.c: libtinycudart/keepalive.cubin
+$(BUILD)/keepalive_cubin.c: libtinycudart/keepalive$(CUBIN_SUF).cubin
 	@mkdir -p $(@D)
-	cd libtinycudart && xxd -i keepalive.cubin > $(ROOT)/$@
+	cd libtinycudart && xxd -i -n keepalive_cubin keepalive$(CUBIN_SUF).cubin > $(ROOT)/$@
 $(BUILD)/keepalive_cubin.o: $(BUILD)/keepalive_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(CUBLAS): $(BUILD)/cublas.o $(BUILD)/gemm_cubin.o
