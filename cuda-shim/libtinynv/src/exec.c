@@ -2018,7 +2018,12 @@ int tinynv_exec_idle(tinynv_exec_t *ex) {
 // drift, and the failure mode of drift is a synchronise that returns while a kernel is still running - a wrong answer
 // with no symptom at the place it was caused. Everything that requires completion sets the flag at the point it is
 // submitted; only an inline upload does not, because its bytes travel in the command stream.
-int tinynv_exec_needs_wait(const tinynv_exec_t *ex) { return ex->needs_wait; }
+//
+// ...and a launch that has only JOINED the pending chain is submitted by nobody until the next flush, so the flag set at
+// submission is still 0 for it. cudaStreamSynchronize takes "0" as "flush and return", which then handed the chain over
+// and returned with every kernel in it still to run (copy_overlap, 2026-11-18: four gemms timed as 54 us apiece). A
+// pending chain therefore needs a wait too. It may hold the driver's own launches; waiting for those is merely early.
+int tinynv_exec_needs_wait(const tinynv_exec_t *ex) { return ex->needs_wait || ex->nchain > 0; }
 
 int tinynv_exec_copy(tinynv_exec_t *ex, uint64_t dst_va, uint64_t src_va, uint64_t bytes) {
   if (!bytes) return 0;

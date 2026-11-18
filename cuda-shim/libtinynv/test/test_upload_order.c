@@ -215,6 +215,17 @@ int main(void) {
     int wb = -1; for (int i = b - 1; i >= 0 && ev[i].batch == ev[b].batch; i--) if (ev[i].kind == EV_WAIT && ev[i].a == 1) wb = i;
     CHECK(wb >= 0, "large: launch B does not wait on the copy queue for the copy");
   }
+  { // a synchronise must wait for launches that only sit in the pending chain (cudaStreamSynchronize flushes and returns
+    // when tinynv_exec_needs_wait says 0 - copy_overlap's 54 us "gemms", 2026-11-18); held inline bytes alone still need
+    // no wait, which is the shortcut's whole purpose
+    tinynv_exec_t *ex = fresh();
+    CHECK(!tinynv_exec_upload(ex, U, data, 16), "needs wait: upload: %s", tinynv_last_error());
+    CHECK(!tinynv_exec_needs_wait(ex), "needs wait: held inline bytes alone report that a synchronise must wait");
+    launch(ex, A);
+    CHECK(tinynv_exec_needs_wait(ex), "needs wait: a launch pending in the chain reports that a synchronise need not wait");
+    CHECK(!tinynv_exec_flush(ex), "needs wait: flush: %s", tinynv_last_error());
+    CHECK(tinynv_exec_needs_wait(ex), "needs wait: the chain once handed over reports that a synchronise need not wait");
+  }
   printf(fails ? "%d of %d checks failed\n" : "upload order: all %d checks passed\n", fails ? fails : checks, checks);
   return fails ? 1 : 0;
 }
