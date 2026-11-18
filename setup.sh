@@ -87,8 +87,19 @@ sd() {
   clone_at stable-diffusion.cpp "$SD_URL" "$SD_COMMIT" "${SD_SRC:-}"
   # upstream ggml (llama.cpp's), not leejet's fork: the shim's ggml-cuda archive is built from llama.cpp's tree
   if [ ! -L stable-diffusion.cpp/ggml ]; then rm -rf stable-diffusion.cpp/ggml; ln -s ../llama.cpp/ggml stable-diffusion.cpp/ggml; fi
-  git -C stable-diffusion.cpp apply --check ../patches/stable-diffusion.cpp-upstream-ggml.patch 2>/dev/null \
-    && git -C stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-upstream-ggml.patch && echo "patch applied" || echo "patch already applied (or does not apply — check git -C stable-diffusion.cpp status)"
+  # Three states, told apart: applies (apply it), applies in reverse (already in), neither. The third used to print a
+  # line and carry on, so a checkout holding an OLDER version of this patch built against a ggml it no longer matches.
+  P=../patches/stable-diffusion.cpp-upstream-ggml.patch
+  if git -C stable-diffusion.cpp apply --check "$P" 2>/dev/null; then
+    git -C stable-diffusion.cpp apply "$P" && echo "patch applied"
+  elif git -C stable-diffusion.cpp apply --check --reverse "$P" 2>/dev/null; then
+    echo "patch already applied"
+  else
+    echo "stable-diffusion.cpp: $P neither applies nor is already applied - the checkout holds other edits (an older" >&2
+    echo "  version of this patch, or local changes). Look at them with: git -C stable-diffusion.cpp diff -- src" >&2
+    echo "  and, if nothing there is yours to keep: git -C stable-diffusion.cpp checkout -- src && sh setup.sh sd" >&2
+    exit 1
+  fi
   mkdir -p stable-diffusion.cpp/build-null
   cmake -S stable-diffusion.cpp -B stable-diffusion.cpp/build-null -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=OFF \
     -DGGML_METAL=OFF -DGGML_NATIVE=${GGML_NATIVE:-ON} ${GGML_CPU_ARM_ARCH:+-DGGML_CPU_ARM_ARCH=$GGML_CPU_ARM_ARCH} > stable-diffusion.cpp/build-null/cmake.log 2>&1 || { tail -20 stable-diffusion.cpp/build-null/cmake.log; exit 1; }
