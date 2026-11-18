@@ -27,6 +27,17 @@ row "OFF: diffusion mix -> tc2s grid (20,4,1)" "$([ "$(has "$OFF" 'launch tinybl
 row "ON: workspace allocations 0 / 0 / 1 (create, non-splitting handle, splitting handle)" "$([ "$(has "$ON" 'ws allocs after cublasCreate x2: 0')" = 1 ] && [ "$(has "$ON" "ws allocs after the non-splitting handle's GEMMs: 0")" = 1 ] && [ "$(has "$ON" "ws allocs after the splitting handle's 3 GEMMs: 1")" = 1 ] && echo 0 || echo 1)"
 row "OFF: workspace allocations 0 / 0 / 0" "$([ "$(has "$OFF" 'ws allocs after cublasCreate x2: 0')" = 1 ] && [ "$(has "$OFF" "ws allocs after the non-splitting handle's GEMMs: 0")" = 1 ] && [ "$(has "$OFF" "ws allocs after the splitting handle's 3 GEMMs: 0")" = 1 ] && echo 0 || echo 1)"
 row "DEFAULT (knob unset): ran, and its launch trace equals the ON arm's" "$([ $rc_def = 0 ] && [ "$(printf '%s\n' "$DEF" | grep '^\[trace\] launch' | sed 's/ -> 0x[0-9a-f]*//')" = "$(printf '%s\n' "$ON" | grep '^\[trace\] launch' | sed 's/ -> 0x[0-9a-f]*//')" ] && [ "$(has "$DEF" '[trace] launch tinyblas_gemm_bf16_tc2k')" = 3 ] && echo 0 || echo 1)"
-[ $fails = 0 ] || { printf '%s\n' "--- ON arm output:" "$ON" "--- OFF arm output:" "$OFF" | head -60; }
+# Under a stream capture (2026-11-18): the split GEMM is a NODE of the graph, as the unsplit one is. It used to launch past
+# the capture - once, eagerly - and be missing from every replay: "holds 1 launches" here, 45 instead of 46 for SD 1.5.
+CAP_ON='graphs: capture 1 holds 2 launches, 0 copies, 0 fills, 0 strided copies; first: tinyblas_gemm_f16_tc2s_tn tinyblas_gemm_f16_tc2k_tn ...'
+CAP_OFF='graphs: capture 1 holds 2 launches, 0 copies, 0 fills, 0 strided copies; first: tinyblas_gemm_f16_tc2s_tn tinyblas_gemm_f16_tc2s_tn ...'
+REPLAY='graphs: 1 captures recorded 2 nodes; 1 graph launches replayed 2 nodes'
+row "capture: begin, end, instantiate and launch all return 0 (ON and OFF)" "$([ "$(has "$ON" 'capture begin rc 0')" = 1 ] && [ "$(has "$ON" 'capture end rc 0')" = 1 ] && [ "$(has "$ON" 'graph instantiate rc 0, launch rc 0')" = 1 ] && [ "$(has "$OFF" 'capture end rc 0')" = 1 ] && [ "$(has "$OFF" 'graph instantiate rc 0, launch rc 0')" = 1 ] && echo 0 || echo 1)"
+row "ON: the captured graph holds the split GEMM (tc2k) after the unsplit one, and no fill" "$([ "$(has "$ON" "$CAP_ON")" = 1 ] && echo 0 || echo 1)"
+row "ON: its one replay issues both nodes" "$([ "$(has "$ON" "$REPLAY")" = 1 ] && echo 0 || echo 1)"
+row "ON: the captured handle's workspace is made inside the capture (allocations 2)" "$([ "$(has "$ON" "ws allocs after the captured handle's GEMMs: 2")" = 1 ] && echo 0 || echo 1)"
+row "OFF: the captured graph holds both GEMMs on tc2s, and no allocation" "$([ "$(has "$OFF" "$CAP_OFF")" = 1 ] && [ "$(has "$OFF" "$REPLAY")" = 1 ] && [ "$(has "$OFF" "ws allocs after the captured handle's GEMMs: 0")" = 1 ] && echo 0 || echo 1)"
+row "DEFAULT: the captured graph equals the ON arm's" "$([ "$(has "$DEF" "$CAP_ON")" = 1 ] && [ "$(has "$DEF" "$REPLAY")" = 1 ] && echo 0 || echo 1)"
+[ $fails = 0 ] || { printf '%s\n' "--- ON arm output:" "$ON" "--- OFF arm output:" "$OFF" | grep -v '^tinynv: would launch' | head -80; }
 echo "splitk_check: $fails failure(s)"
 exit $fails

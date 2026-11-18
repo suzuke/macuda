@@ -64,11 +64,11 @@ static tinynv_kernel_t tinycublas_gemm_tc2_kernel(int bf16, int opA, int opB, in
 static const char* const tc2k_names[2][4]={
   {"tinyblas_gemm_f16_tc2k_nn","tinyblas_gemm_f16_tc2k_nt","tinyblas_gemm_f16_tc2k_tn","tinyblas_gemm_f16_tc2k_tt"},
   {"tinyblas_gemm_bf16_tc2k_nn","tinyblas_gemm_bf16_tc2k_nt","tinyblas_gemm_bf16_tc2k_tn","tinyblas_gemm_bf16_tc2k_tt"}};
-// OFF BY DEFAULT ON sm_8x (Ampere, Ada), ON elsewhere. The flip above was measured and validated on the 5090; on an RTX
-// 3060 through this driver the split GEMMs come back wrong (2026-11-18: SD 1.5, seed 42, 20 steps is noise with split-K
-// and the expected image with TINYCUBLAS_SPLITK=0), while test_splitk passes on a 3090 under NVIDIA's own driver - so the
-// kernel is not the suspect, the way this driver runs it on Ampere is. Until that is found, sm_8x takes the unsplit
-// kernels it took before split-K existed. TINYCUBLAS_SPLITK=1 forces it on anywhere (to reproduce), =0 off anywhere.
+// OFF BY DEFAULT ON sm_8x (Ampere, Ada), ON elsewhere. The flip above was measured and validated on the 5090. The 3060's
+// noise image of 2026-11-18 (SD 1.5, seed 42, 20 steps; correct with TINYCUBLAS_SPLITK=0) is explained by the split
+// launch bypassing graph capture, fixed below in launch_gemm_tc. sm_8x stays off only until a card run
+// confirms split-K there with graphs on and off; then this exception goes. TINYCUBLAS_SPLITK=1 forces it on
+// anywhere (to reproduce), =0 off anywhere.
 // The null device (cc_major 0, cudart_api.c:60; or no device handle at all) keeps the default ON, which is what
 // test/splitk_check.sh traces - nothing executes there. A device whose properties cannot be read is treated as unknown
 // and gets OFF: the unsplit kernels are correct everywhere, the split ones are only known good on sm_120. Decided once
@@ -107,10 +107,15 @@ struct tinyblas_handle { tinynv_stream_t stream; int math_mode; tinynv_devptr_t 
 // SPLIT-K's WORKSPACE IS MADE LAZILY, at the first GEMM whose plan splits (B, 09-23, D's ruling on flip rev 4). It used to
 // be made at cublasCreate, and ggml creates its handle lazily at its first cuBLAS call (common.cuh:1540-1555 at 945e0af),
 // which is a prefill: the 8 MiB allocation, the memset and a sync were charged to that prefill (-2.9% at npl 1 in the
-// 04:52 flip slot). A handle that never splits now never allocates. No capture hazard on this path: the host runtime has
-// no stream capture (libtinycudart/cudart_api.c:86, cudaStreamBeginCapture returns NotSupported), and the guest path does
-// not use this library. The counters are zeroed by a memset on the handle's own stream, ordered before the split GEMM
-// that follows it on that stream, so no host sync is needed.
+// 04:52 flip slot). A handle that never splits now never allocates. The counters are zeroed by a memset on the handle's
+// own stream, ordered before the split GEMM that follows it on that stream, so no host sync is needed.
+// UNDER A STREAM CAPTURE (libtinycudart/graph.c records one; this used to say the runtime had none): the first splitting
+// GEMM may come inside it. The malloc and the memset then run at once and are NOT graph nodes, while the GEMM is recorded.
+// That is correct: the memset is still ordered on the stream ahead of the first replay, and the zeroing is needed only
+// once, because tc2k leaves every counter at 0 after each GEMM - each slice block counts itself (an empty slice too) and
+// the block that completes a tile resets its counter (gemm.cu tinyblas_gemm_tc2, SPLIT). Replays and eager GEMMs on the
+// handle's stream share ws and cnt in stream order, as eager GEMMs always did. A recorded node holds ws and cnt, which
+// cublasDestroy frees: a graph must not be replayed after its handle is gone (as with cuBLAS's own workspace).
 static unsigned g_splitk_ws_allocs;   // workspace allocations made, all handles: the unit row reads it
 unsigned tinycublas_splitk_ws_allocs(void){ return g_splitk_ws_allocs; }
 static int splitk_workspace(struct tinyblas_handle* h){
@@ -190,7 +195,9 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
       static int said; if (!said++) fprintf(stderr,"[tinycublas] split-K ON (default off on sm_8x; TINYCUBLAS_SPLITK=0/1 forces): first %s m=%d n=%d k=%d batch=%d S=%d grid=(%u,%u,%u)\n",kname,m,n,k,batch,S,gx,gy,gz);
       if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%u) block=(128,1,1) m=%d n=%d k=%d out=%d S=%d\n",kname,gx,gy,gz,m,n,k,out_dtype,S);
       tinycudart_count_launch(kname); double t0=tinycudart_now_ns();
-      tinynv_status_t st = tinynv_launch(h->stream, kk, gx,gy,gz, 128,1,1, 0, &q2, sizeof(q2));
+      // Through blas_launch like every other GEMM: a direct tinynv_launch ran past an active capture, once, and was absent
+      // from every replay (2026-11-18, SD 1.5 on the 3060: 45 launches a capture instead of 46, a noise image).
+      tinynv_status_t st = blas_launch(h->stream, kk, kname, gx,gy,gz, 128,1,1, &q2, sizeof(q2));
       tinycudart_time_launch(kname, tinycudart_now_ns()-t0);
       return st==TINYNV_OK ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_EXECUTION_FAILED;
     }
