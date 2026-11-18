@@ -14,3 +14,4 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 "$work/test-pick" "$R/cuda-shim/libtinycudart"
 "$work/test-fwsec"
 python3 "$R/tools/test-pci-preflight.py"
+python3 "$R/tools/nv_flr_check.py" --selftest
