@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated 2026-11-19, at main `a7a0622`. What is in flight, what is next, and what each step needs. Gates are explicit:
+Updated 2026-11-19, at main `7d3177c`. What is in flight, what is next, and what each step needs. Gates are explicit:
 "card" means the step runs on the GPU, "fault" means it deliberately breaks the card's session and can panic macOS
 (owner present and agreeing, every time), "outward" means it publishes or sends something (owner's go first).
 
@@ -29,7 +29,7 @@ followed". Step B (2026-11-19) cut a server-death storm from 129 faults over 32 
 | # | Item | Gate |
 |---|---|---|
 | 1 | M4 fault test on the card: client `kill -9` with the server alive (H2); server death while the client is idle | card, fault |
-| 2 | The server the bmclear helper starts now logs to `logs/tinygpu-server.log` but still without the M6 wrapper (no exit status, no DART snapshot): start it through `tools/tinygpu-server.sh` | none |
+| 2 | ~~A server the bmclear helper starts runs without the M6 wrapper~~ Done 2026-11-19 (`7d3177c`): it starts through `tools/tinygpu-server.sh start` (script(1), exit status, both DART snapshots), falling back to a direct spawn if the script is missing. Gap: a ~20-50 ms window before script(1) execs the app in which a second, non-waiting helper could start another server (needs a watchdog timing out in that window; judged unrealistic) | none |
 | 3 | M5, make the server harder to kill by accident (`kill_tinygpu.sh`, tinygrad's `pkill -f TinyGPU` path beyond the sentinel file) | none |
 | 4 | Report the real fix upstream: the dext should revoke bus mastering before `CompleteDMA` on session close. Only that closes the H2/H10 class; macuda can only shorten the window | outward |
 
