@@ -69,7 +69,11 @@ the last one in the same millisecond the clear landed (PCI_COMMAND 0x0007 -> 0x0
 transport socket did not set SO_NOSIGPIPE and the offline tests ignored SIGPIPE (and `test_tg_dead` only half-closed its
 server). The clear came from `tinynv-bmclear` run by hand after 11 s. Fixed in b420134 (SO_NOSIGPIPE / MSG_NOSIGNAL;
 `test_tg_sigpipe` kills its server outright with SIGPIPE at its default). M6 worked: exit status 137 and both DART
-snapshots recorded. Evidence: `logs/stepB-20261119-122456/` (local, not in git).
+snapshots recorded. Run 2 on 792aeed, same kill: the client latched the loss (recv EOF), started the helper with
+`--old-pid` equal to the killed pid (LOCAL_PEERPID right), refused further launches and skipped drain and unload; the
+helper started a server and cleared bus mastering. 6 DART faults over 200 ms instead of 129 over 11 s; no panic, no
+latch; the card came back with a cold quiesce (opverify 490/490). Not covered: a loss while the client is idle (M4), and
+the helper-started server runs without the M6 wrapper. Evidence: `logs/stepB-20261119-122456/` (local, not in git).
 
 **Known server killer, neutralised by a sentinel file.** tinygrad's `APLRemotePCIDevice.ensure_app()`
 (`tinygrad-stable/tinygrad/runtime/support/system.py:421-427`, Davinchy/tinygrad 33cd373ad) runs `pkill -f TinyGPU` and
