@@ -240,6 +240,10 @@ static int clear(const char *sock, int old_pid, int old_gone, const char *app, d
   }
 
   int fd = connect_to(sock, reply_timeout);
+  // A waiter that finds a server process not yet listening: most likely the one the lock holder started, which ran out
+  // of time before it listened. Connects only, until it does or the alarm - nothing is replaced or started.
+  for (struct timespec nap = {0, 50 * 1000 * 1000}; fd < 0 && waited && server_process_for(sock); nanosleep(&nap, NULL))
+    fd = connect_to(sock, reply_timeout);
   if (fd < 0) {
     int e = errno, other = server_process_for(sock);
     if (old_alive || other) {

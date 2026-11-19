@@ -282,7 +282,8 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@# the watchdog (M4) with real processes and SIGKILL, against a fake server it plays and counts the starts of: a
 	@# killed client or a killed server gets bus mastering cleared once, a clean exit costs the server no connection, two
 	@# clears at once start one app. Its stand-in app is the test binary itself, never the installed one.
-	@$(BUILD)/test_watchdog $(abspath $(BUILD))/tinynv-bmclear
+	@if [ "$$(uname)" = Darwin ]; then $(BUILD)/test_watchdog $(abspath $(BUILD))/tinynv-bmclear; \
+	 else echo "SKIP (not macOS): test_watchdog - the watchdog watches pids with kqueue and is spawned on macOS only" | tee -a $(SKIPS); fi
 	@if [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_trace.py --selftest; else echo "SKIP (no tinygrad): nv_trace.py --selftest — the boot-trace recorder's coalescing self-check" | tee -a $(SKIPS); fi
 	@# what a cubin references and does not contain, both halves: the device printf resolves, anything else is refused.
 	@# the cubin is build output and not in the repository, so it is made if it is missing rather than assumed.

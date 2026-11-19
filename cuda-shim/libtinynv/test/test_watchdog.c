@@ -21,7 +21,8 @@
 //                 death costs no second clear
 //   5 together    the client's own rescue and the watchdog's server-death trigger: one app start; and two one-shot
 //                 helpers against a dead server in the same instant: one start, both clear
-//   6 off         TINYNV_WATCHDOG=0, TINYNV_EMERGENCY_BM=0: no watchdog process, no clear after kill -9
+//   R             the session lost with the server alive: the client's own rescue clears, the watchdog stands down
+//   6 off        TINYNV_WATCHDOG=0, TINYNV_EMERGENCY_BM=0: no watchdog process, no clear after kill -9
 //   8 slow        the server spends 3 s tearing the dead session down: the clear still lands, inside the hard timeout
 //   exit          an armed client that exits without its teardown (TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL=1's path): cleared
 //   sigpipe       the watchdog killed first, then a clean teardown with SIGPIPE at default: the client exits 0
@@ -86,7 +87,7 @@ static void card_set(uint32_t v) {
 static int role_server(const char *sock) {
   signal(SIGPIPE, SIG_IGN);
   logev("start");
-  const char *td = getenv("WD_TEARDOWN_MS");
+  const char *td = getenv("WD_TEARDOWN_MS"), *drop = getenv("WD_DROP_AFTER");
   double teardown = td ? atof(td) / 1000.0 : 0;
   int l = socket(AF_UNIX, SOCK_STREAM, 0);
   struct sockaddr_un a = {.sun_family = AF_UNIX};
@@ -98,7 +99,9 @@ static int role_server(const char *sock) {
     if (s < 0) { if (errno == EINTR) { conn--; continue; } return 2; }
     logev("accept %d", conn);
     req_t rq;
-    while (recv(s, &rq, sizeof(rq), MSG_WAITALL) == (ssize_t)sizeof(rq)) {
+    // WD_DROP_AFTER=N: the first connection is dropped after N requests and the server stays up - a lost session the
+    // client finds by itself, so its own rescue (M3) runs and the watchdog has to stand down
+    for (int nreq = 0; !(conn == 1 && drop && nreq == atoi(drop)) && recv(s, &rq, sizeof(rq), MSG_WAITALL) == (ssize_t)sizeof(rq); nreq++) {
       resp_t rp = {0};
       if (rq.cmd == CMD_CFG_READ && rq.arg0 == 4) { rp.resp0 = card_get(); logev("read %d %#llx", conn, (unsigned long long)rp.resp0); }
       else if (rq.cmd == CMD_CFG_WRITE && rq.arg0 == 4) { card_set((uint32_t)rq.arg2); logev("write %d %#llx", conn, (unsigned long long)rq.arg2); }
@@ -188,6 +191,7 @@ static void case_env(const char *teardown_ms) {
   setenv("WD_LOG", logp, 1);
   setenv("WD_CARD", card, 1);
   if (teardown_ms) setenv("WD_TEARDOWN_MS", teardown_ms, 1); else unsetenv("WD_TEARDOWN_MS");
+  unsetenv("WD_DROP_AFTER");
   card_set(0x0403);
 }
 static pid_t spawn_server(void) {
@@ -390,6 +394,28 @@ static void case_together(void) {
   case_end(0, 0);
 }
 
+// 'R' on its own: the session lost with the server alive, the client's own rescue clears, the watchdog stands down
+static void case_stand_down(void) {
+  case_env(NULL);
+  setenv("WD_DROP_AFTER", "2", 1);   // the client's read and its write with MASTER, then the connection goes
+  pid_t server = spawn_server(), client = spawn_client("rescue"), wd = 0;
+  children(client, &wd);
+  double t0 = now();
+  kill(client, SIGUSR1);
+  int rc = reap(client, 12);
+  CHECK(rc == 0, "stand down: the client exited %d", rc);
+  CHECK(wd && gone(wd, 3), "stand down: the watchdog did not exit");
+  char want[96];
+  snprintf(want, sizeof(want), "stood down: client pid %d started its own emergency clear", (int)client);
+  CHECK(file_has(errp, want), "stand down: the watchdog did not say \"%s\"", want);
+  CHECK(count("accept", t0, server, NULL) == 1, "stand down: %d connections after the loss, want the rescue's one",
+        count("accept", t0, server, NULL));
+  CHECK(count("start", 0, 0, NULL) == 1 && card_get() == 0x0403, "stand down: an app was started, or the card ends at %#x", card_get());
+  CHECK(!file_has(errp, "client exited without a clean teardown"), "stand down: the watchdog cleared as well");
+  show_err("stand down");
+  case_end(server, wd);
+}
+
 // 6: switched off
 static void case_off(const char *var) {
   case_env(NULL);
@@ -455,6 +481,7 @@ int main(int argc, char **argv) {
   case_killed(1);
   case_server_dies();
   case_together();
+  case_stand_down();
   case_off("TINYNV_WATCHDOG");
   case_off("TINYNV_EMERGENCY_BM");
   case_slow();
