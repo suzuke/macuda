@@ -37,9 +37,12 @@ Whether a ~200 ms storm always stays clear of the `AppleT8110DART` panic is unkn
 
 ## Then: releases
 
-5. **Prebuilt releases.** The bmclear helper's path is baked in as an absolute build-tree path
-   (`-DTINYNV_BMCLEAR_DEFAULT`, libtinynv/Makefile); make it relocatable (next to the dylib) first, then decide the
-   binary set and architectures (sm_86 / sm_89 / sm_120). Gate: outward.
+5. **Prebuilt releases.** Relocatable paths done 2026-11-19: the helper, the firmware, `tinygpu-server.sh` and the
+   server log are found by env override, then beside the executable (`<prefix>/bin`, `<prefix>/libexec/macuda`,
+   `<prefix>/share/macuda`), then the baked build-tree default; a read-only prefix logs to `~/Library/Logs/macuda`.
+   `sh setup.sh stage` (`PREFIX` absolute) copies such a tree locally; a staged sm_86 tree moved elsewhere was checked
+   on the null device. Left: decide the binary set and architectures (sm_86 / sm_89 / sm_120a), build the Linux
+   `/proc/self/exe` branch once, and publish. Gate for publishing: outward.
 6. **RTX 4090 and 5090 checks** when the cards are available: split-K and pointer-array batched GEMM under graph
    capture were verified on the 3060 (sm_86) only. Gate: card.
 
