@@ -555,7 +555,7 @@ int main(int argc, char **argv) {
     const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
     if (!strcmp(a, "--no-start")) { no_start = 1; continue; }
     if (!strcmp(a, "--watch")) { watching = 1; continue; }
-    if (!strcmp(a, "--paths")) {   // where a server started now would be started through and log to; nothing else done
+    if (!strcmp(a, "--paths")) {   // where a server started now would be started through and log to; the only side effect is creating the log directory when the fallback ~/Library/Logs/macuda is chosen
       char sp[PATH_MAX], lp[PATH_MAX];
       server_script(sp, sizeof(sp));
       server_log(lp, sizeof(lp));
