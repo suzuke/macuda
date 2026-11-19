@@ -178,10 +178,15 @@ static int tg_lose(tg_t *tg, const char *what) {
   return tinynv_fail("tinygpu server connection lost (%s)", tg->dead_why);
 }
 
+#ifdef MSG_NOSIGNAL
+#define TG_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define TG_SEND_FLAGS 0
+#endif
 static int xfer_all(tg_t *tg, void *buf, size_t len, int sending) {
   if (tg->dead) return tinynv_fail("tinygpu server connection lost (%s)", tg->dead_why);
   for (size_t off = 0; off < len;) {
-    ssize_t n = sending ? send(tg->fd, (char *)buf + off, len - off, 0) : recv(tg->fd, (char *)buf + off, len - off, 0);
+    ssize_t n = sending ? send(tg->fd, (char *)buf + off, len - off, TG_SEND_FLAGS) : recv(tg->fd, (char *)buf + off, len - off, 0);
     if (n > 0) { off += (size_t)n; continue; }
     // An interrupted call fails this transfer as it always did and latches nothing: a signal is not a lost server,
     // and a latch here would turn the signal handler's bus-master clear (tg_quiesce) into a no-op.
@@ -499,6 +504,13 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
     close(fd);
     return tinynv_fail("tinygpu: no server on %s: %s", sock_path, strerror(errno));
   }
+  // A killed server must cost this process a failed send (EPIPE, latched as a lost server), never a SIGPIPE: most
+  // CUDA programs leave SIGPIPE at its default, and on 2026-11-19 (step B) llama-simple died of it the instant the
+  // server went, before the loss could be latched or bus mastering cleared. Per socket, so the program's own
+  // disposition is left alone; MSG_NOSIGNAL in xfer_all does the same where SO_NOSIGPIPE does not exist.
+#ifdef SO_NOSIGPIPE
+  { int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); }
+#endif
   int buf = 64 << 20;
   setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
