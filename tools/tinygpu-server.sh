@@ -31,11 +31,16 @@
 #   TINYGPU_SOCK        the socket (default ${TMPDIR}tinygpu.sock)
 #   TINYGPU_APP         the app (default the installed TinyGPU)
 #   EGPU_ROOT           where logs/ is: the DART snapshots, and the log unless TINYGPU_SERVER_LOG says otherwise
+#                       (~/Library/Logs/macuda when $EGPU_ROOT/logs cannot be written)
 #   TINYGPU_SERVER_LOG  the server's log (default $R/logs/tinygpu-server.log)
 #   TINYGPU_START_NOWAIT=1  start: do not wait for the socket or probe it; say "started" and exit 0
 SOCK=${TINYGPU_SOCK:-${TMPDIR}tinygpu.sock}
 APP=${TINYGPU_APP:-/Applications/TinyGPU.app/Contents/MacOS/TinyGPU}   # TINYGPU_APP: a stand-in, for testing this script with no card
-R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; LOG=${TINYGPU_SERVER_LOG:-$R/logs/tinygpu-server.log}; mkdir -p "$R/logs"
+R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
+# A release unpacked read-only (make stage puts this script in <prefix>/share/macuda, so $R/logs is <prefix>/share/logs)
+# must still keep its records: the exit status and DART snapshots exist for the one incident nobody can rerun.
+LOGDIR=$R/logs; { mkdir -p "$LOGDIR" 2>/dev/null && [ -w "$LOGDIR" ]; } || { LOGDIR=$HOME/Library/Logs/macuda; mkdir -p "$LOGDIR"; }
+LOG=${TINYGPU_SERVER_LOG:-$LOGDIR/tinygpu-server.log}
 
 alive() { python3 -c "
 import socket, sys
@@ -65,9 +70,9 @@ case "${1:-status}" in
       script -q /dev/null /bin/sh -c '"$0" server "$1"; rc=$?; echo "$(date "+%F %T") tinygpu-server.sh: server exit status $rc (128+N = killed by signal N)"; exit $rc' \
         "$APP" "$SOCK" < /dev/null >> "$LOG" 2>&1
       rc=$?; ts=$(date +%Y%m%d-%H%M%S)
-      echo "$(date '+%F %T') tinygpu-server.sh: script(1) around the server exited $rc (the inner shell's exit code, or the signal that killed it - no status line just above means the shell went with the server); DART snapshots: $R/logs/dart-at-server-exit-$ts.txt{,.5s}" >> "$LOG"
-      dart_snap "$R/logs/dart-at-server-exit-$ts.txt"; sync
-      sleep 5; dart_snap "$R/logs/dart-at-server-exit-$ts.txt.5s"; sync
+      echo "$(date '+%F %T') tinygpu-server.sh: script(1) around the server exited $rc (the inner shell's exit code, or the signal that killed it - no status line just above means the shell went with the server); DART snapshots: $LOGDIR/dart-at-server-exit-$ts.txt{,.5s}" >> "$LOG"
+      dart_snap "$LOGDIR/dart-at-server-exit-$ts.txt"; sync
+      sleep 5; dart_snap "$LOGDIR/dart-at-server-exit-$ts.txt.5s"; sync
     ) > /dev/null 2>&1 &
     [ "${TINYGPU_START_NOWAIT:-}" = 1 ] && { echo "started (wrapper pid $!); not waiting for the socket (TINYGPU_START_NOWAIT=1)"; exit 0; }
     echo "started (wrapper pid $!), waiting for the socket"

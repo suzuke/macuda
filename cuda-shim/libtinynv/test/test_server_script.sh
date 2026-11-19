@@ -62,6 +62,20 @@ check 'wait_grep "$TINYGPU_SERVER_LOG" "server exit status 143"' "SIGTERM: no 's
 wait_snaps .5s 2
 check '[ "$(nsnaps .5s)" = 2 ] && ! grep -q "exit status 143" "$log"' "TINYGPU_SERVER_LOG: the snapshots are not in EGPU_ROOT/logs, or the output went to the default log"
 
+# a read-only EGPU_ROOT/logs (a release unpacked where it cannot write): the log and both snapshots go to
+# $HOME/Library/Logs/macuda instead - HOME a temp dir here, never the real one
+unset TINYGPU_SERVER_LOG TINYGPU_START_NOWAIT
+chmod 555 "$d/root/logs"; mkdir -p "$d/home"
+hl=$d/home/Library/Logs/macuda
+out=$(HOME=$d/home sh "$SCRIPT" start 2>&1); rc=$?
+check '[ $rc = 0 ]' "read-only logs/: start rc $rc, output: $out"
+p=$(app_pid)
+[ -n "$p" ] && kill -9 $p
+check 'wait_grep "$hl/tinygpu-server.log" "server exit status 137"' "read-only logs/: no exit status in $hl/tinygpu-server.log"
+i=0; while [ "$(ls "$hl" 2>/dev/null | grep -c '^dart-at-server-exit-.*\.txt\.5s$')" -lt 1 ] && [ $i -lt 120 ]; do i=$((i+1)); sleep 0.1; done
+check '[ "$(ls "$hl" | grep -c "^dart-at-server-exit-.*\.txt$")" = 1 ] && [ "$(ls "$hl" | grep -c "^dart-at-server-exit-.*\.txt\.5s$")" = 1 ]' "read-only logs/: want both snapshots in $hl, have: $(ls "$hl" 2>/dev/null | tr '\n' ' ')"
+chmod 755 "$d/root/logs"
+
 # nothing real touched
 check '[ "$(real_stat)" = "$real_before" ]' "the real socket $real_sock changed: $real_before -> $(real_stat)"
 check '[ "$(pgrep -f "TinyGPU server" | tr "\n" " ")" = "$server_before" ]' "the real server changed: '$server_before'"
