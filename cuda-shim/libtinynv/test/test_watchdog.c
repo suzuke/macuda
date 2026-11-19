@@ -598,6 +598,10 @@ static void case_script(void) {
   if (starts == 1) kill(st.pid, SIGHUP);
   nap(0.3);
   CHECK(starts == 1 && running(st.pid), "script: the started app died of SIGHUP");
+  // one connection to the new server, the clear's: the script's own liveness probe - a connect, about 0.1 s after the
+  // socket appears, into the listen(1) backlog - is off for the helper (TINYGPU_START_NOWAIT). Counted a second on.
+  nap(0.7);
+  CHECK(starts == 1 && count("accept", 0, st.pid, NULL) == 1, "script: the started server saw %d connections, want the clear's one", count("accept", 0, st.pid, NULL));
   char lock[200];
   snprintf(lock, sizeof(lock), "%s.bmclear.lock", sock);
   int lf = open(lock, O_RDWR | O_CLOEXEC);
