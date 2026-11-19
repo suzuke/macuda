@@ -174,7 +174,7 @@ sh tools/tinygpu-sentinel.sh create   # 新的 tinygrad checkout 可能固定別
 
 - **卡不見、`pci-dart-error-data` 旗標被設、連結檢查失敗**：關掉外接盒電源、重插，再跑 `sh tools/preflight.sh`。
   沒有任何腳本能代替實體重插。
-- **preflight 說「nub re-enumerated」或「newer dext instance」而 ABORT**（重插、重開機後常見）：這是 preflight 在提醒
+- **preflight 說「nub re-enumerated」或「a new dext instance」（NEWER than the record）而 ABORT**（重插、重開機後常見）：這是 preflight 在提醒
   「機器變了」。先由人確認卡狀態正常（為什麼重開機、卡是否重插好），再執行 `sh tools/dart-stale.sh --clear`，
   然後重跑 preflight。只有在 preflight 自己提示這一步時才用 `--clear`。
 - **preflight 說「DART ERROR DATA PRESENT」**：旗標要重新列舉（重插、睡眠喚醒或重開機）才會消失，`--clear` 沒有用，
