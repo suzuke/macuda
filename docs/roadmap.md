@@ -1,16 +1,25 @@
 # Roadmap
 
-Updated 2026-11-19, at main `0e4b06f`. What is in flight, what is next, and what each step needs. Gates are explicit:
+Updated 2026-11-19, at main `a7a0622`. What is in flight, what is next, and what each step needs. Gates are explicit:
 "card" means the step runs on the GPU, "fault" means it deliberately breaks the card's session and can panic macOS
 (owner present and agreeing, every time), "outward" means it publishes or sends something (owner's go first).
 
-## In flight
+## Done 2026-11-19: M4, the out-of-process watchdog (main `a7a0622`)
 
-- **M4, the out-of-process watchdog** (branch `feat/dart-m4`). One watchdog process per CUDA program clears bus
-  mastering when the client dies without a clean teardown (H2: client SIGKILLed while the server lives) or when the
-  server dies while the client is idle - the two cases M2/M3 cannot see. Clean exits make no connection to the server; a
-  lock keeps the client's own rescue and the watchdog from starting two servers. Offline tests first, then a normal-path
-  run on the card (no leftover watchdog, back-to-back steps not refused), then merge.
+One `tinynv-bmclear --watch` per TinyGPU session clears bus mastering when the last process holding the session goes
+without a teardown that read mastering back off (kill -9, crash, exit without teardown, closed stdio, a fork that
+re-arms), and when the server dies under an armed client, retrying with backoff. Clean exits make no connection to the
+server. Four fresh-context review rounds (three refuted, then confirmed); 132 offline checks; normal path on the 3060
+(opverify 490/490, server probe byte-identical, no leftover watchdog, no extra connections). Not yet fault-tested on the
+card (item 1 below). Documented gaps, judged unlikely in real use:
+- after the client is gone there is one clear of at most ~10 s: a server that takes longer to finish the dead session,
+  or a replacement app that takes over ~20 s to listen, leaves mastering on;
+- an idle client's retry that lands while another client is being served writes nothing, but its closed connection
+  sits in the server's backlog until that session ends (a third program is refused meanwhile);
+- the retry has no attempt limit while the client lives (every 80 s at most); a manual `tinygpu-server.sh start` within
+  the ~50 ms before the app is exec'd could race a retry into a second server (not reproduced);
+- if the pipe cannot be moved above fd 2 (descriptor table full with stdio closed) the session runs without a watchdog;
+- the watchdog is the client's child for the client's whole life (a host looping on `wait()` until ECHILD would block).
 
 ## Next: finishing the DART guard
 
@@ -19,8 +28,8 @@ followed". Step B (2026-11-19) cut a server-death storm from 129 faults over 32 
 
 | # | Item | Gate |
 |---|---|---|
-| 1 | M4 fault test on the card: client `kill -9` with the server alive; server death while the client is idle | card, fault |
-| 2 | The server the bmclear helper starts runs without the M6 wrapper (no exit status, no DART snapshot): start it through `tools/tinygpu-server.sh` | none |
+| 1 | M4 fault test on the card: client `kill -9` with the server alive (H2); server death while the client is idle | card, fault |
+| 2 | The server the bmclear helper starts now logs to `logs/tinygpu-server.log` but still without the M6 wrapper (no exit status, no DART snapshot): start it through `tools/tinygpu-server.sh` | none |
 | 3 | M5, make the server harder to kill by accident (`kill_tinygpu.sh`, tinygrad's `pkill -f TinyGPU` path beyond the sentinel file) | none |
 | 4 | Report the real fix upstream: the dext should revoke bus mastering before `CompleteDMA` on session close. Only that closes the H2/H10 class; macuda can only shorten the window | outward |
 
