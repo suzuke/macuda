@@ -157,7 +157,12 @@ static int role_client(const char *mode, const char *sock) {
   uint32_t cmd = p.cfg_read(&p, 4, 2);
   if (strcmp(mode, "unarmed")) p.cfg_write(&p, 4, 2, cmd | 4);
   // what any program (and libtinynv's own fprintf) does with a closed fd 2: write to it anyway
-  if (getenv("WD_CLOSE")) { static const char m[] = "client: a line for stderr, which is closed\n"; if (write(2, m, sizeof(m) - 1) < 0) {} }
+  // - and to a closed stdout: with the pipe's write end there, the 'C' in this line was the watchdog's last byte
+  if (getenv("WD_CLOSE")) {
+    static const char m[] = "client: a line for stderr, which is closed\n", o[] = "Client: armed, not Clean - a line for stdout\n";
+    if (write(2, m, sizeof(m) - 1) < 0) {}
+    if (strchr(getenv("WD_CLOSE"), '1') && write(1, o, sizeof(o) - 1) < 0) {}
+  }
   logev("armed %s", mode);
   int sig;
   sigwait(&us, &sig);
