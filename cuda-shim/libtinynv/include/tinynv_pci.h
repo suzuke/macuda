@@ -113,6 +113,11 @@ static inline void tinynv_dma_bind_host(tinynv_dma_t *d) {
 
 // backends. each returns 0 on success and fills *out; on failure it reports through tinynv_last_error().
 int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out); // any host with the TinyGPU.app server (macOS)
+// The emergency bus-master clear (tools/tinynv_bmclear.c) this process would start when TINYNV_BMCLEAR_HELPER is unset:
+// beside the executable, <prefix>/libexec/macuda, then the build tree (src/exe_path.h has the layout). Looked up once
+// per process - the open above calls it, so the crash path only reads the stored result - and said on stderr only when
+// it is not the build tree's, or loudly when there is none.
+const char *tinynv_pci_bmclear_helper(void);
 // TINYNV_RPC_STATS=1: mark the end of the boot, so the exit report separates what the boot cost from what came after
 void tinynv_rpc_stats_boot_done(void);
 #ifdef __linux__

@@ -2,6 +2,9 @@
 // reached over a unix socket. Wire format and semantics: docs/driver/architecture.md §2 (identical to the python client in
 // tinygrad/runtime/support/system.py, so the two can be diffed). Writes are posted and carry no reply; reads are round trips.
 #include "internal.h"
+#include "exe_path.h"
+#include <limits.h>
+#include <pthread.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,10 +20,49 @@
 #include <unistd.h>
 
 extern char **environ;
-// tools/tinynv_bmclear.c, built beside this library; the Makefile bakes in where. TINYNV_BMCLEAR_HELPER overrides it.
+// tools/tinynv_bmclear.c, built beside this library; the Makefile bakes in where. TINYNV_BMCLEAR_HELPER overrides it,
+// and a release's copy beside the executable comes before the baked path (tinynv_pci_bmclear_helper).
 #ifndef TINYNV_BMCLEAR_DEFAULT
 #define TINYNV_BMCLEAR_DEFAULT "tinynv-bmclear"
 #endif
+
+// Resolved ONCE, before any session exists (tinynv_pci_open_tinygpu calls this first), and only read afterwards:
+// tg_rescue can run inside the crash handler, where realpath and stat have no business. The environment override is
+// not part of it - it is read where the helper is started, as it always was, and when it is set at resolve time
+// nothing is said here. The first executable file of: <exe dir>/tinynv-bmclear, <prefix>/libexec/macuda/tinynv-bmclear,
+// the baked TINYNV_BMCLEAR_DEFAULT. Said once when that is not the baked one (a developer build, whose test binaries
+// sit beside it, stays quiet); said loudly when there is none, because then a lost server or a killed client leaves
+// bus mastering on and nothing will clear it.
+static char bm_found[PATH_MAX];
+static pthread_once_t bm_once = PTHREAD_ONCE_INIT;
+static void bm_resolve(void) {
+  const char *env = getenv("TINYNV_BMCLEAR_HELPER");
+  int quiet = env && *env;
+  char dir[PATH_MAX], pre[PATH_MAX], cand[3][PATH_MAX + 48];
+  int nc = 0;
+  if (!tinynv_exe_dir(dir, sizeof(dir))) {
+    snprintf(cand[nc++], sizeof(cand[0]), "%s/tinynv-bmclear", dir);
+    if (!tinynv_exe_prefix(dir, pre, sizeof(pre))) snprintf(cand[nc++], sizeof(cand[0]), "%s/libexec/macuda/tinynv-bmclear", pre);
+  }
+  snprintf(cand[nc++], sizeof(cand[0]), "%s", TINYNV_BMCLEAR_DEFAULT);
+  for (int i = 0; i < nc; i++) {
+    if (!tinynv_is_exec(cand[i])) continue;
+    int baked = i == nc - 1 || tinynv_same_file(cand[i], TINYNV_BMCLEAR_DEFAULT);
+    snprintf(bm_found, sizeof(bm_found), "%s", baked ? TINYNV_BMCLEAR_DEFAULT : cand[i]);
+    if (!baked && !quiet)
+      fprintf(stderr, "libtinynv: tinynv-bmclear from %s (relative to the executable; TINYNV_BMCLEAR_HELPER overrides it)\n", bm_found);
+    return;
+  }
+  snprintf(bm_found, sizeof(bm_found), "%s", TINYNV_BMCLEAR_DEFAULT);   // so a start fails with this name, as it did
+  if (quiet) return;
+  char looked[3 * (PATH_MAX + 48) + 8] = "";
+  for (int i = 0; i < nc; i++) { strcat(looked, i ? ", " : ""); strcat(looked, cand[i]); }
+  fprintf(stderr, "libtinynv: no tinynv-bmclear found (looked in %s): no emergency bus-master clear and no watchdog\n", looked);
+}
+const char *tinynv_pci_bmclear_helper(void) {
+  pthread_once(&bm_once, bm_resolve);
+  return bm_found;
+}
 
 enum {
   CMD_PROBE = 0, CMD_MAP_BAR, CMD_MAP_SYSMEM_FD, CMD_CFG_READ, CMD_CFG_WRITE, CMD_RESET,
@@ -489,7 +531,7 @@ static void tg_rescue(tinynv_pci_t *p, double wait_s) {
       return;
     }
     const char *helper = getenv("TINYNV_BMCLEAR_HELPER");
-    if (!helper || !*helper) helper = TINYNV_BMCLEAR_DEFAULT;
+    if (!helper || !*helper) helper = bm_found;   // resolved at open (bm_resolve): no lookup here, this may be the crash handler
     char pid[16];
     snprintf(pid, sizeof(pid), "%d", tg->peer_pid);
     char *argv[] = {(char *)helper, "--sock", tg->path, "--old-pid", pid, NULL};
@@ -590,7 +632,7 @@ static void tg_watch(tg_t *tg) {
     return;
   }
   const char *helper = getenv("TINYNV_BMCLEAR_HELPER");
-  if (!helper || !*helper) helper = TINYNV_BMCLEAR_DEFAULT;
+  if (!helper || !*helper) helper = bm_found;   // resolved by tinynv_pci_open_tinygpu before this
   int pfd[2];
   // no pipe2 here: see NOT ATOMIC above for the window before the two fcntls below
   if (pipe(pfd)) { fprintf(stderr, "libtinynv: no watchdog: pipe: %s\n", strerror(errno)); return; }
@@ -651,6 +693,7 @@ static void tg_watch(tg_t *tg) {
 }
 
 int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
+  tinynv_pci_bmclear_helper();   // first, outside any handler: tg_rescue and tg_watch only read what it stored
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
   if (strlen(sock_path) >= sizeof(addr.sun_path)) return tinynv_fail("tinygpu: socket path is too long");
   strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);

@@ -13,8 +13,9 @@
 
 typedef struct { uint8_t *data; size_t size; } tinynv_blob_t;
 
-// Where firmware images live, in order: a root the program set explicitly, then $TINYNV_FW_DIR, then the directory the
-// library was built against. Never the working directory: a relative default means the same binary finds the firmware
+// Where firmware images live, in order: a root the program set explicitly, then $TINYNV_FW_DIR, then a release's
+// <prefix>/share/macuda/firmware beside the executable (exe_path.h), then the directory the library was built against.
+// Never the working directory: a relative default means the same binary finds the firmware
 // from one directory and silently does not from another, and "not found" here degrades into a test that passes without
 // testing anything. Session A hit exactly that and nearly reported a boot as verified from a run that never reached it.
 const char *tinynv_fw_root(void);

@@ -35,6 +35,7 @@
 // helper's open and its flock would hand the two of them different locks.
 //
 //   tinynv-bmclear --watch [--old-pid N]       (socket in $TINYNV_BMCLEAR_SOCK, the client's clean channel on fd 3)
+//   tinynv-bmclear --paths                     the server script and log a start would use (server_script, server_log)
 //
 // WATCH MODE: M4, the watchdog libtinynv starts beside every TinyGPU session (pci_tinygpu.c: tg_watch). M2 and M3 need
 // a client alive to notice; two ways out had nobody: the client killed or crashed under a live server, which then
@@ -87,6 +88,7 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include "../src/exe_path.h"
 
 extern char **environ;
 
@@ -108,6 +110,43 @@ static const char *server_log_default = TINYNV_SERVER_LOG_DEFAULT;
 #define TINYNV_SERVER_SCRIPT_DEFAULT ""
 #endif
 static const char *server_script_default = TINYNV_SERVER_SCRIPT_DEFAULT;
+
+// Where those two are for THIS helper, which may be a release unpacked anywhere rather than the build tree the defaults
+// above name (src/exe_path.h has the layout; the prefix is the parent of bin/, or of libexec/macuda/ when the helper sits
+// there). An environment override is terminal even when it names nothing: the tests point TINYGPU_SERVER_SCRIPT at a
+// path that does not exist to get the direct spawn, and falling through would start their servers through the real
+// script instead.
+//   script: TINYGPU_SERVER_SCRIPT, else <prefix>/share/macuda/tinygpu-server.sh if readable, else the baked one.
+//   log:    TINYGPU_SERVER_LOG, else the baked repo log when its directory exists, else
+//           $HOME/Library/Logs/macuda/tinygpu-server.log (the directory created), else /dev/null.
+static void server_script(char *out, size_t n) {
+  const char *e = getenv("TINYGPU_SERVER_SCRIPT");
+  char dir[PATH_MAX], pre[PATH_MAX], cand[PATH_MAX + 48];
+  if (e && *e) { snprintf(out, n, "%s", e); return; }
+  if (!tinynv_exe_dir(dir, sizeof(dir)) && !tinynv_exe_prefix(dir, pre, sizeof(pre))) {
+    snprintf(cand, sizeof(cand), "%s/share/macuda/tinygpu-server.sh", pre);
+    if (tinynv_is_readable(cand)) { snprintf(out, n, "%s", cand); return; }
+  }
+  snprintf(out, n, "%s", server_script_default);
+}
+static int mkdirs(char *p) {   // mkdir -p, in place; 0 when p is a directory afterwards
+  for (char *s = p + 1; *s; s++)
+    if (*s == '/') { *s = 0; int r = mkdir(p, 0755); *s = '/'; if (r && errno != EEXIST) return -1; }
+  return mkdir(p, 0755) && errno != EEXIST ? -1 : !tinynv_is_dir(p);
+}
+static void server_log(char *out, size_t n) {
+  const char *e = getenv("TINYGPU_SERVER_LOG"), *home = getenv("HOME");
+  if (e && *e) { snprintf(out, n, "%s", e); return; }
+  char d[PATH_MAX];
+  snprintf(d, sizeof(d), "%s", server_log_default);
+  char *slash = strrchr(d, '/');
+  if (slash && slash != d) { *slash = 0; if (tinynv_is_dir(d)) { snprintf(out, n, "%s", server_log_default); return; } }
+  if (home && *home && snprintf(d, sizeof(d), "%s/Library/Logs/macuda", home) < (int)sizeof(d) && !mkdirs(d)) {
+    snprintf(out, n, "%s/tinygpu-server.log", d);
+    return;
+  }
+  snprintf(out, n, "/dev/null");
+}
 
 static void say(const char *fmt, ...) {
   char ts[32];
@@ -202,14 +241,14 @@ static int g_patient;
 //     tinygpu.sock` (found by review, 2026-11-19). SIGHUP stays ignored, as the script's `trap '' HUP` has it: the
 //     server outlives the terminal it was started from.
 //   - Its output goes to the server log the script writes (TINYGPU_SERVER_LOG, else the repo's
-//     logs/tinygpu-server.log, baked in at build), appended, with one line first saying who started it and why. Never
+//     logs/tinygpu-server.log, baked in at build, else ~/Library/Logs/macuda: server_log), appended, with one line first saying who started it and why. Never
 //     the client's stderr: a server holding that would keep a pipe reading the client's log open for its whole life.
 //     A log that cannot be opened is /dev/null.
 // THROUGH THE SCRIPT (M6 for this helper). A server started here exists only right after an incident, and is the one
 // whose death matters most - yet started directly it left no exit status and no DART snapshot. So it is started as
-// `/bin/sh SCRIPT start` (TINYGPU_SERVER_SCRIPT, else tools/tinygpu-server.sh baked in at build), which runs the app
-// under script(1), writes its exit status and snapshots pci-dart-error-data from a subshell of its own that outlives
-// this process. The script is handed the socket (TINYGPU_SOCK), the app (TINYGPU_APP), the log opened here
+// `/bin/sh SCRIPT start` (TINYGPU_SERVER_SCRIPT, else a release's share/macuda copy, else tools/tinygpu-server.sh baked in at
+// build: server_script), which runs the app under script(1), writes its exit status and snapshots pci-dart-error-data
+// from a subshell of its own that outlives this process. The script is handed the socket (TINYGPU_SOCK), the app (TINYGPU_APP), the log opened here
 // (TINYGPU_SERVER_LOG, so the line below and the server's output are one file; /dev/null if it could not be opened,
 // where the script's own `>> LOG` would otherwise fail and start nothing) and TINYGPU_START_NOWAIT=1: this process
 // waits for the socket with its own connects, and the script's probe would be one more connect into the new server's
@@ -229,9 +268,10 @@ static int start_server(const char *app, const char *sock) {
   if (!lstat(sock, &st) && !S_ISSOCK(st.st_mode)) { say("%s exists and is not a socket; not starting a server on it", sock); return -1; }
   unlink(sock);   // a stale socket file: nothing accepts on it (checked above) and no process serves it
   char why[PATH_MAX + 128] = "";   // why the output goes to /dev/null, when the log could not be opened
-  const char *log = getenv("TINYGPU_SERVER_LOG");
-  if (!log || !*log) log = server_log_default;
-  if (!log || !*log) log = "/dev/null";
+  char logp[PATH_MAX], scriptp[PATH_MAX];
+  server_log(logp, sizeof(logp));
+  server_script(scriptp, sizeof(scriptp));
+  const char *log = logp;
   int lfd = open(log, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
   if (lfd < 0) {
     snprintf(why, sizeof(why), " (the server log %s could not be opened: %s)", log, strerror(errno));
@@ -242,8 +282,7 @@ static int start_server(const char *app, const char *sock) {
   }
   // an app that cannot run is a start that fails here, as the direct spawn's did, not a script waiting on nothing
   if (access(app, X_OK)) { int e = errno; close(lfd); say("could not start %s server %s: %s", app, sock, strerror(e)); return -1; }
-  const char *script = getenv("TINYGPU_SERVER_SCRIPT");
-  if (!script || !*script) script = server_script_default;
+  const char *script = scriptp;
   char fell[PATH_MAX + 160] = "";   // why the app is started directly, when it is
   if (!script || !*script) snprintf(fell, sizeof(fell), "no server script is configured (TINYGPU_SERVER_SCRIPT)");
   else if (access(script, R_OK)) snprintf(fell, sizeof(fell), "the server script %s cannot be read (%s)", script, strerror(errno));
@@ -516,6 +555,13 @@ int main(int argc, char **argv) {
     const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
     if (!strcmp(a, "--no-start")) { no_start = 1; continue; }
     if (!strcmp(a, "--watch")) { watching = 1; continue; }
+    if (!strcmp(a, "--paths")) {   // where a server started now would be started through and log to; nothing else done
+      char sp[PATH_MAX], lp[PATH_MAX];
+      server_script(sp, sizeof(sp));
+      server_log(lp, sizeof(lp));
+      printf("script %s\nlog %s\n", sp, lp);
+      return 0;
+    }
     if (!v) { fprintf(stderr, "tinynv-bmclear: %s needs a value\n", a); return 2; }
     if (!strcmp(a, "--sock")) sock = v;
     else if (!strcmp(a, "--old-pid")) old_pid = atoi(v);

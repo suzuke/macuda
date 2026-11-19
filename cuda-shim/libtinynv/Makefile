@@ -103,9 +103,23 @@ $(BUILD)/tinynv-smi: tools/tinynv_smi.c $(BUILD)/libtinynv.a
 
 # The emergency bus-master clear a client starts when it has lost its TinyGPU server (tools/tinynv_bmclear.c). Built
 # with the library, which finds it at this absolute path (TINYNV_BMCLEAR_HELPER overrides it).
-$(BUILD)/tinynv-bmclear: tools/tinynv_bmclear.c
+$(BUILD)/tinynv-bmclear: tools/tinynv_bmclear.c src/exe_path.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ $<
+
+# test/test_paths.sh's binaries. test_paths comes from the pattern rule below, with the build tree's defaults. The other
+# two are built with defaults that do not exist, as on a machine that never had this build tree: the library's two
+# lookups compiled into the test itself (the archive's pci_tinygpu.o and fw.o are then never pulled in, as with
+# test_teardown_term's tinynv.c), and the helper with its baked log in a directory the test makes and removes.
+NOBAKE := -UTINYNV_BMCLEAR_DEFAULT -DTINYNV_BMCLEAR_DEFAULT=\"/nonexistent/baked/tinynv-bmclear\" \
+          -UTINYNV_FW_DEFAULT_DIR -DTINYNV_FW_DEFAULT_DIR=\"/nonexistent/baked/firmware\"
+$(BUILD)/test_paths_nobake: test/test_paths.c src/pci_tinygpu.c src/fw.c src/exe_path.h $(BUILD)/libtinynv.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(NOBAKE) -Isrc test/test_paths.c src/pci_tinygpu.c src/fw.c $(BUILD)/libtinynv.a -o $@
+$(BUILD)/tinynv-bmclear-paths: tools/tinynv_bmclear.c src/exe_path.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -UTINYNV_SERVER_LOG_DEFAULT -DTINYNV_SERVER_LOG_DEFAULT=\"$(abspath $(BUILD))/paths-bakedlogs/tinygpu-server.log\" \
+	  -UTINYNV_SERVER_SCRIPT_DEFAULT -DTINYNV_SERVER_SCRIPT_DEFAULT=\"/nonexistent/baked/tinygpu-server.sh\" -o $@ $<
 
 $(BUILD)/test_headers: test/test_headers.c src/nv_structs.h
 	@mkdir -p $(@D)
@@ -210,7 +224,7 @@ test: export TINYGPU_SERVER_LOG := /dev/null
 # that does not exist is the helper's direct spawn. test_watchdog turns the script on for its own cases, with EGPU_ROOT
 # a temp directory of its own; test_server_script.sh drives the script with every path it takes pointed at stand-ins.
 test: export TINYGPU_SERVER_SCRIPT := /nonexistent/tools/tinygpu-server.sh
-test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_tg_sigpipe $(BUILD)/test_lost $(BUILD)/test_bmclear $(BUILD)/tinynv-bmclear $(BUILD)/test_watchdog $(BUILD)/test_teardown_lost $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_tg_sigpipe $(BUILD)/test_lost $(BUILD)/test_bmclear $(BUILD)/tinynv-bmclear $(BUILD)/test_paths $(BUILD)/test_paths_nobake $(BUILD)/tinynv-bmclear-paths $(BUILD)/test_watchdog $(BUILD)/test_teardown_lost $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@mkdir -p $(BUILD); : > $(SKIPS)
 	@if [ -z "$(HAVE_TINYGRAD)" ] && [ -n "$(STRICT)" ]; then echo "FAIL: TINYNV_REQUIRE_TINYGRAD=1 but $(PYTHON) cannot import tinygrad (tinygrad.helpers, tinygrad.runtime.autogen.nv_570, test.unit.test_remote_pci; TINYGRAD_SRC=$${TINYGRAD_SRC:-$(abspath ../../tinygrad)}; see env.sh)"; exit 1; fi
 	@[ -n "$(HAVE_TINYGRAD)" ] || echo "  no tinygrad (TINYGRAD_SRC, see env.sh): the steps that need it say SKIP (no tinygrad) and the rest runs; TINYNV_REQUIRE_TINYGRAD=1 fails instead"
@@ -291,6 +305,10 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@# nothing written to a device that reads all ones or through a server that does not answer; the hard timeout holds.
 	@# Every path it could take to the real server or app is overridden, and it is told the helper by absolute path.
 	@$(BUILD)/test_bmclear $(abspath $(BUILD))/tinynv-bmclear
+	@# where a release unpacked anywhere finds its helper, firmware and server script (src/exe_path.h), and that a
+	@# developer build still finds the build tree's and says nothing: the binaries copied into temp prefixes, HOME a temp
+	@# directory so the log fallback never writes the real ~/Library/Logs.
+	@sh test/test_paths.sh $(abspath $(BUILD)) $(abspath third_party/firmware)
 	@# the watchdog (M4) with real processes and SIGKILL, against a fake server it plays and counts the starts of: a
 	@# killed client or a killed server gets bus mastering cleared once, a clean exit costs the server no connection, two
 	@# clears at once start one app. Its stand-in app is the test binary itself, never the installed one.

@@ -1,6 +1,8 @@
 #include "fw.h"
 #include "internal.h"
 #include "sha256.h"
+#include "exe_path.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,11 +15,27 @@ static const char *fw_root_override;
 
 void tinynv_fw_set_root(const char *dir) { fw_root_override = dir; }
 
+// The release layout's firmware (exe_path.h): <prefix>/share/macuda/firmware for a program at <prefix>/bin/X, when it
+// is a directory, else the build tree's. Looked up once per process; said on stderr only when it is not the build
+// tree's, so a developer run stays quiet and a release says where its firmware came from.
+static char fw_found[PATH_MAX];
+static pthread_once_t fw_once = PTHREAD_ONCE_INIT;
+static void fw_resolve(void) {
+  char dir[PATH_MAX], pre[PATH_MAX], cand[PATH_MAX + 32];
+  snprintf(fw_found, sizeof(fw_found), "%s", TINYNV_FW_DEFAULT_DIR);
+  if (tinynv_exe_dir(dir, sizeof(dir)) || tinynv_exe_prefix(dir, pre, sizeof(pre))) return;
+  snprintf(cand, sizeof(cand), "%s/share/macuda/firmware", pre);
+  if (!tinynv_is_dir(cand) || tinynv_same_file(cand, TINYNV_FW_DEFAULT_DIR)) return;
+  snprintf(fw_found, sizeof(fw_found), "%s", cand);
+  fprintf(stderr, "libtinynv: firmware from %s (relative to the executable; TINYNV_FW_DIR overrides it)\n", fw_found);
+}
+
 const char *tinynv_fw_root(void) {
   if (fw_root_override && *fw_root_override) return fw_root_override;
   const char *e = getenv("TINYNV_FW_DIR");
   if (e && *e) return e;
-  return TINYNV_FW_DEFAULT_DIR;
+  pthread_once(&fw_once, fw_resolve);
+  return fw_found;
 }
 
 int tinynv_fw_load(const char *chip_dir, const char *name, const char *sha256_hex, tinynv_blob_t *out) {

@@ -66,6 +66,8 @@ STOP(tinynv_mm_check_fw_carveout, int, const tinynv_mm_t *mm, uint64_t lo, uint6
 STOP(tinynv_vmap_free, void, tinynv_mm_t *mm, tinynv_vmap_t *v)
 STOP(tinynv_va_tag_set, void, const char *tag)
 STOP(tinynv_pci_open_tinygpu, int, const char *s, tinynv_pci_t *out)
+STOP(tinynv_pci_bmclear_helper, const char *, void)   // TINYNV_PATHS=1 only
+STOP(tinynv_fw_root, const char *, void)
 STOP(tinynv_rd32, uint32_t, tinynv_dev_t *d, uint64_t off)
 STOP(tinynv_gsp_init_objects, int, tinynv_gpu_t *g)
 STOP(tinynv_gsp_init_channel, int, tinynv_gpu_t *g)

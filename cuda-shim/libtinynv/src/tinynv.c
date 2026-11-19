@@ -18,6 +18,7 @@
 #include "nv_regs.h"
 #include "fw_layout.h"
 #include "arch_compat.h"
+#include "fw.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -450,6 +451,14 @@ tinynv_status_t tinynv_init(void) {
   pthread_mutex_lock(&g_lock);
   if (g_inited) { pthread_mutex_unlock(&g_lock); return TINYNV_OK; }
   memset(&g_dev, 0, sizeof(g_dev));
+  // TINYNV_PATHS=1: say which helper and firmware this process would use (src/exe_path.h), even on the null device,
+  // which otherwise looks up neither - the one way to check a release's layout without a card.
+  const char *pv = getenv("TINYNV_PATHS");
+  if (pv && !strcmp(pv, "1")) {
+    const char *h = getenv("TINYNV_BMCLEAR_HELPER");
+    if (!h || !*h) h = tinynv_pci_bmclear_helper();
+    fprintf(stderr, "libtinynv: paths (TINYNV_PATHS=1): tinynv-bmclear %s, firmware %s\n", h, tinynv_fw_root());
+  }
   // a real device when one can be opened. the socket is how macOS reaches the gpu; TINYNV_PCI names a linux device instead
   const char *sock = getenv("TINYNV_SOCKET");
   // Empty is not a device name, it is the absence of one - which is how every other knob in this library reads its
