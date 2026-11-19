@@ -46,8 +46,8 @@ free_gb=$(df -g . | awk 'NR==2{print $4}')
 if system_profiler SPPCIDataType 2>/dev/null | grep -q "Vendor ID: 0x10de"; then
   ok "an NVIDIA card is on the PCI bus"
 else
-  note "no NVIDIA card found on the PCI bus — everything still BUILDS, but nothing can run until an RTX 5090 is"
-  note "  plugged in over Thunderbolt (that hardware is the point of the project; see README §What you need)"
+  note "no NVIDIA card found on the PCI bus — everything still BUILDS, but nothing can run until an RTX 5090, 4090"
+  note "  or 3060 is plugged in over Thunderbolt (see README §What you need); with no card, set ARCH for the one you have"
 fi
 
 # ---------------------------------------------------------------- tools
@@ -187,6 +187,8 @@ echo "  2. Get a model (any GGUF llama.cpp can read) into models/ — see models
 echo "  3. Run one:"
 echo "       sh tools/nv_shim_step.sh A bench models/<your-model>.gguf"
 echo "     which does the whole protocol for you: preflight, take the lock, start the server, run, release."
+echo "     It runs the binaries built here ($ARCH: cuda-shim/build/bin$([ "$ARCH" = sm_120a ] || echo "-$ARCH")) unless BIN says otherwise."
+[ "$ARCH" = sm_86 ] && echo "     On an RTX 30 (Ampere) card the protocol adds QUIESCE=1 to every step - it needs the tinygrad recovery checkout (README)."
 echo
 echo "  Read README §Run before driving the card yourself: one process on it at a time, and a wedged card needs"
 echo "  a physical replug that no script can do."

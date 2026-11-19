@@ -30,7 +30,7 @@ For implementation details, see the [architecture and integration plan](docs/03-
 
 ## Quick start
 
-Run the prerequisite check before installing or building:
+Run the prerequisite check before installing or building (a step-by-step walk-through in Traditional Chinese, from an empty Mac to a first run: [docs/install-from-scratch.zh-TW.md](docs/install-from-scratch.zh-TW.md)):
 
 ```sh
 git clone https://github.com/Davinchy/macuda
@@ -210,7 +210,7 @@ sh tools/serve.sh stop
 
 ### Recovery and diagnostics
 
-Use [tools/preflight.sh](tools/preflight.sh) to determine whether a run can proceed. If you also run Python through tinygrad's APL backend on this Mac, create its TinyGPU sentinel first - `mkdir -p ~/Library/Caches/tinygrad/downloads && touch ~/Library/Caches/tinygrad/downloads/TinyGPU_c0d024f9ff0e1dc8fdf217f255da7101d91e8323.zip` - or tinygrad's `ensure_app()` runs `pkill -f TinyGPU` and kills a serving TinyGPU server with bus mastering on (see [the stability hypotheses](docs/driver/stability-hypotheses.md), 2026-11-18). The recovery tools `nv_quiesce.sh`, `nv_e3_flr.py` and `nv_temp.py` use the tinygrad environment configured by `env.sh`. A disconnected GPU, a latched `pci-dart-error-data` flag or a failed link check may require physically reconnecting the enclosure. Do not use `systemextensionsctl reset` as a recovery shortcut.
+Use [tools/preflight.sh](tools/preflight.sh) to determine whether a run can proceed. If you also run Python through tinygrad's APL backend on this Mac, its TinyGPU sentinel must exist, or tinygrad's `ensure_app()` runs `pkill -f TinyGPU` and kills a serving TinyGPU server with bus mastering on (see [the stability hypotheses](docs/driver/stability-hypotheses.md), 2026-11-18). `install.sh` creates it in every cache tinygrad may use; `sh tools/tinygpu-sentinel.sh check` (also run by preflight) says whether it is there, and `create` makes it. The recovery tools `nv_quiesce.sh`, `nv_e3_flr.py` and `nv_temp.py` use the tinygrad environment configured by `env.sh`. A disconnected GPU, a latched `pci-dart-error-data` flag or a failed link check may require physically reconnecting the enclosure. Do not use `systemextensionsctl reset` as a recovery shortcut.
 
 The current driver defaults include asynchronous submission, a VRAM command arena, chain depth 128, a 64 MB descriptor region, token-aligned delta delivery, tail-only timeline release, inline small uploads and kernel-based device-to-device copies. Inspect the startup line to confirm the settings for each run.
 
