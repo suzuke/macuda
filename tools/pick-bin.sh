@@ -6,7 +6,8 @@
 # bin-sm_86, and build/bin is the wrong one for a 3060. Prints the directory; says on stderr when it is not build/bin;
 # exits 1 when nothing built fits the card.
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; B=$R/cuda-shim/build
-a=$(sh "$R/setup.sh" arch 2>/dev/null); a=${a:-sm_120a}
+# setup.sh arch refuses an ARCH it does not build (exit 2): stop there, never fall back to another family's binaries
+a=$(sh "$R/setup.sh" arch 2>/dev/null) && [ -n "$a" ] || { echo "ARCH=${ARCH:-} is not one this tree builds (sm_86, sm_89, sm_120a, multi): set ARCH or BIN" >&2; exit 1; }
 if [ "$a" = sm_120a ]; then set -- "$B/bin" "$B/bin-multi"; else set -- "$B/bin-$a" "$B/bin-multi"; fi
 for d; do
   [ -d "$d" ] || continue
