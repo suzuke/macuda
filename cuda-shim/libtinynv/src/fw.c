@@ -1,3 +1,5 @@
+// glibc declares realpath and readlink (src/exe_path.h) under -std=c11 only with this; the bsd headers need nothing
+#define _DEFAULT_SOURCE
 #include "fw.h"
 #include "internal.h"
 #include "sha256.h"
