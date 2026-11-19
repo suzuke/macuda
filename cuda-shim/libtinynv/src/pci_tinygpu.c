@@ -60,9 +60,10 @@ typedef struct {
   int peer_pid;
   int rescue_state; // 0 not started, 1 running, 2 finished, refused or turned off
   pid_t rescue_pid;
-  // The watchdog's clean channel (M4, tg_watch): the write end of its pipe, -1 when there is none, and whether the
-  // last byte said bus mastering may be on.
-  int wd_fd, wd_armed;
+  // The watchdog's clean channel (M4, tg_watch): the write end of its pipe, -1 when there is none. Nothing is kept
+  // here about what was last written: the pipe is shared by every process a fork puts in this session, so the last
+  // byte in it may be another process's (tg_wd_say).
+  int wd_fd;
 } tg_t;
 
 
@@ -257,13 +258,50 @@ static int rpc(tg_t *tg, resp_t *rp, uint8_t cmd, uint32_t bar, uint64_t a0, uin
   return 0;
 }
 
-// One byte to the watchdog: 'A' bus mastering may be on, 'C' it was read back off, 'R' the M3 rescue has started.
-// The pipe is non-blocking and raises no SIGPIPE (tg_watch), so a watchdog that died first costs nothing here.
+// One byte to the watchdog: 'A' bus mastering may be on, 'C' it was read back off. The watchdog goes by the LAST
+// byte it received, whoever sent it, so each one is sent EVERY time and nothing is remembered here: this process's
+// "I have said 'A'" is no longer true once a child it forked has quiesced and said 'C' into the same pipe - the
+// parent then set MASTER again, sent nothing, was killed, and the watchdog called it clean with the card at 0x407
+// (found by review, 2026-11-19). The cost is one 1-byte write per PCI_COMMAND write with MASTER (dev.c: two a boot)
+// and per DMA mapping (at most MAX_DMA a session), next to a socket round trip each.
+// The pipe is non-blocking and raises no SIGPIPE (tg_watch), so a watchdog that died first costs nothing here; a
+// full pipe would lose the byte, and the watchdog reads every byte as it arrives.
 static void tg_wd_say(tg_t *tg, char what) {
-  if (tg->wd_fd < 0) return;
-  if (write(tg->wd_fd, &what, 1) == 1) tg->wd_armed = what == 'A';
+  if (tg->wd_fd >= 0 && write(tg->wd_fd, &what, 1) < 0) {}
 }
-static void tg_wd_arm(tg_t *tg) { if (!tg->wd_armed) tg_wd_say(tg, 'A'); }
+
+// A descriptor of this session's - the server socket, an end of the watchdog's pipe - is never 0, 1 or 2. A program
+// that closed its stdio (a daemon, `2>&-`) gets those numbers from socket() and pipe(), and then fd 2 IS the session:
+// libtinynv's own fprintf(stderr) went to the server as requests, and both spawns below, which hand fd 2 on as the
+// child's stdout and stderr, gave the watchdog the client's server socket (its log text became requests and the
+// session outlived the client) or the pipe's own write end (it never saw end of file). Either way a killed client
+// left the card at 0x407 with nobody to clear it (found by review, 2026-11-19). Close-on-exec comes with the move.
+// A descriptor that cannot be moved (EMFILE) is kept where it is, and tg_child_stdio does not hand it on.
+static int tg_fd_high(int fd) {
+  if (fd < 0 || fd > 2) return fd;
+  int hi = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+  if (hi < 0) return fd;
+  close(fd);
+  return hi;
+}
+
+// What a spawned helper gets as stdio: /dev/null to read, and this process's stderr as its stdout and stderr, so its
+// lines land in this process's log - but only a stderr that is open and is not part of the session (a, b, c: the
+// socket and the pipe's ends, -1 for none). Otherwise /dev/null: a dup2 from a closed fd 2 fails the whole spawn,
+// and there would be no watchdog and no rescue at all for a program without a stderr. fcntl only: tg_rescue can run
+// inside the crash handler.
+static void tg_child_stdio(posix_spawn_file_actions_t *fa, int a, int b, int c) {
+  posix_spawn_file_actions_addopen(fa, 0, "/dev/null", O_RDONLY, 0);
+  if (fcntl(2, F_GETFD) != -1 && a != 2 && b != 2 && c != 2) {
+    posix_spawn_file_actions_adddup2(fa, 2, 1);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    posix_spawn_file_actions_addinherit_np(fa, 2);
+#endif
+  } else {
+    posix_spawn_file_actions_addopen(fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(fa, 2, "/dev/null", O_WRONLY, 0);
+  }
+}
 
 static uint32_t tg_cfg_read(tinynv_pci_t *p, uint32_t off, uint32_t size) {
   resp_t rp;
@@ -274,7 +312,7 @@ static uint32_t tg_cfg_read(tinynv_pci_t *p, uint32_t off, uint32_t size) {
 static void tg_cfg_write(tinynv_pci_t *p, uint32_t off, uint32_t size, uint32_t val) {
   resp_t rp;
   // armed BEFORE the write goes out: a client killed between the two must not leave a watchdog that believes it clean
-  if (off == PCI_COMMAND && (val & PCI_COMMAND_MASTER)) tg_wd_arm(p->ctx);
+  if (off == PCI_COMMAND && (val & PCI_COMMAND_MASTER)) tg_wd_say(p->ctx, 'A');
   rpc(p->ctx, &rp, CMD_CFG_WRITE, 0, off, size, val, NULL, 0, NULL, 0, NULL);
 }
 
@@ -351,7 +389,7 @@ static int tg_dma_alloc(tinynv_pci_t *p, size_t size, tinynv_dma_t *out) {
   resp_t rp;
   int fd = -1;
   if (tg->ndma >= MAX_DMA) return tinynv_fail("tinygpu: the server allows %d dma mappings per session", MAX_DMA);
-  tg_wd_arm(tg);   // a mapping the server will complete when the session ends, with whatever mastering the card has
+  tg_wd_say(tg, 'A');   // a mapping the server will complete when the session ends, with whatever mastering the card has
   if (rpc(tg, &rp, CMD_MAP_SYSMEM_FD, 0, size, 0, 0, NULL, 0, NULL, 0, &fd)) return -1;
   if (fd < 0) return tinynv_fail("tinygpu: dma reply carried no descriptor");
 
@@ -428,8 +466,14 @@ static int tg_transport_dead(tinynv_pci_t *p) { tg_t *tg = p->ctx; return tg && 
 // the server has answered its first read, which proves no other client holds the one-client server.
 //
 // posix_spawn only - this can run inside the crash handler. The child gets no descriptor but stdio (no lock file, no
-// dead socket), with stderr shared so its result lands in this process's log, and an empty signal mask (the handler
-// runs with its own signal blocked).
+// dead socket), with stderr shared so its result lands in this process's log (tg_child_stdio: /dev/null when this
+// process has no stderr of its own), and an empty signal mask (the handler runs with its own signal blocked).
+//
+// The watchdog is told nothing of this. It once stood down on a byte sent here ('R'), when the rescue had only
+// STARTED: with the server 3 s in the dead session's teardown the rescue's 1 s reply timeout expired (exit 4), the
+// watchdog had already gone, and the card stayed at 0x407 (found by review, 2026-11-19). It now acts on what it sees
+// - this process gone, or the server gone - and the helper's lock puts the two in a row: whichever comes second
+// connects to the server that is up, reads PCI_COMMAND, writes only if MASTER is still set, and starts no server.
 static void tg_rescue(tinynv_pci_t *p, double wait_s) {
   tg_t *tg = p->ctx;
   if (!tg || !tg->dead) return;
@@ -458,11 +502,7 @@ static void tg_rescue(tinynv_pci_t *p, double wait_s) {
 #endif
     posix_spawnattr_setflags(&at, flags);
     posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&fa, 2, 1);
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-    posix_spawn_file_actions_addinherit_np(&fa, 2);
-#endif
+    tg_child_stdio(&fa, tg->fd, tg->wd_fd, -1);
     int rc = posix_spawn(&tg->rescue_pid, helper, &fa, &at, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&at);
@@ -471,7 +511,6 @@ static void tg_rescue(tinynv_pci_t *p, double wait_s) {
       return;
     }
     tg->rescue_state = 1;
-    tg_wd_say(tg, 'R');   // the watchdog stands down rather than race this one to the server
     fprintf(stderr, "libtinynv: emergency bus-master clear started: %s --sock %s --old-pid %s (pid %d)\n", helper,
             tg->path, pid, (int)tg->rescue_pid);
   }
@@ -525,7 +564,13 @@ static void tg_close(tinynv_pci_t *p) {
 //     did when it watched the opener's pid, sat in the listen(1) backlog against the live session, and the next
 //     program's connect was refused (found by review, 2026-11-19).
 //   - The watchdog gets nothing else but stdio (POSIX_SPAWN_CLOEXEC_DEFAULT). Holding this process's server socket
-//     would keep the session open after this process died, and the server would never see it go.
+//     would keep the session open after this process died, and the server would never see it go. Its stdio is never
+//     the socket or the pipe either, whatever numbers this process's descriptors have (tg_fd_high, tg_child_stdio).
+//   - NOT ATOMIC, and left so: macOS has no SOCK_CLOEXEC and no pipe2, so between socket()/pipe() and the fcntl that
+//     sets close-on-exec another thread can fork and exec, and that child holds one of the two without the other -
+//     the socket without the pipe (the watchdog fires against a session still open), or the pipe without the socket
+//     (it never fires). Theoretical: it needs a fork+exec in another thread inside those few instructions, and a
+//     posix_spawn with POSIX_SPAWN_CLOEXEC_DEFAULT is not affected at all.
 //   - The socket path goes in the environment, not argv: `pkill -f tinygpu.sock` stops servers, not watchdogs.
 //   - A session of its own, and the helper ignores SIGINT/SIGHUP/SIGTERM: a ^C or a kill of this process group is
 //     what it is there for.
@@ -543,10 +588,12 @@ static void tg_watch(tg_t *tg) {
   const char *helper = getenv("TINYNV_BMCLEAR_HELPER");
   if (!helper || !*helper) helper = TINYNV_BMCLEAR_DEFAULT;
   int pfd[2];
+  // no pipe2 here: see NOT ATOMIC above for the window before the two fcntls below
   if (pipe(pfd)) { fprintf(stderr, "libtinynv: no watchdog: pipe: %s\n", strerror(errno)); return; }
   // the read end above the three it becomes fd 3 among: a dup2 onto itself would keep its close-on-exec
   int rd = fcntl(pfd[0], F_DUPFD_CLOEXEC, 10);
   close(pfd[0]);
+  pfd[1] = tg_fd_high(pfd[1]);   // off 0-2, where pipe() puts it in a program without stdio
   fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
   fcntl(pfd[1], F_SETFL, fcntl(pfd[1], F_GETFL) | O_NONBLOCK);
   fcntl(pfd[1], F_SETNOSIGPIPE, 1);
@@ -570,9 +617,7 @@ static void tg_watch(tg_t *tg) {
   posix_spawnattr_setsigmask(&at, &none);
   posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT);
   posix_spawn_file_actions_init(&fa);
-  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-  posix_spawn_file_actions_adddup2(&fa, 2, 1);
-  posix_spawn_file_actions_addinherit_np(&fa, 2);
+  tg_child_stdio(&fa, tg->fd, pfd[1], rd);
   posix_spawn_file_actions_adddup2(&fa, rd, 3);
   pid_t wd;
   int rc = posix_spawn(&wd, helper, &fa, &at, argv, env);
@@ -596,8 +641,11 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
   if (strlen(sock_path) >= sizeof(addr.sun_path)) return tinynv_fail("tinygpu: socket path is too long");
   strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
+  // No SOCK_CLOEXEC on macOS: close-on-exec is set below, and a fork+exec in another thread before that keeps the
+  // socket (tg_watch: NOT ATOMIC). Off 0-2 first, where socket() puts it in a program that closed its stdio.
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return tinynv_fail("tinygpu: socket: %s", strerror(errno));
+  fd = tg_fd_high(fd);
   if (connect(fd, (struct sockaddr *)&addr, sizeof(addr))) {
     close(fd);
     return tinynv_fail("tinygpu: no server on %s: %s", sock_path, strerror(errno));

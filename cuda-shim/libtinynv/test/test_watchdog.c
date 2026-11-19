@@ -21,7 +21,18 @@
 //                 death costs no second clear
 //   5 together    the client's own rescue and the watchdog's server-death trigger: one app start; and two one-shot
 //                 helpers against a dead server in the same instant: one start, both clear
-//   R             the session lost with the server alive: the client's own rescue clears, the watchdog stands down
+//   R             the session lost with the server alive: the client's own rescue clears, and the watchdog - which no
+//                 longer stands down for a rescue that has only STARTED - looks once the client has gone, finds bus
+//                 mastering off and writes nothing
+//   R slow        the same loss under a server 3 s in the dead session's teardown: the rescue's 1 s reply timeout
+//                 expires (exit 4), and the watchdog, still there, clears (round 2 of the review, 2026-11-19)
+//   no stdio      the client's fd 2 closed, and fds 0-2 closed (a daemon, `2>&-`): socket() and pipe() then hand out
+//                 0-2, and the watchdog once got the client's own server socket, or the pipe's write end, as its
+//                 stdout and stderr. kill -9 clears within about 1 s all the same, the session ends at once, and
+//                 the server reads nothing on the client's connection that is not a request - not the watchdog's
+//                 log, not what the client itself prints to a closed fd 2. And the rescue (M3) starts and clears.
+//   refork        armed, forked, the child quiesced and exited, the parent turned bus mastering on again and was
+//                 killed: cleared. The watchdog goes by the LAST byte, so every arming has to send one.
 //   6 off        TINYNV_WATCHDOG=0, TINYNV_EMERGENCY_BM=0: no watchdog process, no clear after kill -9
 //   8 slow        the server spends 3 s tearing the dead session down: the clear still lands, inside the hard timeout
 //   exit          an armed client that exits without its teardown (TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL=1's path): cleared
@@ -107,15 +118,19 @@ static int role_server(const char *sock) {
     if (s < 0) { if (errno == EINTR) { conn--; continue; } return 2; }
     logev("accept %d", conn);
     req_t rq;
+    ssize_t got = 0;
     // WD_DROP_AFTER=N: the first connection is dropped after N requests and the server stays up - a lost session the
     // client finds by itself, so its own rescue (M3) runs and the watchdog has to stand down
-    for (int nreq = 0; !(conn == 1 && drop && nreq == atoi(drop)) && recv(s, &rq, sizeof(rq), MSG_WAITALL) == (ssize_t)sizeof(rq); nreq++) {
+    for (int nreq = 0; !(conn == 1 && drop && nreq == atoi(drop)) && (got = recv(s, &rq, sizeof(rq), MSG_WAITALL)) == (ssize_t)sizeof(rq); nreq++) {
       resp_t rp = {0};
-      if (rq.cmd == CMD_CFG_READ && rq.arg0 == 4) { rp.resp0 = card_get(); logev("read %d %#llx", conn, (unsigned long long)rp.resp0); }
+      // a request is 33 bytes with a command the protocol has (0..12) for device 0; anything else is somebody's text
+      if (rq.cmd > 12 || rq.dev_id) logev("bad %d %u", conn, rq.cmd);
+      else if (rq.cmd == CMD_CFG_READ && rq.arg0 == 4) { rp.resp0 = card_get(); logev("read %d %#llx", conn, (unsigned long long)rp.resp0); }
       else if (rq.cmd == CMD_CFG_WRITE && rq.arg0 == 4) { card_set((uint32_t)rq.arg2); logev("write %d %#llx", conn, (unsigned long long)rq.arg2); }
       else logev("other %d %u", conn, rq.cmd);
       if (send(s, &rp, sizeof(rp), 0) < 0) break;
     }
+    if (got > 0 && got != (ssize_t)sizeof(rq)) logev("bad %d %d", conn, (int)got);   // a tail that is no request
     logev("eof %d", conn);
     close(s);
     if (teardown > 0) nap(teardown);   // the dead session's teardown, during which nothing is accepted
@@ -133,10 +148,16 @@ static int role_client(const char *mode, const char *sock) {
   // A real program has files open before the device. Here the socket would otherwise land on fd 3 - where the spawn
   // puts the watchdog's pipe, overwriting it - and an inherited socket (no CLOEXEC_DEFAULT) would go unseen.
   for (int i = 0; i < 4; i++) if (open("/dev/null", O_RDONLY) < 0) return 2;
+  // WD_CLOSE: a daemon's descriptors. "2" closes stderr (`2>&-`), "012" all three - AFTER the opens above, so the
+  // lowest free descriptors, which socket() and pipe() take, are 0-2.
+  const char *cl = getenv("WD_CLOSE");
+  for (; cl && *cl; cl++) close(*cl - '0');
   tinynv_pci_t p;
   if (tinynv_pci_open_tinygpu(sock, &p)) { fprintf(stderr, "client: open: %s\n", tinynv_last_error()); return 2; }
   uint32_t cmd = p.cfg_read(&p, 4, 2);
   if (strcmp(mode, "unarmed")) p.cfg_write(&p, 4, 2, cmd | 4);
+  // what any program (and libtinynv's own fprintf) does with a closed fd 2: write to it anyway
+  if (getenv("WD_CLOSE")) { static const char m[] = "client: a line for stderr, which is closed\n"; if (write(2, m, sizeof(m) - 1) < 0) {} }
   logev("armed %s", mode);
   int sig;
   sigwait(&us, &sig);
@@ -156,10 +177,24 @@ static int role_client(const char *mode, const char *sock) {
     logev("child %d", (int)c);
     for (;;) pause();
   }
-  if (!strcmp(mode, "rescue")) {
+  if (!strncmp(mode, "rescue", 6)) {
     p.cfg_read(&p, 4, 2);   // the server is gone: this latches the loss
     p.rescue(&p, 9.0);
+    logev("rescued");
+    if (!strcmp(mode, "rescue-stay")) for (;;) pause();   // what the rescue did, seen with the client still alive
     return 0;
+  }
+  if (!strcmp(mode, "refork")) {
+    // armed above; a child quiesces and goes; this process turns bus mastering on again
+    pid_t c = fork();
+    if (!c) { p.quiesce(&p); _exit(0); }
+    waitpid(c, NULL, 0);
+    logev("quiesced");
+    cmd = p.cfg_read(&p, 4, 2);
+    p.cfg_write(&p, 4, 2, cmd | 4);
+    p.cfg_read(&p, 4, 2);   // a round trip: the write has landed
+    logev("rearmed");
+    for (;;) pause();
   }
   return 0;   // "exit", "unarmed": out without a teardown
 }
@@ -229,6 +264,7 @@ static void case_env(const char *teardown_ms) {
   setenv("WD_CARD", card, 1);
   if (teardown_ms) setenv("WD_TEARDOWN_MS", teardown_ms, 1); else unsetenv("WD_TEARDOWN_MS");
   unsetenv("WD_DROP_AFTER");
+  unsetenv("WD_CLOSE");
   card_set(0x0403);
 }
 static pid_t spawn_server(void) {
@@ -543,8 +579,10 @@ static void case_signals(void) {
   case_end(server, wd);
 }
 
-// 'R' on its own: the session lost with the server alive, the client's own rescue clears, the watchdog stands down
-static void case_stand_down(void) {
+// R: the session lost with the server alive. The client's own rescue clears; the watchdog does not stand down for it
+// (a rescue that has started has cleared nothing yet), and when the client has gone it looks for itself: one more
+// connection, a read that finds bus mastering off, nothing written.
+static void case_rescue(void) {
   case_env(NULL);
   setenv("WD_DROP_AFTER", "2", 1);   // the client's read and its write with MASTER, then the connection goes
   pid_t server = spawn_server(), client = spawn_client("rescue"), wd = 0;
@@ -552,16 +590,116 @@ static void case_stand_down(void) {
   double t0 = now();
   kill(client, SIGUSR1);
   int rc = reap(client, 12);
-  CHECK(rc == 0, "stand down: the client exited %d", rc);
-  CHECK(wd && gone(wd, 3), "stand down: the watchdog did not exit");
-  char want[96];
-  snprintf(want, sizeof(want), "stood down: client pid %d started its own emergency clear", (int)client);
-  CHECK(file_has(errp, want), "stand down: the watchdog did not say \"%s\"", want);
-  CHECK(count("accept", t0, server, NULL) == 1, "stand down: %d connections after the loss, want the rescue's one",
+  CHECK(rc == 0, "rescue: the client exited %d", rc);
+  CHECK(wd && gone(wd, 3), "rescue: the watchdog did not exit");
+  CHECK(file_has(errp, "the emergency bus-master clear exited 0"), "rescue: the client's own rescue did not clear");
+  CHECK(file_has(errp, "client exited without a clean teardown"), "rescue: the watchdog stood down for a rescue that had only started");
+  CHECK(count("accept", t0, server, NULL) == 2, "rescue: %d connections after the loss, want the rescue's and the watchdog's",
         count("accept", t0, server, NULL));
-  CHECK(count("start", 0, 0, NULL) == 1 && card_get() == 0x0403, "stand down: an app was started, or the card ends at %#x", card_get());
-  CHECK(!file_has(errp, "client exited without a clean teardown"), "stand down: the watchdog cleared as well");
-  show_err("stand down");
+  CHECK(count("write", t0, server, NULL) == 1, "rescue: %d writes after the loss, want the rescue's one - the watchdog found it off",
+        count("write", t0, server, NULL));
+  CHECK(count("start", 0, 0, NULL) == 1 && card_get() == 0x0403, "rescue: an app was started, or the card ends at %#x", card_get());
+  show_err("rescue");
+  case_end(server, wd);
+}
+
+// R slow: the same loss, and the server takes 3 s over the dead session. The rescue connects into the backlog, gets no
+// answer in its 1 s and exits 4 with nothing written; the client goes on and exits. The watchdog once stood down at
+// 'R' and the card stayed at 0x407 with nobody left (round 2 of the review). The stand-in naps after EVERY
+// connection, the rescue's dead one too, so the watchdog's is served about 6 s after the loss.
+static void case_rescue_slow(void) {
+  case_env("3000");
+  setenv("WD_DROP_AFTER", "2", 1);
+  pid_t server = spawn_server(), client = spawn_client("rescue"), wd = 0;
+  children(client, &wd);
+  double t0 = now();
+  kill(client, SIGUSR1);
+  int rc = reap(client, 12);
+  CHECK(rc == 0, "rescue, slow teardown: the client exited %d", rc);
+  CHECK(file_has(errp, "the emergency bus-master clear exited 4"), "rescue, slow teardown: the rescue was meant to time out (exit 4) here");
+  ev_t w;
+  int writes = wait_for("write", t0, server, 1, 12, &w);
+  CHECK(writes == 1 && w.v == 0x0403, "rescue, slow teardown: %d write(s) after the rescue gave up, want the watchdog's 0x0403", writes);
+  nap(0.2);
+  CHECK(card_get() == 0x0403, "rescue, slow teardown: the card ends at %#x, want 0x0403", card_get());
+  CHECK(count("start", 0, 0, NULL) == 1, "rescue, slow teardown: an app was started under a live server");
+  CHECK(wd && gone(wd, 3), "rescue, slow teardown: the watchdog did not exit");
+  show_err("rescue, slow teardown");
+  case_end(server, wd);
+}
+
+// no stdio: fd 2 closed ("2"), or 0-2 closed ("012"), before the transport opens
+static void case_noio(const char *closed) {
+  char name[32];
+  snprintf(name, sizeof(name), "fds %s closed", closed);
+  case_env(NULL);
+  setenv("WD_CLOSE", closed, 1);
+  pid_t server = spawn_server(), client = spawn_client("idle"), wd = 0;
+  int nwd = children(client, &wd);
+  CHECK(nwd == 1, "%s: the client has %d children, want the one watchdog", name, nwd);
+  nap(0.2);
+  double t0 = now();
+  kill(client, SIGKILL);
+  reap(client, 3);
+  ev_t eof, w;
+  wait_for("eof", t0, server, 1, 0.5, NULL);
+  CHECK(first("eof", t0, server, &eof) && eof.conn == 1 && eof.t - t0 < 0.5,
+        "%s: the server did not see the client's connection end within 0.5 s (the watchdog holds it as its stderr?)", name);
+  int writes = wait_for("write", t0, server, 1, 3, &w);
+  CHECK(writes == 1 && w.v == 0x0403 && w.t - t0 < 1.5, "%s: %d write(s) after the kill, want one of 0x0403 within about 1 s (%.2f s)",
+        name, writes, writes ? w.t - t0 : -1.0);
+  nap(0.2);
+  CHECK(card_get() == 0x0403, "%s: the card ends at %#x, want 0x0403", name, card_get());
+  CHECK(count("bad", 0, server, NULL) == 0 && count("other", 0, server, NULL) == 0,
+        "%s: the server read %d thing(s) that are no request of this client's (somebody's log went into the session)", name,
+        count("bad", 0, server, NULL) + count("other", 0, server, NULL));
+  CHECK(wd && gone(wd, 3), "%s: the watchdog did not exit (it holds the pipe's write end itself?)", name);
+  if (wd && !gone(wd, 0)) { kill(wd, SIGKILL); wd = 0; }
+  case_end(server, wd);
+}
+
+// no stdio, the rescue: its spawn handed fd 2 on as well. Seen with the client alive, so only the rescue can have cleared.
+static void case_noio_rescue(void) {
+  case_env(NULL);
+  setenv("WD_CLOSE", "2", 1);
+  setenv("WD_DROP_AFTER", "2", 1);
+  pid_t server = spawn_server(), client = spawn_client("rescue-stay"), wd = 0;
+  children(client, &wd);
+  double t0 = now();
+  kill(client, SIGUSR1);
+  CHECK(wait_for("rescued", t0, client, 1, 11, NULL) == 1, "fd 2 closed, rescue: the client's rescue did not return");
+  CHECK(kill(client, 0) == 0 && count("write", t0, server, NULL) == 1 && card_get() == 0x0403,
+        "fd 2 closed, rescue: the rescue did not clear with the client alive (%d write(s), card %#x) - was it started at all?",
+        count("write", t0, server, NULL), card_get());
+  CHECK(count("bad", 0, server, NULL) == 0 && count("other", 0, server, NULL) == 0, "fd 2 closed, rescue: the server read something that is no request");
+  kill(client, SIGKILL);
+  reap(client, 3);
+  CHECK(wd && gone(wd, 3), "fd 2 closed, rescue: the watchdog did not exit");
+  if (wd && !gone(wd, 0)) { kill(wd, SIGKILL); wd = 0; }
+  case_end(server, wd);
+}
+
+// refork: the pipe is shared by every process in the session, so what one of them last said is not what another may
+// assume. The parent armed; its child quiesced ('C') and went; the parent set MASTER again. A client that kept "I
+// have said 'A'" to itself sent nothing, and the watchdog called the kill clean with the card at 0x407.
+static void case_refork(void) {
+  case_env(NULL);
+  pid_t server = spawn_server(), client = spawn_client("refork"), wd = 0;
+  children(client, &wd);
+  double t0 = now();
+  kill(client, SIGUSR1);
+  CHECK(wait_for("rearmed", t0, client, 1, 3, NULL) == 1 && card_get() == 0x0407, "refork: the parent did not turn bus mastering on again (card %#x)", card_get());
+  double t1 = now();
+  kill(client, SIGKILL);
+  reap(client, 3);
+  ev_t w;
+  int writes = wait_for("write", t1, server, 1, 3, &w);
+  CHECK(writes == 1 && w.v == 0x0403 && w.t - t1 < 1.5, "refork: %d write(s) after the kill, want one of 0x0403 within about 1 s", writes);
+  nap(0.2);
+  CHECK(card_get() == 0x0403, "refork: the card ends at %#x, want 0x0403", card_get());
+  CHECK(!file_has(errp, "stood down: clean"), "refork: the watchdog called an armed session clean");
+  CHECK(wd && gone(wd, 3), "refork: the watchdog did not exit");
+  show_err("refork");
   case_end(server, wd);
 }
 
@@ -630,7 +768,12 @@ int main(int argc, char **argv) {
   case_killed(1);
   case_server_dies();
   case_together();
-  case_stand_down();
+  case_rescue();
+  case_rescue_slow();
+  case_noio("2");
+  case_noio("012");
+  case_noio_rescue();
+  case_refork();
   case_fork(0);
   case_fork(1);
   case_signals();

@@ -42,15 +42,23 @@
 //     without a clean teardown";
 //   - the server (--old-pid, the client's LOCAL_PEERPID) exited while the client lives and is armed: "server pid N
 //     exited", a fresh server started if none serves the path; then it waits on for the client, and clears no more.
-// The client writes one byte per change: 'A' bus mastering may be on (a PCI_COMMAND write with MASTER, a DMA mapping),
-// 'C' its own teardown read bus mastering back OFF, 'R' its own M3 rescue has started - stand down rather than race it.
-// The last byte before the client goes decides, so a quiesce in mid-session followed by a reboot is armed again; a
-// session that never turned mastering on is clean, and a clean exit makes NO connection to the server - one spare
-// connect sits in the listen(1) backlog and the next program's connect is refused.
+// The client writes one byte each time: 'A' bus mastering may be on (EVERY PCI_COMMAND write with MASTER, EVERY DMA
+// mapping), 'C' its own teardown read bus mastering back OFF. The LAST byte received decides, whichever process of
+// the session sent it - a fork shares the pipe, so the client keeps no "already said" of its own. A quiesce in
+// mid-session followed by a reboot is armed again; a session that never turned mastering on is clean, and a clean
+// exit makes NO connection to the server - one spare connect sits in the listen(1) backlog and the next program's
+// connect is refused. Any other byte is ignored.
+// NOTHING STANDS THIS DOWN BUT A CLEAN STATE. The client's own M3 rescue once did, with a byte sent when it started;
+// the rescue then timed out behind a server 3 s in the dead session's teardown, and nobody was left (found by
+// review, 2026-11-19). Now the two just run in a row under the lock above: the second connects to the server that is
+// up, reads PCI_COMMAND, writes only if MASTER is still set, exits 0 - and, having waited, starts no server.
 // The socket is not in argv because tools that stop a server run `pkill -f tinygpu.sock`, which would take this too.
+// A live server that refuses the connect (its listen(1) backlog full) is tried again until the hard timeout: the
+// watchdog is the last one there, and exit 3 would leave nobody.
 // SIGINT, SIGHUP and SIGTERM are ignored and the process has a session of its own: a ^C or a group kill of the client
 // is exactly what it is there for. Its descriptors are fd 3 and stdio only - holding the client's server socket would
-// keep the session open after the client died, and the server would never see it go. The client killed under a busy
+// keep the session open after the client died, and the server would never see it go; stdout and stderr are the
+// client's stderr, or /dev/null when the client has none of its own (pci_tinygpu.c: tg_child_stdio). The client killed under a busy
 // server meets a server still tearing the dead session down, so the first read may wait: --reply-timeout 8 and
 // --timeout 10 here, against 1 and 5 for the client's own rescue, where nothing else is being torn down.
 #include <errno.h>
@@ -176,6 +184,8 @@ static int connect_to(const char *sock, double reply_timeout) {
 
 // Why this process is clearing, for the line the server log gets when a server is started here.
 static const char *g_why = "the client lost its server connection (M3)";
+// The watchdog's clears wait for a live server that refuses connections; a one-shot helper says so and exits 3.
+static int g_patient;
 
 // A server started here is a server like any other, as tools/tinygpu-server.sh starts it, not a child of the trouble:
 //   - SIGINT, SIGTERM and SIGPIPE at their defaults, an empty mask. The watchdog ignores INT and TERM, and ignored
@@ -190,12 +200,15 @@ static int start_server(const char *app, const char *sock) {
   struct stat st;
   if (!lstat(sock, &st) && !S_ISSOCK(st.st_mode)) { say("%s exists and is not a socket; not starting a server on it", sock); return -1; }
   unlink(sock);   // a stale socket file: nothing accepts on it (checked above) and no process serves it
+  char why[PATH_MAX + 128] = "";   // why the output goes to /dev/null, when the log could not be opened
   const char *log = getenv("TINYGPU_SERVER_LOG");
   if (!log || !*log) log = server_log_default;
   if (!log || !*log) log = "/dev/null";
   int lfd = open(log, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
   if (lfd < 0) {
+    snprintf(why, sizeof(why), " (the server log %s could not be opened: %s)", log, strerror(errno));
     say("cannot open the server log %s (%s): the server's output goes to /dev/null", log, strerror(errno));
+    log = "/dev/null";
     lfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (lfd < 0) { say("cannot open /dev/null: %s; not starting a server", strerror(errno)); return -1; }
   }
@@ -236,7 +249,7 @@ static int start_server(const char *app, const char *sock) {
                    sock, (int)pid, g_why);
   if (n > 0 && write(lfd, line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1) < 0) {}
   close(lfd);
-  say("started %s server %s (pid %d); its output goes to %s", app, sock, (int)pid, log);
+  say("started %s server %s (pid %d); its output goes to %s%s", app, sock, (int)pid, log, why);
   return 0;
 }
 
@@ -282,13 +295,26 @@ static int clear(const char *sock, int old_pid, int old_gone, const char *app, d
     say("the other clear is done: looking again for its server, and starting none");
   }
 
-  int fd = connect_to(sock, reply_timeout);
+  int fd = connect_to(sock, reply_timeout), ce = errno;   // ce: why the last connect failed, kept past other calls
   // A waiter that finds a server process not yet listening: most likely the one the lock holder started, which ran out
   // of time before it listened. Connects only, until it does or the alarm - nothing is replaced or started.
   for (struct timespec nap = {0, 50 * 1000 * 1000}; fd < 0 && waited && server_process_for(sock); nanosleep(&nap, NULL))
-    fd = connect_to(sock, reply_timeout);
+    fd = connect_to(sock, reply_timeout), ce = errno;
+  // THE WATCHDOG WAITS FOR A FULL BACKLOG. It is the last one there, and a refused connect to a live server is most
+  // often the listen(1) backlog holding somebody else's connection: the client's own rescue connected, timed out
+  // behind the dead session's teardown and left, and its dead connection sits there until the server gets to it -
+  // the watchdog, coming next, was refused and gave up with the card at 0x407 (2026-11-19). Connects only, while a
+  // server for the path lives, until one is taken or the alarm; nothing is replaced, and if the server dies
+  // meanwhile the lines below decide as they always did.
+  if (fd < 0 && g_patient && ce == ECONNREFUSED && (old_alive || server_process_for(sock))) {
+    say("a server for %s is alive but refuses connections (its backlog is full, or it is wedged): trying until it takes one", sock);
+    for (struct timespec nap = {0, 100 * 1000 * 1000}; fd < 0; nanosleep(&nap, NULL)) {
+      fd = connect_to(sock, reply_timeout), ce = errno;
+      if (fd < 0 && !(old_alive = !old_gone && pid_alive(old_pid)) && !server_process_for(sock)) break;
+    }
+  }
   if (fd < 0) {
-    int e = errno, other = server_process_for(sock);
+    int e = ce, other = server_process_for(sock);
     if (old_alive || other) {
       say("a server for %s may be alive (pid %d) but refuses connections (%s): busy with another client or wedged; not touching it",
           sock, old_alive ? old_pid : other, strerror(e));
@@ -345,6 +371,7 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
   signal(SIGINT, SIG_IGN);
   signal(SIGHUP, SIG_IGN);
   signal(SIGTERM, SIG_IGN);
+  g_patient = 1;
   const char *sock = getenv("TINYNV_BMCLEAR_SOCK");
   if (!sock || !*sock) { fprintf(stderr, "tinynv-bmclear: --watch needs TINYNV_BMCLEAR_SOCK; the socket is never guessed\n"); return 2; }
   // The client is its pipe, not a pid. Every process holding the session holds the pipe too (pci_tinygpu.c: the
@@ -395,12 +422,10 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
       ssize_t r;
       while ((r = read(3, b, sizeof(b))) > 0)
         for (ssize_t j = 0; j < r; j++) {
+          // the last byte decides, whoever in the session sent it; nothing else - the client's own rescue having
+          // started least of all - makes a session clean
           if (b[j] == 'A') armed = ever = 1;
           else if (b[j] == 'C') armed = 0;
-          else if (b[j] == 'R') {
-            say("stood down: client pid %d started its own emergency clear (M3)", client);
-            return 0;
-          }
         }
       if (r == 0) client_gone = 1;
     }
