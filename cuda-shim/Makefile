@@ -141,6 +141,28 @@ test: all coverage $(SPIKE_CUBINS)
 	@n=$$(grep -c '^SKIP' $(NV_BUILD)/test-skips.txt | tr -d ' '); [ -f build/libggml-cuda.a ] || n=$$((n + 1)); \
 	 echo "make test: every test that ran passed; $$n SKIP(s), each listed above as SKIP (...)"
 
+# make stage PREFIX=/abs/dir - a release tree for this BUILD's card, in the layout libtinynv looks for beside the executable
+# (libtinynv/src/exe_path.h), so it runs from wherever it is unpacked:
+#   PREFIX/bin/                          the linked binaries (build/bin<suffix>/: *-null, and *-mc when split was run)
+#   PREFIX/libexec/macuda/tinynv-bmclear the emergency bus-master clear and watchdog, from this BUILD's libtinynv
+#   PREFIX/share/macuda/firmware/        the GSP firmware (libtinynv/third_party/firmware)
+#   PREFIX/share/macuda/tinygpu-server.sh
+# BUILD names the card as setup.sh's shim step does (build/shim-sm_86 -> build/bin-sm_86): ARCH=sm_86 PREFIX=dir sh
+# setup.sh stage passes it. Copies only: it builds nothing, deletes nothing in PREFIX, and packs or sends nothing.
+BIN_DIR := $(patsubst build/shim%,build/bin%,$(BUILD))
+.PHONY: stage
+stage:
+	@[ -n "$(filter /%,$(PREFIX))" ] || { echo "usage: make stage PREFIX=/absolute/dir [BUILD=build/shim-<arch>]"; exit 2; }
+	@[ -x "$(NV_BUILD)/tinynv-bmclear" ] || { echo "no $(NV_BUILD)/tinynv-bmclear: build it with  sh setup.sh shim"; exit 1; }
+	@ls $(BIN_DIR)/*-null >/dev/null 2>&1 || { echo "no binaries in $(BIN_DIR): link them with  sh setup.sh link"; exit 1; }
+	@[ -d libtinynv/third_party/firmware/nvidia ] || { echo "no firmware in libtinynv/third_party/firmware: sh setup.sh deps"; exit 1; }
+	@mkdir -p "$(PREFIX)/bin" "$(PREFIX)/libexec/macuda" "$(PREFIX)/share/macuda/firmware"
+	@for f in $(BIN_DIR)/*; do [ -f "$$f" ] && cp -p "$$f" "$(PREFIX)/bin/" || exit 1; done
+	@cp -p "$(NV_BUILD)/tinynv-bmclear" "$(PREFIX)/libexec/macuda/"
+	@cp -Rp libtinynv/third_party/firmware/. "$(PREFIX)/share/macuda/firmware/"
+	@cp -p ../tools/tinygpu-server.sh "$(PREFIX)/share/macuda/"
+	@echo "staged $(BIN_DIR) into $(PREFIX): $$(ls "$(PREFIX)/bin" | wc -l | tr -d ' ') binaries, libexec/macuda/tinynv-bmclear, share/macuda/{firmware,tinygpu-server.sh}"
+
 # every cuda*/cublas* symbol the compiled ggml-cuda archive needs must be defined by the shim (skipped if the archive is absent)
 .PHONY: coverage
 coverage: $(CUDART) $(CUBLAS)

@@ -7,6 +7,9 @@
 #   sh setup.sh shim       make libtinynv.a + libtinycudart.a + libtinycublas.a (no GPU needed)
 #   sh setup.sh cuda       compile ggml's CUDA backend: device code through nvcc, host code through clang
 #   sh setup.sh link       link the *-null binaries against the shim (needs cuda-shim/build/libggml-cuda.a from the step above)
+#   PREFIX=/abs/dir sh setup.sh stage   copy this ARCH's binaries, tinynv-bmclear, the firmware and tools/tinygpu-server.sh into
+#                          PREFIX/{bin,libexec/macuda,share/macuda}, the layout a prebuilt release runs from wherever it is
+#                          unpacked (cuda-shim/Makefile: stage). Local only: no archive, nothing uploaded.
 #   sh setup.sh split      Metal + CUDA in ONE process: a static Metal llama.cpp tree (llama.cpp/build-metal-null) linked
 #                          against the same shim and archive -> build/bin/*-mc (split a model across the eGPU and the Mac GPU)
 # Environment: LLAMA_SRC / SD_SRC name a local clone to copy from instead of GitHub; JOBS caps the parallel build (default:
@@ -175,9 +178,10 @@ split() {
     test -f "$R/cuda-shim/build/bin$SUF/$n-mc" || { echo "LINKING FAILED for $n-mc"; exit 1; }
   done
 }
+stage() { case "${PREFIX:-}" in /*) ;; *) echo "usage: PREFIX=/absolute/dir sh setup.sh stage"; exit 2 ;; esac; ( cd cuda-shim && make -s stage BUILD="build/shim$SUF" PREFIX="$PREFIX" ); }
 case "$step" in
   all)   deps; llama; sd; shim; cuda; link ;;
-  deps)  deps ;; llama) llama ;; sd) sd ;; shim) shim ;; cuda) cuda ;; link) link ;; split) split ;;
+  deps)  deps ;; llama) llama ;; sd) sd ;; shim) shim ;; cuda) cuda ;; link) link ;; split) split ;; stage) stage ;;
   arch)  echo "$ARCH" ;;   # the ARCH this run resolved to (install.sh fixes it once for all its stages)
-  *) echo "usage: sh setup.sh [all|deps|llama|sd|shim|cuda|link|split|arch]"; exit 2 ;;
+  *) echo "usage: sh setup.sh [all|deps|llama|sd|shim|cuda|link|split|stage|arch]"; exit 2 ;;
 esac
