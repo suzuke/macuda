@@ -144,6 +144,11 @@ if [ -n "$s1" ]; then
   else echo "$s1" | sed 's/^   /   busy for a moment, clear 2 s later: /'; fi
 fi
 echo "-- socket / lock --"; ls -la "$TMPDIR/tinygpu.sock" "$TMPDIR/nv_usb4.lock" 2>&1 | sed 's/^/   /' | cut -c1-90
+# A warning, not an abort: a missing sentinel is a hazard to the NEXT session (a tinygrad program run without
+# APL_REMOTE_SOCK pkills the server), not a reason this step cannot run. tools/tinygpu-sentinel.sh says why.
+echo "-- tinygrad pkill guard --"
+if g=$(sh "$(dirname "$0")/tinygpu-sentinel.sh" check); then echo "   sentinel files present ($(echo "$g" | grep -c present:))"
+else echo "$g" | grep -v '^   present:' | sed 's/^   /   WARNING: /'; fi
 echo "-- power --"; pmset -g 2>/dev/null | grep -E "powermode|lowpowermode" | sed 's/^/   /'
 [ $abort -eq 0 ] && echo "VERDICT: OK to proceed (one GPU step at a time)" || echo "VERDICT: ABORT - do not touch the GPU [$why]"
 exit $abort
