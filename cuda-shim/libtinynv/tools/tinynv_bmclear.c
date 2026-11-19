@@ -38,7 +38,8 @@
 // a client alive to notice; two ways out had nobody: the client killed or crashed under a live server, which then
 // tears the session down with bus mastering on, and the server dying under an idle client that touches nothing. This
 // process outlives both and runs steps 1-4 at most once:
-//   - the client gone (its end of fd 3 closed, or its pid exited) while ARMED: "client exited without a clean teardown";
+//   - the client gone (the last write end of fd 3 closed: no process holds the session) while ARMED: "client exited
+//     without a clean teardown";
 //   - the server (--old-pid, the client's LOCAL_PEERPID) exited while the client lives and is armed: "server pid N
 //     exited", a fresh server started if none serves the path; then it waits on for the client, and clears no more.
 // The client writes one byte per change: 'A' bus mastering may be on (a PCI_COMMAND write with MASTER, a DMA mapping),
@@ -85,6 +86,11 @@ enum { CMD_CFG_READ = 3, CMD_CFG_WRITE = 4 };
 #define PCI_COMMAND 0x04
 #define PCI_COMMAND_MASTER 0x4
 #define DEFAULT_APP "/Applications/TinyGPU.app/Contents/MacOS/TinyGPU"
+// tools/tinygpu-server.sh's log, which the Makefile bakes in from the repo root; TINYGPU_SERVER_LOG overrides it
+#ifndef TINYNV_SERVER_LOG_DEFAULT
+#define TINYNV_SERVER_LOG_DEFAULT ""
+#endif
+static const char *server_log_default = TINYNV_SERVER_LOG_DEFAULT;
 
 static void say(const char *fmt, ...) {
   char ts[32];
@@ -168,15 +174,45 @@ static int connect_to(const char *sock, double reply_timeout) {
   return fd;
 }
 
+// Why this process is clearing, for the line the server log gets when a server is started here.
+static const char *g_why = "the client lost its server connection (M3)";
+
+// A server started here is a server like any other, as tools/tinygpu-server.sh starts it, not a child of the trouble:
+//   - SIGINT, SIGTERM and SIGPIPE at their defaults, an empty mask. The watchdog ignores INT and TERM, and ignored
+//     signals survive both its fork and the spawn, so a server it started could not be stopped by `pkill -f
+//     tinygpu.sock` (found by review, 2026-11-19). SIGHUP stays ignored, as the script's `trap '' HUP` has it: the
+//     server outlives the terminal it was started from.
+//   - Its output goes to the server log the script writes (TINYGPU_SERVER_LOG, else the repo's
+//     logs/tinygpu-server.log, baked in at build), appended, with one line first saying who started it and why. Never
+//     the client's stderr: a server holding that would keep a pipe reading the client's log open for its whole life.
+//     A log that cannot be opened is /dev/null.
 static int start_server(const char *app, const char *sock) {
   struct stat st;
   if (!lstat(sock, &st) && !S_ISSOCK(st.st_mode)) { say("%s exists and is not a socket; not starting a server on it", sock); return -1; }
   unlink(sock);   // a stale socket file: nothing accepts on it (checked above) and no process serves it
+  const char *log = getenv("TINYGPU_SERVER_LOG");
+  if (!log || !*log) log = server_log_default;
+  if (!log || !*log) log = "/dev/null";
+  int lfd = open(log, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+  if (lfd < 0) {
+    say("cannot open the server log %s (%s): the server's output goes to /dev/null", log, strerror(errno));
+    lfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (lfd < 0) { say("cannot open /dev/null: %s; not starting a server", strerror(errno)); return -1; }
+  }
   char *argv[] = {(char *)app, "server", (char *)sock, NULL};
   posix_spawnattr_t at;
   posix_spawn_file_actions_t fa;
+  sigset_t def, none;
+  sigemptyset(&def);
+  sigaddset(&def, SIGINT);
+  sigaddset(&def, SIGTERM);
+  sigaddset(&def, SIGPIPE);
+  sigemptyset(&none);
+  signal(SIGHUP, SIG_IGN);   // in this process (a helper, or the watchdog's clear child), so the server inherits it
   posix_spawnattr_init(&at);
-  short flags = 0;
+  posix_spawnattr_setsigdefault(&at, &def);
+  posix_spawnattr_setsigmask(&at, &none);
+  short flags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
 #ifdef POSIX_SPAWN_SETSID
   flags |= POSIX_SPAWN_SETSID;
 #endif
@@ -186,16 +222,21 @@ static int start_server(const char *app, const char *sock) {
   posix_spawnattr_setflags(&at, flags);
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-  posix_spawn_file_actions_adddup2(&fa, 2, 1);
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-  posix_spawn_file_actions_addinherit_np(&fa, 2);
-#endif
+  posix_spawn_file_actions_adddup2(&fa, lfd, 1);
+  posix_spawn_file_actions_adddup2(&fa, lfd, 2);
   pid_t pid;
   int rc = posix_spawn(&pid, app, &fa, &at, argv, environ);
   posix_spawn_file_actions_destroy(&fa);
   posix_spawnattr_destroy(&at);
-  if (rc) { say("could not start %s server %s: %s", app, sock, strerror(rc)); return -1; }
-  say("started %s server %s (pid %d)", app, sock, (int)pid);
+  if (rc) { close(lfd); say("could not start %s server %s: %s", app, sock, strerror(rc)); return -1; }
+  char line[PATH_MAX * 2 + 256], ts[32];
+  time_t now = time(NULL);
+  strftime(ts, sizeof(ts), "%F %T", localtime(&now));
+  int n = snprintf(line, sizeof(line), "%s tinynv-bmclear[%d]: started %s server %s (pid %d): %s\n", ts, (int)getpid(), app,
+                   sock, (int)pid, g_why);
+  if (n > 0 && write(lfd, line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1) < 0) {}
+  close(lfd);
+  say("started %s server %s (pid %d); its output goes to %s", app, sock, (int)pid, log);
   return 0;
 }
 
@@ -229,7 +270,9 @@ static int clear(const char *sock, int old_pid, int old_gone, const char *app, d
       old_pid <= 0 ? "unknown" : old_alive ? "alive" : "gone");
   char lock[PATH_MAX];
   int waited = 0;
-  snprintf(lock, sizeof(lock), "%s.bmclear.lock", sock);
+  char spelt[PATH_MAX];
+  norm(sock, spelt, sizeof(spelt));   // one name however the socket is spelt, as server_process_for matches it
+  snprintf(lock, sizeof(lock), "%s.bmclear.lock", spelt);
   int lfd = open(lock, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   if (lfd < 0) say("no lock %s (%s): going on without one", lock, strerror(errno));
   else if (flock(lfd, LOCK_EX | LOCK_NB)) {
@@ -304,13 +347,16 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
   signal(SIGTERM, SIG_IGN);
   const char *sock = getenv("TINYNV_BMCLEAR_SOCK");
   if (!sock || !*sock) { fprintf(stderr, "tinynv-bmclear: --watch needs TINYNV_BMCLEAR_SOCK; the socket is never guessed\n"); return 2; }
+  // The client is its pipe, not a pid. Every process holding the session holds the pipe too (pci_tinygpu.c: the
+  // socket and the pipe's write end are both close-on-exec and both pass through a fork), so end of file on fd 3
+  // means no process holds the session any more. A pid said less: a client that forked and exited left its child
+  // in the session, and a watchdog firing on the parent's exit sat in the listen(1) backlog against a live session
+  // and cost the next program its connect (found by review, 2026-11-19). The pid is only for the log.
   int client = (int)getppid(), kq = kqueue(), armed = 0, ever = 0, cleared = 0, server_watched = 0;
   fcntl(3, F_SETFL, fcntl(3, F_GETFL) | O_NONBLOCK);
-  struct kevent ev[3];
-  int n = 0;
-  EV_SET(&ev[n++], 3, EVFILT_READ, EV_ADD, 0, 0, NULL);
-  if (client > 1) EV_SET(&ev[n++], client, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, NULL);
-  if (kq < 0 || kevent(kq, ev, n, NULL, 0, NULL)) { say("watch: kqueue: %s; not watching", strerror(errno)); return 5; }
+  struct kevent ev[1];
+  EV_SET(&ev[0], 3, EVFILT_READ, EV_ADD, 0, 0, NULL);
+  if (kq < 0 || kevent(kq, ev, 1, NULL, 0, NULL)) { say("watch: kqueue: %s; not watching", strerror(errno)); return 5; }
   if (server_pid > 0) {
     EV_SET(&ev[0], server_pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, NULL);
     if (!kevent(kq, ev, 1, NULL, 0, NULL)) server_watched = 1;
@@ -324,6 +370,7 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
       if (!armed) say("server pid %d exited; this client has bus mastering off or never turned it on: nothing to do", server_pid);
       else {
         say("server pid %d exited while client pid %d is alive: clearing bus mastering", server_pid, client);
+        g_why = "the watchdog saw the old server exit under a live client (M4)";
         watched_clear(sock, server_pid, 1, app, timeout, reply_timeout, no_start);
         cleared = 1;
       }
@@ -333,6 +380,7 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
       else if (!armed) say("stood down: clean - client pid %d %s", client, ever ? "read bus mastering back off" : "never turned bus mastering on");
       else {
         say("client exited without a clean teardown (pid %d): clearing bus mastering", client);
+        g_why = "the watchdog saw the client exit without a clean teardown (M4)";
         return watched_clear(sock, server_pid, server_gone != 0, app, timeout, reply_timeout, no_start);
       }
       return 0;
@@ -342,8 +390,7 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
     if (k < 0) { if (errno == EINTR) continue; say("watch: kevent: %s; stopping", strerror(errno)); return 5; }
     for (int i = 0; i < k; i++) {
       if (got[i].filter == EVFILT_PROC && (int)got[i].ident == server_pid) { if (!server_gone) server_gone = 1; continue; }
-      if (got[i].filter == EVFILT_PROC) client_gone = 1;   // the client: whatever it wrote last is still in the pipe
-      // Every byte in the pipe, after a read event or the client's exit alike; end of file is the client's last end.
+      // every byte in the pipe; end of file is the last holder of the session gone
       char b[64];
       ssize_t r;
       while ((r = read(3, b, sizeof(b))) > 0)

@@ -516,9 +516,14 @@ static void tg_close(tinynv_pci_t *p) {
 // under a live server, which then tears the session down with bus mastering on, and the server dying while this
 // process sits idle and touches nothing. The helper's header says what it does and when; what matters here:
 //
-//   - The clean channel is a pipe. This process holds the write end, close-on-exec (tg_rescue's spawn and any other
-//     exec leave it behind), non-blocking and with SIGPIPE off: a watchdog that died first must not kill the client,
-//     which was the step-B bug with the server's socket. The watchdog holds the read end as its fd 3.
+//   - The clean channel is a pipe. This process holds the write end, non-blocking and with SIGPIPE off: a watchdog
+//     that died first must not kill the client, which was the step-B bug with the server's socket. The watchdog holds
+//     the read end as its fd 3, and end of file there is its only sign that the client has gone.
+//   - THE PIPE'S WRITE END AND THE SERVER SOCKET GO TOGETHER: both close-on-exec, both kept across a fork. So every
+//     process that holds the session holds the pipe, and end of file means exactly "nobody holds the session any
+//     more". A fork whose parent exits leaves the child in the session, and the watchdog must not fire then: it
+//     did when it watched the opener's pid, sat in the listen(1) backlog against the live session, and the next
+//     program's connect was refused (found by review, 2026-11-19).
 //   - The watchdog gets nothing else but stdio (POSIX_SPAWN_CLOEXEC_DEFAULT). Holding this process's server socket
 //     would keep the session open after this process died, and the server would never see it go.
 //   - The socket path goes in the environment, not argv: `pkill -f tinygpu.sock` stops servers, not watchdogs.
@@ -604,6 +609,7 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
 #ifdef SO_NOSIGPIPE
   { int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); }
 #endif
+  fcntl(fd, F_SETFD, FD_CLOEXEC);   // as the watchdog's pipe (tg_watch): an exec leaves both behind, a fork keeps both
   int buf = 64 << 20;
   setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));

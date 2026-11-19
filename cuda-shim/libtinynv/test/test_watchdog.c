@@ -26,6 +26,14 @@
 //   8 slow        the server spends 3 s tearing the dead session down: the clear still lands, inside the hard timeout
 //   exit          an armed client that exits without its teardown (TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL=1's path): cleared
 //   sigpipe       the watchdog killed first, then a clean teardown with SIGPIPE at default: the client exits 0
+//   fork          the client forks and the parent exits: the child still holds the session, so nothing fires while
+//                 it lives and quiesces - and its kill -9 does fire (the pipe, not a pid, says the session is gone)
+//   exec          the client exec'd a child and was killed: the session still ends at once, and is cleared
+//   signals       SIGINT, SIGTERM and SIGHUP to the watchdog itself: it lives, and still clears on the client's death
+//   started app   (in 4) answers SIGTERM, logs to TINYGPU_SERVER_LOG with a line saying who started it, and does not
+//                 hold the client's stderr: the client's stderr is a pipe here and reaches end of file once the client
+//                 and the watchdog are gone, with the app still running
+//   spellings     (in 5) two helpers at once, /tmp/X and /private/tmp/X: one lock, one start
 #include "tinynv_pci.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -133,6 +141,21 @@ static int role_client(const char *mode, const char *sock) {
   int sig;
   sigwait(&us, &sig);
   if (!strcmp(mode, "clean")) { p.quiesce(&p); logev("quiesced"); return 0; }
+  if (!strncmp(mode, "fork", 4)) {
+    // the parent goes, the child keeps the session: its socket and the watchdog's pipe both
+    if (fork()) _exit(0);
+    logev("child");
+    if (!strcmp(mode, "fork-clean")) { nap(2); p.quiesce(&p); logev("quiesced"); _exit(0); }
+    for (;;) pause();
+  }
+  if (!strcmp(mode, "exec")) {
+    // a program that starts a helper of its own and is then killed: the helper must hold neither the session nor the
+    // pipe, or the server would not see the session end while the watchdog, seeing the pipe close, fired against it
+    pid_t c = fork();
+    if (!c) { execl("/bin/sleep", "sleep", "4", (char *)NULL); _exit(127); }
+    logev("child %d", (int)c);
+    for (;;) pause();
+  }
   if (!strcmp(mode, "rescue")) {
     p.cfg_read(&p, 4, 2);   // the server is gone: this latches the loss
     p.rescue(&p, 9.0);
@@ -143,7 +166,19 @@ static int role_client(const char *mode, const char *sock) {
 
 // ---- the harness ----
 static const char *helper;
-static char self[PATH_MAX], dir[64], sock[128], logp[160], card[160], errp[160];
+static char self[PATH_MAX], dir[64], sock[128], logp[160], card[160], errp[160], slog[160];
+// The client's stderr is a pipe, as it is under a shell or tools/serve.sh: whoever still holds its write end keeps a
+// reader from ever seeing end of file. drain() copies what has arrived into errp and says whether the end has come.
+static int errfd = -1;
+static int drain(void) {
+  if (errfd < 0) return 1;
+  char b[4096];
+  ssize_t n;
+  int f = open(errp, O_WRONLY | O_APPEND | O_CREAT, 0600);
+  while ((n = read(errfd, b, sizeof(b))) > 0) if (f >= 0 && write(f, b, (size_t)n) < 0) break;
+  if (f >= 0) close(f);
+  return n == 0;
+}
 
 typedef struct { double t; int pid; char ev[16]; int conn; unsigned long v; } ev_t;
 static int load(ev_t *e, int max) {
@@ -188,6 +223,8 @@ static void case_env(const char *teardown_ms) {
   snprintf(logp, sizeof(logp), "%s/events", dir);
   snprintf(card, sizeof(card), "%s/card", dir);
   snprintf(errp, sizeof(errp), "%s/client.err", dir);
+  snprintf(slog, sizeof(slog), "%s/server.log", dir);
+  setenv("TINYGPU_SERVER_LOG", slog, 1);
   setenv("WD_LOG", logp, 1);
   setenv("WD_CARD", card, 1);
   if (teardown_ms) setenv("WD_TEARDOWN_MS", teardown_ms, 1); else unsetenv("WD_TEARDOWN_MS");
@@ -207,11 +244,19 @@ static pid_t spawn_server(void) {
 static pid_t spawn_client(const char *mode) {
   char *argv[] = {self, "client", (char *)mode, sock, NULL};
   posix_spawn_file_actions_t fa;
+  int pp[2];
+  if (pipe(pp)) { perror("pipe"); exit(2); }
+  fcntl(pp[0], F_SETFD, FD_CLOEXEC);
+  fcntl(pp[1], F_SETFD, FD_CLOEXEC);
+  fcntl(pp[0], F_SETFL, O_NONBLOCK);
   posix_spawn_file_actions_init(&fa);
-  posix_spawn_file_actions_addopen(&fa, 2, errp, O_WRONLY | O_CREAT | O_APPEND, 0600);
+  posix_spawn_file_actions_adddup2(&fa, pp[1], 2);
   pid_t pid;
   if (posix_spawn(&pid, self, &fa, NULL, argv, environ)) { perror("spawn client"); exit(2); }
   posix_spawn_file_actions_destroy(&fa);
+  close(pp[1]);
+  if (errfd >= 0) close(errfd);
+  errfd = pp[0];
   if (wait_for("armed", 0, pid, 1, 3, NULL) < 1) printf("note: client %d (%s) did not arm\n", (int)pid, mode);
   return pid;
 }
@@ -234,6 +279,14 @@ static int args_of(pid_t pid, char *out, size_t n) {
   if (f) { if (!fgets(out, (int)n, f)) out[0] = 0; pclose(f); }
   return out[0] != 0;
 }
+// alive and not a zombie: the watchdog is the client's child, and kill(pid, 0) succeeds on one it has not reaped
+static int running(pid_t pid) {
+  char c[64], st[16] = "";
+  snprintf(c, sizeof(c), "ps -o stat= -p %d", (int)pid);
+  FILE *f = popen(c, "r");
+  if (f) { if (!fgets(st, sizeof(st), f)) st[0] = 0; pclose(f); }
+  return st[0] && st[0] != 'Z';
+}
 static int gone(pid_t pid, double limit) {
   double end = now() + limit;
   while (now() < end) { if (kill(pid, 0) && errno == ESRCH) return 1; nap(0.02); }
@@ -248,7 +301,13 @@ static int reap(pid_t pid, double limit) {
   }
   return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
+static int err_eof(double limit) {
+  double end = now() + limit;
+  while (!drain() && now() < end) nap(0.02);
+  return drain();
+}
 static int file_has(const char *path, const char *needle) {
+  if (path == errp) drain();
   FILE *f = fopen(path, "r");
   char line[512];
   int found = 0;
@@ -265,15 +324,18 @@ static void case_end(pid_t server, pid_t wd) {
   int n = load(e, 512);
   for (int i = 0; i < n; i++) if (!strcmp(e[i].ev, "start") && e[i].pid != server) kill(e[i].pid, SIGKILL);
   if (server > 0) { kill(server, SIGKILL); waitpid(server, NULL, 0); }
+  drain();
+  if (errfd >= 0) { close(errfd); errfd = -1; }
   char lock[200];
   snprintf(lock, sizeof(lock), "%s.bmclear.lock", sock);
-  unlink(lock); unlink(sock); unlink(logp); unlink(card); unlink(errp);
+  unlink(lock); unlink(sock); unlink(logp); unlink(card); unlink(errp); unlink(slog);
   rmdir(dir);
 }
 static void show_err(const char *what) {
   static int shown;
   if (fails == shown) return;   // only for a case that has just failed
   shown = fails;
+  drain();
   printf("--- %s: the client's stderr (%s)\n", what, errp);
   FILE *f = fopen(errp, "r");
   char line[512];
@@ -353,6 +415,13 @@ static void case_server_dies(void) {
   reap(client, 3);
   CHECK(wd && gone(wd, 3), "server -9: the watchdog did not exit after the client's death");
   CHECK(count("accept", t1, 0, NULL) == 0 && count("start", t1, 0, NULL) == 0, "server -9: the client's death cost a second clear");
+  // the app the watchdog started: still running, but not on the client's stderr; in its own log; stopped by SIGTERM
+  CHECK(starts == 1 && kill(st.pid, 0) == 0, "server -9: the started app is not running");
+  CHECK(err_eof(1.0), "server -9: the client's stderr never reached end of file - the started app holds it");
+  snprintf(want, sizeof(want), "(pid %d)", (int)st.pid);
+  CHECK(file_has(slog, "started") && file_has(slog, want), "server -9: %s has no line saying the helper started pid %d", slog, (int)st.pid);
+  if (starts == 1) kill(st.pid, SIGTERM);
+  CHECK(starts == 1 && gone(st.pid, 1.5), "server -9: the started app ignored SIGTERM (pkill -f tinygpu.sock could not stop it)");
   if (fails) show_err("server -9");
   case_end(0, wd);
 }
@@ -392,6 +461,86 @@ static void case_together(void) {
   CHECK(count("start", 0, 0, NULL) == 1, "two helpers at once: the app was started %d times", count("start", 0, 0, NULL));
   CHECK(card_get() == 0x0403, "two helpers at once: the card ends at %#x", card_get());
   case_end(0, 0);
+
+  // ...and the same, the two spelling the socket differently: /tmp is /private/tmp, and it must be one lock
+  case_env(NULL);
+  card_set(0x0407);
+  char alt[160];
+  snprintf(alt, sizeof(alt), "/private%s", sock);
+  char *argv2[] = {(char *)helper, "--sock", alt, "--old-pid", dp, "--app", self, NULL};
+  if (posix_spawn(&h[0], helper, NULL, NULL, argv, environ) || posix_spawn(&h[1], helper, NULL, NULL, argv2, environ)) { perror("spawn"); exit(2); }
+  r0 = reap(h[0], 8), r1 = reap(h[1], 8);
+  CHECK(r0 == 0 && r1 == 0, "two spellings at once: they exited %d and %d, want both 0", r0, r1);
+  CHECK(count("start", 0, 0, NULL) == 1, "two spellings at once: the app was started %d times", count("start", 0, 0, NULL));
+  case_end(0, 0);
+}
+
+// fork: the session outlives the process that opened it
+static void case_fork(int killed) {
+  const char *name = killed ? "fork, child killed" : "fork, child clean";
+  case_env(NULL);
+  pid_t server = spawn_server(), client = spawn_client(killed ? "fork-kill" : "fork-clean"), wd = 0;
+  children(client, &wd);
+  double t0 = now();
+  kill(client, SIGUSR1);
+  CHECK(reap(client, 3) == 0, "%s: the parent did not exit 0", name);
+  ev_t ch;
+  CHECK(wait_for("child", t0, 0, 1, 2, &ch) == 1, "%s: no child", name);
+  if (!killed) {
+    CHECK(wait_for("quiesced", t0, 0, 1, 5, NULL) == 1, "%s: the child did not quiesce", name);
+    CHECK(wd && gone(wd, 2), "%s: the watchdog did not exit", name);
+    CHECK(count("accept", t0, server, NULL) == 0, "%s: %d connection(s) while the child held the session", name, count("accept", t0, server, NULL));
+    CHECK(file_has(errp, "stood down: clean"), "%s: the watchdog did not stand down clean", name);
+  } else {
+    nap(0.5);
+    CHECK(count("accept", t0, server, NULL) == 0, "%s: the watchdog connected while the child held the session", name);
+    double t1 = now();
+    kill(ch.pid, SIGKILL);
+    ev_t w;
+    CHECK(wait_for("write", t1, server, 1, 3, &w) == 1 && w.v == 0x0403, "%s: bus mastering was not cleared after the child's kill", name);
+    CHECK(wd && gone(wd, 3), "%s: the watchdog did not exit", name);
+  }
+  show_err(name);
+  case_end(server, wd);
+}
+
+// exec: a child the client exec'd holds no part of the session
+static void case_exec(void) {
+  case_env(NULL);
+  pid_t server = spawn_server(), client = spawn_client("exec"), wd = 0;
+  children(client, &wd);
+  kill(client, SIGUSR1);
+  ev_t ch, eof;
+  CHECK(wait_for("child", 0, client, 1, 2, &ch) == 1, "exec: no child");
+  nap(0.2);
+  double t0 = now();
+  kill(client, SIGKILL);
+  reap(client, 3);
+  wait_for("eof", t0, server, 1, 0.5, NULL);
+  CHECK(first("eof", t0, server, &eof) && eof.conn == 1 && eof.t - t0 < 0.5,
+        "exec: the server did not see the session end within 0.5 s - the exec'd child holds the socket");
+  ev_t w;
+  CHECK(wait_for("write", t0, server, 1, 3, &w) == 1 && w.v == 0x0403 && w.t - t0 < 1.5, "exec: no clear within about 1 s");
+  if (ch.conn > 0) kill(ch.conn, SIGKILL);   // the sleep this test's client started
+  show_err("exec");
+  case_end(server, wd);
+}
+
+// the watchdog shrugs off the signals a terminal or a stop script sends
+static void case_signals(void) {
+  case_env(NULL);
+  pid_t server = spawn_server(), client = spawn_client("idle"), wd = 0;
+  children(client, &wd);
+  if (wd > 0) { kill(wd, SIGINT); kill(wd, SIGTERM); kill(wd, SIGHUP); }
+  nap(0.3);
+  CHECK(wd > 0 && running(wd), "signals: the watchdog died of SIGINT, SIGTERM or SIGHUP");
+  double t0 = now();
+  kill(client, SIGKILL);
+  reap(client, 3);
+  ev_t w;
+  CHECK(wait_for("write", t0, server, 1, 3, &w) == 1 && w.v == 0x0403, "signals: no clear after the client's death");
+  show_err("signals");
+  case_end(server, wd);
 }
 
 // 'R' on its own: the session lost with the server alive, the client's own rescue clears, the watchdog stands down
@@ -482,6 +631,10 @@ int main(int argc, char **argv) {
   case_server_dies();
   case_together();
   case_stand_down();
+  case_fork(0);
+  case_fork(1);
+  case_signals();
+  case_exec();
   case_off("TINYNV_WATCHDOG");
   case_off("TINYNV_EMERGENCY_BM");
   case_slow();

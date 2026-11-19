@@ -37,6 +37,8 @@ SKIPS    = $(BUILD)/test-skips.txt   # one line per SKIP of the last `make test`
 # where the library finds the emergency bus-master clear (tools/tinynv_bmclear.c, built beside it): absolute, as the
 # firmware directory is, because the process that needs it is somebody else's program in somebody else's directory
 CFLAGS  += -DTINYNV_BMCLEAR_DEFAULT=\"$(abspath $(BUILD))/tinynv-bmclear\"
+# and where a server that helper starts writes its output: the log tools/tinygpu-server.sh writes, at the repo root
+CFLAGS  += -DTINYNV_SERVER_LOG_DEFAULT=\"$(abspath ../..)/logs/tinygpu-server.log\"
 # track header dependencies. without this a change to a struct in a header rebuilds only the .c files that were edited,
 # and the rest of the library keeps the old layout: the two halves then disagree about where a field is, which shows up
 # as a value that was set a moment ago reading back as zero. cost me a debugging round; never again.
@@ -198,6 +200,8 @@ test: export TINYNV_EMERGENCY_BM := 0
 # its own binary as the app.
 test: export TINYNV_WATCHDOG := 0
 test: export TINYGPU_APP := /nonexistent/TinyGPU.app/Contents/MacOS/TinyGPU
+# and a stand-in a test does start writes its output nowhere near the repository's own server log
+test: export TINYGPU_SERVER_LOG := /dev/null
 test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_tg_sigpipe $(BUILD)/test_lost $(BUILD)/test_bmclear $(BUILD)/tinynv-bmclear $(BUILD)/test_watchdog $(BUILD)/test_teardown_lost $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@mkdir -p $(BUILD); : > $(SKIPS)
 	@if [ -z "$(HAVE_TINYGRAD)" ] && [ -n "$(STRICT)" ]; then echo "FAIL: TINYNV_REQUIRE_TINYGRAD=1 but $(PYTHON) cannot import tinygrad (tinygrad.helpers, tinygrad.runtime.autogen.nv_570, test.unit.test_remote_pci; TINYGRAD_SRC=$${TINYGRAD_SRC:-$(abspath ../../tinygrad)}; see env.sh)"; exit 1; fi

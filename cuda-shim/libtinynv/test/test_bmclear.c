@@ -112,6 +112,9 @@ int main(int argc, char **argv) {
   fclose(f);
   chmod(app, 0700);
   setenv("TINYGPU_APP", app, 1);   // the same stand-in, should anything fall back to the environment
+  char slog[160];
+  snprintf(slog, sizeof(slog), "%s/server.log", dir);
+  setenv("TINYGPU_SERVER_LOG", slog, 1);   // never the repository's logs/tinygpu-server.log
 
   serve_cmd(0x0407, 1);
   serve_cmd(0xffff, 0);
@@ -185,7 +188,7 @@ int main(int argc, char **argv) {
 
   char lock[200];
   snprintf(lock, sizeof(lock), "%s.bmclear.lock", sock);   // the helper's own, never removed by it (tools/tinynv_bmclear.c)
-  unlink(app); unlink(marker); unlink(sock); unlink(lock); rmdir(dir);
+  unlink(app); unlink(marker); unlink(sock); unlink(lock); unlink(slog); rmdir(dir);
   printf("test_bmclear: %d checks run, %d failed\n", checks, fails);
   return fails ? 1 : 0;
 }
