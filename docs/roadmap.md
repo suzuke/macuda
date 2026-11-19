@@ -41,8 +41,13 @@ Whether a ~200 ms storm always stays clear of the `AppleT8110DART` panic is unkn
    server log are found by env override, then beside the executable (`<prefix>/bin`, `<prefix>/libexec/macuda`,
    `<prefix>/share/macuda`), then the baked build-tree default; a read-only prefix logs to `~/Library/Logs/macuda`.
    `sh setup.sh stage` (`PREFIX` absolute) copies such a tree locally; a staged sm_86 tree moved elsewhere was checked
-   on the null device. Left: decide the binary set and architectures (sm_86 / sm_89 / sm_120a), build the Linux
-   `/proc/self/exe` branch once, and publish. Gate for publishing: outward.
+   on the null device. The Linux `/proc/self/exe` branch was built with gcc 13 (`-std=c11 -O2 -Werror`, in the
+   local `nvidia/cuda:13.0.3-devel-ubuntu24.04` image, no network) and run: a moved prefix, `libexec/macuda`, a two-hop
+   symlink and the helper's `--paths` all resolved into the moved tree. Left: decide the binary set and architectures
+   (sm_86 / sm_89 / sm_120a), and publish. Gate for publishing: outward.
+   - Linux build of the rest of libtinynv (not a release target today): with `-D_DEFAULT_SOURCE` now passed off macOS,
+     what remains is gcc-only `-Werror` diagnostics clang does not raise, in vbios.c, tensor_unlock.c, flcn.c, cubin.c
+     and exec.c (maybe-uninitialized, sign-compare, type-limits, format-truncation).
 6. **RTX 4090 and 5090 checks** when the cards are available: split-K and pointer-array batched GEMM under graph
    capture were verified on the 3060 (sm_86) only. Gate: card.
 

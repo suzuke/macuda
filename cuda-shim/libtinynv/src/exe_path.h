@@ -13,6 +13,11 @@
 // at open or init, and the crash path reads what was stored.
 #ifndef TINYNV_EXE_PATH_H
 #define TINYNV_EXE_PATH_H
+// glibc declares readlink and PATH_MAX under -std=c11 only with a feature-test macro, and that has to come before the
+// first system header of the source file - too late to set here, so say so instead of failing on readlink.
+#if !defined(__APPLE__) && !defined(_DEFAULT_SOURCE) && !defined(_GNU_SOURCE) && !defined(_POSIX_C_SOURCE) && !defined(_XOPEN_SOURCE)
+#error "exe_path.h: #define _DEFAULT_SOURCE before the first #include of this source file (glibc: readlink, PATH_MAX)"
+#endif
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +57,12 @@ static inline int tinynv_exe_prefix(const char *exe_dir, char *out, size_t n) {
   if (!s) return -1;
   if (s == out) s[1] = 0; else *s = 0;
   return 0;
+}
+
+// a/b into out, or -1 when it does not fit: a cut path names some other file, so a caller drops that candidate
+static inline int tinynv_join(char *out, size_t n, const char *a, const char *b) {
+  int k = snprintf(out, n, "%s%s", a, b);
+  return k >= 0 && (size_t)k < n ? 0 : -1;
 }
 
 static inline int tinynv_is_exec(const char *p) { struct stat st; return !stat(p, &st) && S_ISREG(st.st_mode) && !access(p, X_OK); }

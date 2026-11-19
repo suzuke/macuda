@@ -38,24 +38,24 @@ static pthread_once_t bm_once = PTHREAD_ONCE_INIT;
 static void bm_resolve(void) {
   const char *env = getenv("TINYNV_BMCLEAR_HELPER");
   int quiet = env && *env;
-  char dir[PATH_MAX], pre[PATH_MAX], cand[3][PATH_MAX + 48];
+  char dir[PATH_MAX], pre[PATH_MAX], cand[3][sizeof(bm_found)];
   int nc = 0;
   if (!tinynv_exe_dir(dir, sizeof(dir))) {
-    snprintf(cand[nc++], sizeof(cand[0]), "%s/tinynv-bmclear", dir);
-    if (!tinynv_exe_prefix(dir, pre, sizeof(pre))) snprintf(cand[nc++], sizeof(cand[0]), "%s/libexec/macuda/tinynv-bmclear", pre);
+    if (!tinynv_join(cand[nc], sizeof(cand[0]), dir, "/tinynv-bmclear")) nc++;
+    if (!tinynv_exe_prefix(dir, pre, sizeof(pre)) && !tinynv_join(cand[nc], sizeof(cand[0]), pre, "/libexec/macuda/tinynv-bmclear")) nc++;
   }
   snprintf(cand[nc++], sizeof(cand[0]), "%s", TINYNV_BMCLEAR_DEFAULT);
   for (int i = 0; i < nc; i++) {
     if (!tinynv_is_exec(cand[i])) continue;
     int baked = i == nc - 1 || tinynv_same_file(cand[i], TINYNV_BMCLEAR_DEFAULT);
-    snprintf(bm_found, sizeof(bm_found), "%s", baked ? TINYNV_BMCLEAR_DEFAULT : cand[i]);
+    if (baked) snprintf(bm_found, sizeof(bm_found), "%s", TINYNV_BMCLEAR_DEFAULT); else memcpy(bm_found, cand[i], sizeof(bm_found));
     if (!baked && !quiet)
       fprintf(stderr, "libtinynv: tinynv-bmclear from %s (relative to the executable; TINYNV_BMCLEAR_HELPER overrides it)\n", bm_found);
     return;
   }
   snprintf(bm_found, sizeof(bm_found), "%s", TINYNV_BMCLEAR_DEFAULT);   // so a start fails with this name, as it did
   if (quiet) return;
-  char looked[3 * (PATH_MAX + 48) + 8] = "";
+  char looked[3 * sizeof(bm_found) + 8] = "";
   for (int i = 0; i < nc; i++) { strcat(looked, i ? ", " : ""); strcat(looked, cand[i]); }
   fprintf(stderr, "libtinynv: no tinynv-bmclear found (looked in %s): no emergency bus-master clear and no watchdog\n", looked);
 }

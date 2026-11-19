@@ -1,5 +1,7 @@
 // glibc declares realpath and readlink (src/exe_path.h) under -std=c11 only with this; the bsd headers need nothing
+#ifndef _DEFAULT_SOURCE   // the Makefile passes it off macOS; this is for a build that compiles fw.c on its own
 #define _DEFAULT_SOURCE
+#endif
 #include "fw.h"
 #include "internal.h"
 #include "sha256.h"
@@ -23,12 +25,12 @@ void tinynv_fw_set_root(const char *dir) { fw_root_override = dir; }
 static char fw_found[PATH_MAX];
 static pthread_once_t fw_once = PTHREAD_ONCE_INIT;
 static void fw_resolve(void) {
-  char dir[PATH_MAX], pre[PATH_MAX], cand[PATH_MAX + 32];
+  char dir[PATH_MAX], pre[PATH_MAX], cand[sizeof(fw_found)];
   snprintf(fw_found, sizeof(fw_found), "%s", TINYNV_FW_DEFAULT_DIR);
   if (tinynv_exe_dir(dir, sizeof(dir)) || tinynv_exe_prefix(dir, pre, sizeof(pre))) return;
-  snprintf(cand, sizeof(cand), "%s/share/macuda/firmware", pre);
+  if (tinynv_join(cand, sizeof(cand), pre, "/share/macuda/firmware")) return;
   if (!tinynv_is_dir(cand) || tinynv_same_file(cand, TINYNV_FW_DEFAULT_DIR)) return;
-  snprintf(fw_found, sizeof(fw_found), "%s", cand);
+  memcpy(fw_found, cand, sizeof(fw_found));
   fprintf(stderr, "libtinynv: firmware from %s (relative to the executable; TINYNV_FW_DIR overrides it)\n", fw_found);
 }
 

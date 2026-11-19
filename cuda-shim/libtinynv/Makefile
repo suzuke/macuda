@@ -13,6 +13,11 @@ SDK     := $(shell sh $(dir $(lastword $(MAKEFILE_LIST)))../build/sdk.sh 2>/dev/
 ifneq ($(SDK),)
 CFLAGS  += -isysroot $(SDK)
 endif
+# glibc hides POSIX (clock_gettime, nanosleep, strdup, sigaction, kill, readlink, PATH_MAX) under -std=c11 unless a
+# feature-test macro asks for it; the bsd headers on macOS do not. One flag here, not a #define per source file.
+ifneq ($(shell uname),Darwin)
+CFLAGS  += -D_DEFAULT_SOURCE
+endif
 # absolute, from the source tree: a relative firmware path finds the images from one directory and not from another,
 # which turns a missing fetch into a test that passes without testing anything
 CFLAGS  += -DTINYNV_FW_DEFAULT_DIR=\"$(abspath third_party/firmware)\"

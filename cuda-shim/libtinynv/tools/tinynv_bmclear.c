@@ -124,8 +124,8 @@ static void server_script(char *out, size_t n) {
   char dir[PATH_MAX], pre[PATH_MAX], cand[PATH_MAX + 48];
   if (e && *e) { snprintf(out, n, "%s", e); return; }
   if (!tinynv_exe_dir(dir, sizeof(dir)) && !tinynv_exe_prefix(dir, pre, sizeof(pre))) {
-    snprintf(cand, sizeof(cand), "%s/share/macuda/tinygpu-server.sh", pre);
-    if (tinynv_is_readable(cand)) { snprintf(out, n, "%s", cand); return; }
+    if (!tinynv_join(cand, sizeof(cand), pre, "/share/macuda/tinygpu-server.sh") && tinynv_is_readable(cand)
+        && !tinynv_join(out, n, cand, "")) return;
   }
   snprintf(out, n, "%s", server_script_default);
 }
@@ -141,10 +141,9 @@ static void server_log(char *out, size_t n) {
   snprintf(d, sizeof(d), "%s", server_log_default);
   char *slash = strrchr(d, '/');
   if (slash && slash != d) { *slash = 0; if (tinynv_is_dir(d)) { snprintf(out, n, "%s", server_log_default); return; } }
-  if (home && *home && snprintf(d, sizeof(d), "%s/Library/Logs/macuda", home) < (int)sizeof(d) && !mkdirs(d)) {
-    snprintf(out, n, "%s/tinygpu-server.log", d);
+  if (home && *home && !tinynv_join(d, sizeof(d), home, "/Library/Logs/macuda") && !mkdirs(d)
+      && !tinynv_join(out, n, d, "/tinygpu-server.log"))
     return;
-  }
   snprintf(out, n, "/dev/null");
 }
 
@@ -164,7 +163,8 @@ static void say(const char *fmt, ...) {
 static void on_alarm(int sig) {
   (void)sig;
   static const char m[] = "tinynv-bmclear: the hard timeout expired; stopping with nothing more sent\n";
-  write(2, m, sizeof(m) - 1);
+  ssize_t w = write(2, m, sizeof(m) - 1);   // nothing to do if it fails: the exit status says it
+  (void)w;
   _exit(124);
 }
 
@@ -176,8 +176,9 @@ static void norm(const char *path, char *out, size_t n) {
   char d[PATH_MAX], b[PATH_MAX], r[PATH_MAX];
   snprintf(d, sizeof(d), "%s", path);
   snprintf(b, sizeof(b), "%s", path);
-  if (realpath(dirname(d), r)) snprintf(out, n, "%s/%s", r, basename(b));
-  else snprintf(out, n, "%s", path);
+  char dir_slash[PATH_MAX + 1];
+  if (!realpath(dirname(d), r) || tinynv_join(dir_slash, sizeof(dir_slash), r, "/") || tinynv_join(out, n, dir_slash, basename(b)))
+    snprintf(out, n, "%s", path);   // unresolvable, or too long resolved: the spelling as given
 }
 
 // Any process whose arguments contain "server PATH": a TinyGPU server for this socket, alive whatever its socket says.
@@ -376,8 +377,8 @@ static int clear(const char *sock, int old_pid, int old_gone, const char *app, d
   int waited = 0;
   char spelt[PATH_MAX];
   norm(sock, spelt, sizeof(spelt));   // one name however the socket is spelt, as server_process_for matches it
-  snprintf(lock, sizeof(lock), "%s.bmclear.lock", spelt);
-  int lfd = open(lock, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  // a cut name would be some other lock file: then none (a socket path is at most 104 bytes, so it never is)
+  int lfd = tinynv_join(lock, sizeof(lock), spelt, ".bmclear.lock") ? (errno = ENAMETOOLONG, -1) : open(lock, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   if (lfd < 0) say("no lock %s (%s): going on without one", lock, strerror(errno));
   else if (flock(lfd, LOCK_EX | LOCK_NB)) {
     say("another bus-master clear of %s holds %s: waiting for it", sock, lock);
