@@ -148,7 +148,7 @@ fi
 # nothing missing - the usual one - needs it too. Local cache files only, so no question asked.
 if [ -d /Applications/TinyGPU.app ]; then
   echo "== tinygrad pkill guard (the files tinygrad checks before it would kill a serving TinyGPU server):"
-  sh "$R/tools/tinygpu-sentinel.sh" create | sed 's/^   /   /'
+  sh "$R/tools/tinygpu-sentinel.sh" create
 fi
 
 # ---------------------------------------------------------------- build
