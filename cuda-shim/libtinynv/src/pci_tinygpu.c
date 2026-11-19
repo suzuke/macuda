@@ -60,6 +60,9 @@ typedef struct {
   int peer_pid;
   int rescue_state; // 0 not started, 1 running, 2 finished, refused or turned off
   pid_t rescue_pid;
+  // The watchdog's clean channel (M4, tg_watch): the write end of its pipe, -1 when there is none, and whether the
+  // last byte said bus mastering may be on.
+  int wd_fd, wd_armed;
 } tg_t;
 
 
@@ -254,6 +257,14 @@ static int rpc(tg_t *tg, resp_t *rp, uint8_t cmd, uint32_t bar, uint64_t a0, uin
   return 0;
 }
 
+// One byte to the watchdog: 'A' bus mastering may be on, 'C' it was read back off, 'R' the M3 rescue has started.
+// The pipe is non-blocking and raises no SIGPIPE (tg_watch), so a watchdog that died first costs nothing here.
+static void tg_wd_say(tg_t *tg, char what) {
+  if (tg->wd_fd < 0) return;
+  if (write(tg->wd_fd, &what, 1) == 1) tg->wd_armed = what == 'A';
+}
+static void tg_wd_arm(tg_t *tg) { if (!tg->wd_armed) tg_wd_say(tg, 'A'); }
+
 static uint32_t tg_cfg_read(tinynv_pci_t *p, uint32_t off, uint32_t size) {
   resp_t rp;
   if (rpc(p->ctx, &rp, CMD_CFG_READ, 0, off, size, 0, NULL, 0, NULL, 0, NULL)) return 0xffffffff;
@@ -262,6 +273,8 @@ static uint32_t tg_cfg_read(tinynv_pci_t *p, uint32_t off, uint32_t size) {
 
 static void tg_cfg_write(tinynv_pci_t *p, uint32_t off, uint32_t size, uint32_t val) {
   resp_t rp;
+  // armed BEFORE the write goes out: a client killed between the two must not leave a watchdog that believes it clean
+  if (off == PCI_COMMAND && (val & PCI_COMMAND_MASTER)) tg_wd_arm(p->ctx);
   rpc(p->ctx, &rp, CMD_CFG_WRITE, 0, off, size, val, NULL, 0, NULL, 0, NULL);
 }
 
@@ -338,6 +351,7 @@ static int tg_dma_alloc(tinynv_pci_t *p, size_t size, tinynv_dma_t *out) {
   resp_t rp;
   int fd = -1;
   if (tg->ndma >= MAX_DMA) return tinynv_fail("tinygpu: the server allows %d dma mappings per session", MAX_DMA);
+  tg_wd_arm(tg);   // a mapping the server will complete when the session ends, with whatever mastering the card has
   if (rpc(tg, &rp, CMD_MAP_SYSMEM_FD, 0, size, 0, 0, NULL, 0, NULL, 0, &fd)) return -1;
   if (fd < 0) return tinynv_fail("tinygpu: dma reply carried no descriptor");
 
@@ -395,7 +409,9 @@ static void tg_quiesce(tinynv_pci_t *p) {
   // cmd & ~MASTER back for the second would put 0xfffb in the command register of whatever answers there next.
   if (cmd == 0xffffffff || (cmd & 0xffff) == 0xffff) return;
   tg_cfg_write(p, PCI_COMMAND, 2, cmd & ~PCI_COMMAND_MASTER);
-  tg_cfg_read(p, PCI_COMMAND, 2); // read back, so the write has landed before any mapping is torn down
+  uint32_t after = tg_cfg_read(p, PCI_COMMAND, 2); // read back, so the write has landed before any mapping is torn down
+  // Clean only on what the card said: a read-back that failed, or still has MASTER, leaves the watchdog armed.
+  if (after != 0xffffffff && (after & 0xffff) != 0xffff && !(after & PCI_COMMAND_MASTER)) tg_wd_say(p->ctx, 'C');
 }
 
 static int tg_transport_dead(tinynv_pci_t *p) { tg_t *tg = p->ctx; return tg && tg->dead; }
@@ -455,6 +471,7 @@ static void tg_rescue(tinynv_pci_t *p, double wait_s) {
       return;
     }
     tg->rescue_state = 1;
+    tg_wd_say(tg, 'R');   // the watchdog stands down rather than race this one to the server
     fprintf(stderr, "libtinynv: emergency bus-master clear started: %s --sock %s --old-pid %s (pid %d)\n", helper,
             tg->path, pid, (int)tg->rescue_pid);
   }
@@ -489,8 +506,84 @@ static void tg_close(tinynv_pci_t *p) {
   if (!tg) return;
   for (int i = 0; i < tg->ndma; i++) munmap(tg->dma[i].va, tg->dma[i].size);
   if (tg->fd >= 0) close(tg->fd);
+  if (tg->wd_fd >= 0) close(tg->wd_fd);   // after the socket: an armed session closed is the watchdog's to clear
   free(tg);
   p->ctx = NULL;
+}
+
+// M4 of the 2026-11-18 DART panic analysis: a watchdog beside every session, tinynv-bmclear --watch, for the two ways
+// out that M2 and M3 cannot see because they need this process alive and talking - this process killed or crashed
+// under a live server, which then tears the session down with bus mastering on, and the server dying while this
+// process sits idle and touches nothing. The helper's header says what it does and when; what matters here:
+//
+//   - The clean channel is a pipe. This process holds the write end, close-on-exec (tg_rescue's spawn and any other
+//     exec leave it behind), non-blocking and with SIGPIPE off: a watchdog that died first must not kill the client,
+//     which was the step-B bug with the server's socket. The watchdog holds the read end as its fd 3.
+//   - The watchdog gets nothing else but stdio (POSIX_SPAWN_CLOEXEC_DEFAULT). Holding this process's server socket
+//     would keep the session open after this process died, and the server would never see it go.
+//   - The socket path goes in the environment, not argv: `pkill -f tinygpu.sock` stops servers, not watchdogs.
+//   - A session of its own, and the helper ignores SIGINT/SIGHUP/SIGTERM: a ^C or a kill of this process group is
+//     what it is there for.
+//   - TINYNV_WATCHDOG=0 turns it off, and so does TINYNV_EMERGENCY_BM=0, which already meant "no bus-master clear
+//     from anyone but this process's own teardown".
+// macOS only: it watches pids with kqueue, and only the macOS server can be killed under a client this way.
+static void tg_watch(tg_t *tg) {
+#ifdef __APPLE__
+  const char *off = getenv("TINYNV_WATCHDOG"), *em = getenv("TINYNV_EMERGENCY_BM");
+  if ((off && !strcmp(off, "0")) || (em && !strcmp(em, "0"))) {
+    fprintf(stderr, "libtinynv: %s=0: no watchdog; a kill of this process or of the server leaves bus mastering as it is\n",
+            off && !strcmp(off, "0") ? "TINYNV_WATCHDOG" : "TINYNV_EMERGENCY_BM");
+    return;
+  }
+  const char *helper = getenv("TINYNV_BMCLEAR_HELPER");
+  if (!helper || !*helper) helper = TINYNV_BMCLEAR_DEFAULT;
+  int pfd[2];
+  if (pipe(pfd)) { fprintf(stderr, "libtinynv: no watchdog: pipe: %s\n", strerror(errno)); return; }
+  // the read end above the three it becomes fd 3 among: a dup2 onto itself would keep its close-on-exec
+  int rd = fcntl(pfd[0], F_DUPFD_CLOEXEC, 10);
+  close(pfd[0]);
+  fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+  fcntl(pfd[1], F_SETFL, fcntl(pfd[1], F_GETFL) | O_NONBLOCK);
+  fcntl(pfd[1], F_SETNOSIGPIPE, 1);
+  if (rd < 0) { close(pfd[1]); fprintf(stderr, "libtinynv: no watchdog: %s\n", strerror(errno)); return; }
+
+  size_t n = 0;
+  while (environ[n]) n++;
+  char **env = calloc(n + 2, sizeof(char *)), sockvar[sizeof(tg->path) + 32];
+  size_t k = 0;
+  for (size_t i = 0; i < n; i++) if (strncmp(environ[i], "TINYNV_BMCLEAR_SOCK=", 20)) env[k++] = environ[i];
+  snprintf(sockvar, sizeof(sockvar), "TINYNV_BMCLEAR_SOCK=%s", tg->path);
+  env[k++] = sockvar;
+  char pid[16];
+  snprintf(pid, sizeof(pid), "%d", tg->peer_pid);
+  char *argv[] = {(char *)helper, "--watch", "--old-pid", pid, NULL};
+  posix_spawnattr_t at;
+  posix_spawn_file_actions_t fa;
+  sigset_t none;
+  sigemptyset(&none);
+  posix_spawnattr_init(&at);
+  posix_spawnattr_setsigmask(&at, &none);
+  posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT);
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_adddup2(&fa, 2, 1);
+  posix_spawn_file_actions_addinherit_np(&fa, 2);
+  posix_spawn_file_actions_adddup2(&fa, rd, 3);
+  pid_t wd;
+  int rc = posix_spawn(&wd, helper, &fa, &at, argv, env);
+  posix_spawn_file_actions_destroy(&fa);
+  posix_spawnattr_destroy(&at);
+  free(env);
+  close(rd);
+  if (rc) {
+    close(pfd[1]);
+    fprintf(stderr, "libtinynv: could not start the watchdog (%s): %s\n", helper, strerror(rc));
+    return;
+  }
+  tg->wd_fd = pfd[1];
+#else
+  (void)tg;
+#endif
 }
 
 int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
@@ -517,10 +610,12 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
 
   tg_t *tg = calloc(1, sizeof(tg_t));
   tg->fd = fd;
+  tg->wd_fd = -1;
   snprintf(tg->path, sizeof(tg->path), "%s", sock_path);
 #ifdef LOCAL_PEERPID
   { pid_t peer = 0; socklen_t len = sizeof(peer); if (!getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &peer, &len)) tg->peer_pid = peer; }
 #endif
+  tg_watch(tg);
   *out = (tinynv_pci_t){.ctx = tg, .live = 1, .name = "usb4", .cfg_read = tg_cfg_read, .cfg_write = tg_cfg_write, .bar_info = tg_bar_info,
                         .bar_map = tg_bar_map, .bar_unmap = tg_bar_unmap, .dma_alloc = tg_dma_alloc, .dma_free = tg_dma_free,
                         .reset = tg_reset, .quiesce = tg_quiesce, .close = tg_close, .transport_dead = tg_transport_dead,

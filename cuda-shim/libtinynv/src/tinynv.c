@@ -170,11 +170,16 @@ static void put_the_card_down(void) {
     // executing. Unloading the GSP under live DMA is the known MMU-fault wedge; leaving it risks a DART fault when the
     // mappings are reclaimed. Like nv-uefi-unlocker, which halts rather than tear down under possibly-live DMA, this
     // chooses to touch nothing: no exec_fini, no gpu_close.
+    // What it cannot choose is the session's end: this process exiting IS the server's CompleteDMA, with mastering on
+    // - the 2026-11-18 shape. So no clean byte goes to the watchdog (pci_tinygpu.c: tg_watch), and once the session
+    // has gone it clears bus mastering through a fresh connection. That touches no firmware and unmaps nothing: the
+    // live DMA this knob protects from a GSP unload is, by then, faulting against mappings already gone.
     if (drained) {
       const char *skip = getenv("TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL");
       if (skip && *skip == '1') {
         fprintf(stderr, "libtinynv: the exit-path drain failed; TINYNV_SKIP_UNLOAD_ON_DRAIN_FAIL=1, so the GSP is NOT "
-                        "unloaded and bus mastering is NOT cleared (the card may still be executing)\n");
+                        "unloaded and this process does NOT clear bus mastering (the card may still be executing); over "
+                        "tinygpu the watchdog clears it once the session has ended\n");
         return;
       }
     }

@@ -76,6 +76,7 @@ static void wp_check(int dead, int errfd) {
 
 int main(void) {
   signal(SIGPIPE, SIG_IGN); // as llama-server does: a send to a dead peer fails with EPIPE rather than killing us
+  setenv("TINYNV_WATCHDOG", "0", 1);   // no watchdog beside this fake server, however the test is run
   char dir[] = "/tmp/tgdead.XXXXXX", path[128], errpath[160];
   if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
   snprintf(path, sizeof(path), "%s/tinygpu.sock", dir);

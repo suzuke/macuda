@@ -192,7 +192,13 @@ test: export TINYNV_SOCKET :=
 # and no emergency bus-master clear (src/pci_tinygpu.c: tg_rescue) from a test that latches a lost server: the arms
 # that exercise it turn it on themselves, with the helper, the socket and the app all pointed at stand-ins.
 test: export TINYNV_EMERGENCY_BM := 0
-test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_tg_sigpipe $(BUILD)/test_lost $(BUILD)/test_bmclear $(BUILD)/tinynv-bmclear $(BUILD)/test_teardown_lost $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+# and no watchdog (src/pci_tinygpu.c: tg_watch), which TINYNV_EMERGENCY_BM=0 already implies and this says outright.
+# Should one start anyway, the only app it can start does not exist: a watchdog beside a test whose fake server exits
+# would otherwise start the installed TinyGPU on that test's socket. test_watchdog turns both on again for itself, with
+# its own binary as the app.
+test: export TINYNV_WATCHDOG := 0
+test: export TINYGPU_APP := /nonexistent/TinyGPU.app/Contents/MacOS/TinyGPU
+test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_tg_sigpipe $(BUILD)/test_lost $(BUILD)/test_bmclear $(BUILD)/tinynv-bmclear $(BUILD)/test_watchdog $(BUILD)/test_teardown_lost $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@mkdir -p $(BUILD); : > $(SKIPS)
 	@if [ -z "$(HAVE_TINYGRAD)" ] && [ -n "$(STRICT)" ]; then echo "FAIL: TINYNV_REQUIRE_TINYGRAD=1 but $(PYTHON) cannot import tinygrad (tinygrad.helpers, tinygrad.runtime.autogen.nv_570, test.unit.test_remote_pci; TINYGRAD_SRC=$${TINYGRAD_SRC:-$(abspath ../../tinygrad)}; see env.sh)"; exit 1; fi
 	@[ -n "$(HAVE_TINYGRAD)" ] || echo "  no tinygrad (TINYGRAD_SRC, see env.sh): the steps that need it say SKIP (no tinygrad) and the rest runs; TINYNV_REQUIRE_TINYGRAD=1 fails instead"
@@ -273,6 +279,10 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@# nothing written to a device that reads all ones or through a server that does not answer; the hard timeout holds.
 	@# Every path it could take to the real server or app is overridden, and it is told the helper by absolute path.
 	@$(BUILD)/test_bmclear $(abspath $(BUILD))/tinynv-bmclear
+	@# the watchdog (M4) with real processes and SIGKILL, against a fake server it plays and counts the starts of: a
+	@# killed client or a killed server gets bus mastering cleared once, a clean exit costs the server no connection, two
+	@# clears at once start one app. Its stand-in app is the test binary itself, never the installed one.
+	@$(BUILD)/test_watchdog $(abspath $(BUILD))/tinynv-bmclear
 	@if [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_trace.py --selftest; else echo "SKIP (no tinygrad): nv_trace.py --selftest — the boot-trace recorder's coalescing self-check" | tee -a $(SKIPS); fi
 	@# what a cubin references and does not contain, both halves: the device printf resolves, anything else is refused.
 	@# the cubin is build output and not in the repository, so it is made if it is missing rather than assumed.

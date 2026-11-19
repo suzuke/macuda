@@ -24,6 +24,34 @@
 // 0 bus mastering confirmed off; 2 usage; 3 no server reachable and none started; 4 the first read was not answered
 // (another client, or a wedged server) - nothing written; 5 the server failed a request or the connection was lost;
 // 6 the device reads all ones - nothing written; 7 the read-back still has bus mastering on; 124 --timeout expired.
+//
+// ONE SERVER START, however many clears race. The client's own rescue and the watchdog's server-death trigger fired
+// in the same millisecond on the card (2026-11-19), and two helpers that each find no server each start one: two
+// TinyGPU servers on one socket path. So steps 1-4 run under flock on "PATH.bmclear.lock", in every mode, and a helper
+// that had to wait for the lock never starts a server: whoever held it has started one or found one, and the waiter
+// only looks again (a connect, then the process list). The lock file is never removed - an unlink between another
+// helper's open and its flock would hand the two of them different locks.
+//
+//   tinynv-bmclear --watch [--old-pid N]       (socket in $TINYNV_BMCLEAR_SOCK, the client's clean channel on fd 3)
+//
+// WATCH MODE: M4, the watchdog libtinynv starts beside every TinyGPU session (pci_tinygpu.c: tg_watch). M2 and M3 need
+// a client alive to notice; two ways out had nobody: the client killed or crashed under a live server, which then
+// tears the session down with bus mastering on, and the server dying under an idle client that touches nothing. This
+// process outlives both and runs steps 1-4 at most once:
+//   - the client gone (its end of fd 3 closed, or its pid exited) while ARMED: "client exited without a clean teardown";
+//   - the server (--old-pid, the client's LOCAL_PEERPID) exited while the client lives and is armed: "server pid N
+//     exited", a fresh server started if none serves the path; then it waits on for the client, and clears no more.
+// The client writes one byte per change: 'A' bus mastering may be on (a PCI_COMMAND write with MASTER, a DMA mapping),
+// 'C' its own teardown read bus mastering back OFF, 'R' its own M3 rescue has started - stand down rather than race it.
+// The last byte before the client goes decides, so a quiesce in mid-session followed by a reboot is armed again; a
+// session that never turned mastering on is clean, and a clean exit makes NO connection to the server - one spare
+// connect sits in the listen(1) backlog and the next program's connect is refused.
+// The socket is not in argv because tools that stop a server run `pkill -f tinygpu.sock`, which would take this too.
+// SIGINT, SIGHUP and SIGTERM are ignored and the process has a session of its own: a ^C or a group kill of the client
+// is exactly what it is there for. Its descriptors are fd 3 and stdio only - holding the client's server socket would
+// keep the session open after the client died, and the server would never see it go. The client killed under a busy
+// server meets a server still tearing the dead session down, so the first read may wait: --reply-timeout 8 and
+// --timeout 10 here, against 1 and 5 for the client's own rescue, where nothing else is being torn down.
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -33,9 +61,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #ifdef __APPLE__
+#include <sys/event.h>
 #include <sys/sysctl.h>
 #endif
 #include <libgen.h>
@@ -190,42 +221,33 @@ static int rpc(int fd, uint8_t cmd, uint64_t a0, uint64_t a1, uint64_t a2, uint6
   return 0;
 }
 
-int main(int argc, char **argv) {
-  const char *sock = NULL, *app = getenv("TINYGPU_APP");
-  int old_pid = 0, no_start = 0;
-  double timeout = 5.0, reply_timeout = 1.0;
-  for (int i = 1; i < argc; i++) {
-    const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
-    if (!strcmp(a, "--no-start")) { no_start = 1; continue; }
-    if (!v) { fprintf(stderr, "tinynv-bmclear: %s needs a value\n", a); return 2; }
-    if (!strcmp(a, "--sock")) sock = v;
-    else if (!strcmp(a, "--old-pid")) old_pid = atoi(v);
-    else if (!strcmp(a, "--app")) app = v;
-    else if (!strcmp(a, "--timeout")) timeout = atof(v);
-    else if (!strcmp(a, "--reply-timeout")) reply_timeout = atof(v);
-    else { fprintf(stderr, "tinynv-bmclear: unknown argument %s\n", a); return 2; }
-    i++;
-  }
-  // No default socket: which server to reach is the caller's to say, never guessed from this process's environment.
-  if (!sock || !*sock || timeout <= 0 || reply_timeout <= 0) {
-    fprintf(stderr, "usage: tinynv-bmclear --sock PATH [--old-pid N] [--app PATH] [--timeout S] [--reply-timeout S] [--no-start]\n");
-    return 2;
-  }
-  if (!app || !*app) app = DEFAULT_APP;
-  signal(SIGPIPE, SIG_IGN);
-  signal(SIGALRM, on_alarm);
-  alarm((unsigned)(timeout + 0.999));
+// Steps 1-4 under the lock. old_gone: the caller knows the old server has exited (the watchdog was told by the
+// kernel), which a zombie not yet reaped would otherwise contradict.
+static int clear(const char *sock, int old_pid, int old_gone, const char *app, double reply_timeout, int no_start) {
+  int old_alive = !old_gone && pid_alive(old_pid);
   say("clearing bus mastering through %s (old server pid %d %s)", sock, old_pid,
-      old_pid <= 0 ? "unknown" : pid_alive(old_pid) ? "alive" : "gone");
+      old_pid <= 0 ? "unknown" : old_alive ? "alive" : "gone");
+  char lock[PATH_MAX];
+  int waited = 0;
+  snprintf(lock, sizeof(lock), "%s.bmclear.lock", sock);
+  int lfd = open(lock, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (lfd < 0) say("no lock %s (%s): going on without one", lock, strerror(errno));
+  else if (flock(lfd, LOCK_EX | LOCK_NB)) {
+    say("another bus-master clear of %s holds %s: waiting for it", sock, lock);
+    while (flock(lfd, LOCK_EX) && errno == EINTR) {}   // bounded by the alarm
+    waited = 1;
+    say("the other clear is done: looking again for its server, and starting none");
+  }
 
   int fd = connect_to(sock, reply_timeout);
   if (fd < 0) {
     int e = errno, other = server_process_for(sock);
-    if (pid_alive(old_pid) || other) {
+    if (old_alive || other) {
       say("a server for %s may be alive (pid %d) but refuses connections (%s): busy with another client or wedged; not touching it",
-          sock, pid_alive(old_pid) ? old_pid : other, strerror(e));
+          sock, old_alive ? old_pid : other, strerror(e));
       return 3;
     }
+    if (waited) { say("no server on %s (%s) after the other clear: not starting a second; nothing done", sock, strerror(e)); return 3; }
     if (no_start) { say("no server on %s (%s) and --no-start: nothing done", sock, strerror(e)); return 3; }
     if (start_server(app, sock)) return 3;
     struct timespec nap = {0, 50 * 1000 * 1000};
@@ -251,4 +273,127 @@ int main(int argc, char **argv) {
       after & PCI_COMMAND_MASTER ? "STILL ON" : "off");
   close(fd);
   return after & PCI_COMMAND_MASTER ? 7 : 0;
+}
+
+#ifdef __APPLE__
+// One clear, in a child of its own with its own alarm: the hard timeout then ends that attempt and not the watchdog,
+// which may still have the client to wait for.
+static int watched_clear(const char *sock, int old_pid, int old_gone, const char *app, double timeout, double reply_timeout,
+                         int no_start) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    signal(SIGALRM, on_alarm);
+    alarm((unsigned)(timeout + 0.999));
+    _exit(clear(sock, old_pid, old_gone, app, reply_timeout, no_start));
+  }
+  if (pid < 0) { say("could not fork the clear: %s", strerror(errno)); return -1; }
+  int st = 0;
+  while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+  int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+  say("the clear exited %d%s", rc, rc ? ": bus mastering was NOT confirmed off" : "");
+  return rc;
+}
+
+static int watch(int server_pid, const char *app, double timeout, double reply_timeout, int no_start) {
+  signal(SIGINT, SIG_IGN);
+  signal(SIGHUP, SIG_IGN);
+  signal(SIGTERM, SIG_IGN);
+  const char *sock = getenv("TINYNV_BMCLEAR_SOCK");
+  if (!sock || !*sock) { fprintf(stderr, "tinynv-bmclear: --watch needs TINYNV_BMCLEAR_SOCK; the socket is never guessed\n"); return 2; }
+  int client = (int)getppid(), kq = kqueue(), armed = 0, ever = 0, cleared = 0, server_watched = 0;
+  fcntl(3, F_SETFL, fcntl(3, F_GETFL) | O_NONBLOCK);
+  struct kevent ev[3];
+  int n = 0;
+  EV_SET(&ev[n++], 3, EVFILT_READ, EV_ADD, 0, 0, NULL);
+  if (client > 1) EV_SET(&ev[n++], client, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, NULL);
+  if (kq < 0 || kevent(kq, ev, n, NULL, 0, NULL)) { say("watch: kqueue: %s; not watching", strerror(errno)); return 5; }
+  if (server_pid > 0) {
+    EV_SET(&ev[0], server_pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, NULL);
+    if (!kevent(kq, ev, 1, NULL, 0, NULL)) server_watched = 1;
+    else if (errno != ESRCH) say("watch: cannot watch server pid %d (%s); watching the client only", server_pid, strerror(errno));
+  }
+  say("watching client pid %d and server pid %d%s on %s", client, server_pid, server_pid > 0 && !server_watched ? " (already gone)" : "", sock);
+  int server_gone = server_pid > 0 && !server_watched, client_gone = 0;
+  for (;;) {
+    if (server_gone == 1) {
+      server_gone = 2;
+      if (!armed) say("server pid %d exited; this client has bus mastering off or never turned it on: nothing to do", server_pid);
+      else {
+        say("server pid %d exited while client pid %d is alive: clearing bus mastering", server_pid, client);
+        watched_clear(sock, server_pid, 1, app, timeout, reply_timeout, no_start);
+        cleared = 1;
+      }
+    }
+    if (client_gone) {
+      if (cleared) say("client pid %d gone; bus mastering was cleared once already, after server pid %d exited: done", client, server_pid);
+      else if (!armed) say("stood down: clean - client pid %d %s", client, ever ? "read bus mastering back off" : "never turned bus mastering on");
+      else {
+        say("client exited without a clean teardown (pid %d): clearing bus mastering", client);
+        return watched_clear(sock, server_pid, server_gone != 0, app, timeout, reply_timeout, no_start);
+      }
+      return 0;
+    }
+    struct kevent got[4];
+    int k = kevent(kq, NULL, 0, got, 4, NULL);
+    if (k < 0) { if (errno == EINTR) continue; say("watch: kevent: %s; stopping", strerror(errno)); return 5; }
+    for (int i = 0; i < k; i++) {
+      if (got[i].filter == EVFILT_PROC && (int)got[i].ident == server_pid) { if (!server_gone) server_gone = 1; continue; }
+      if (got[i].filter == EVFILT_PROC) client_gone = 1;   // the client: whatever it wrote last is still in the pipe
+      // Every byte in the pipe, after a read event or the client's exit alike; end of file is the client's last end.
+      char b[64];
+      ssize_t r;
+      while ((r = read(3, b, sizeof(b))) > 0)
+        for (ssize_t j = 0; j < r; j++) {
+          if (b[j] == 'A') armed = ever = 1;
+          else if (b[j] == 'C') armed = 0;
+          else if (b[j] == 'R') {
+            say("stood down: client pid %d started its own emergency clear (M3)", client);
+            return 0;
+          }
+        }
+      if (r == 0) client_gone = 1;
+    }
+  }
+}
+#endif
+
+int main(int argc, char **argv) {
+  const char *sock = NULL, *app = getenv("TINYGPU_APP");
+  int old_pid = 0, no_start = 0, watching = 0;
+  double timeout = 0, reply_timeout = 0;
+  for (int i = 1; i < argc; i++) {
+    const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+    if (!strcmp(a, "--no-start")) { no_start = 1; continue; }
+    if (!strcmp(a, "--watch")) { watching = 1; continue; }
+    if (!v) { fprintf(stderr, "tinynv-bmclear: %s needs a value\n", a); return 2; }
+    if (!strcmp(a, "--sock")) sock = v;
+    else if (!strcmp(a, "--old-pid")) old_pid = atoi(v);
+    else if (!strcmp(a, "--app")) app = v;
+    else if (!strcmp(a, "--timeout")) timeout = atof(v);
+    else if (!strcmp(a, "--reply-timeout")) reply_timeout = atof(v);
+    else { fprintf(stderr, "tinynv-bmclear: unknown argument %s\n", a); return 2; }
+    i++;
+  }
+  if (timeout == 0) timeout = watching ? 10.0 : 5.0;
+  if (reply_timeout == 0) reply_timeout = watching ? 8.0 : 1.0;
+  if (!app || !*app) app = DEFAULT_APP;
+  signal(SIGPIPE, SIG_IGN);
+  if (watching) {
+#ifdef __APPLE__
+    if (sock || timeout < 0 || reply_timeout < 0) { fprintf(stderr, "tinynv-bmclear: --watch takes the socket from TINYNV_BMCLEAR_SOCK, never --sock\n"); return 2; }
+    return watch(old_pid, app, timeout, reply_timeout, no_start);
+#else
+    fprintf(stderr, "tinynv-bmclear: --watch is macOS only (kqueue)\n");
+    return 2;
+#endif
+  }
+  // No default socket: which server to reach is the caller's to say, never guessed from this process's environment.
+  if (!sock || !*sock || timeout <= 0 || reply_timeout <= 0) {
+    fprintf(stderr, "usage: tinynv-bmclear --sock PATH [--old-pid N] [--app PATH] [--timeout S] [--reply-timeout S] [--no-start]\n"
+                    "       tinynv-bmclear --watch [--old-pid N] [--app PATH] [--timeout S] [--reply-timeout S] [--no-start]\n");
+    return 2;
+  }
+  signal(SIGALRM, on_alarm);
+  alarm((unsigned)(timeout + 0.999));
+  return clear(sock, old_pid, 0, app, reply_timeout, no_start);
 }

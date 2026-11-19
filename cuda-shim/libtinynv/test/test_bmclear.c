@@ -183,7 +183,9 @@ int main(int argc, char **argv) {
   if (posix_spawn(&pid, helper, NULL, NULL, (char **)bare, environ)) { perror("spawn"); return 2; }
   CHECK(reap(pid, 3.0) == 2, "no --sock: the helper did not refuse");
 
-  unlink(app); unlink(marker); unlink(sock); rmdir(dir);
+  char lock[200];
+  snprintf(lock, sizeof(lock), "%s.bmclear.lock", sock);   // the helper's own, never removed by it (tools/tinynv_bmclear.c)
+  unlink(app); unlink(marker); unlink(sock); unlink(lock); rmdir(dir);
   printf("test_bmclear: %d checks run, %d failed\n", checks, fails);
   return fails ? 1 : 0;
 }

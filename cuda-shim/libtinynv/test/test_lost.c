@@ -153,6 +153,7 @@ static pthread_t after(double s, double what) {
 
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
+  setenv("TINYNV_WATCHDOG", "0", 1);   // no watchdog beside this fake server, however the test is run
 
   // ---- short waits and an ordinary announcement: nothing extra on the socket ----
   session_open();
