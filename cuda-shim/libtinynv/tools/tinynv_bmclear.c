@@ -37,11 +37,13 @@
 // WATCH MODE: M4, the watchdog libtinynv starts beside every TinyGPU session (pci_tinygpu.c: tg_watch). M2 and M3 need
 // a client alive to notice; two ways out had nobody: the client killed or crashed under a live server, which then
 // tears the session down with bus mastering on, and the server dying under an idle client that touches nothing. This
-// process outlives both and runs steps 1-4 at most once:
+// process outlives both and runs steps 1-4:
 //   - the client gone (the last write end of fd 3 closed: no process holds the session) while ARMED: "client exited
 //     without a clean teardown";
 //   - the server (--old-pid, the client's LOCAL_PEERPID) exited while the client lives and is armed: "server pid N
-//     exited", a fresh server started if none serves the path; then it waits on for the client, and clears no more.
+//     exited", a fresh server started if none serves the path. A clear that confirmed bus mastering off is the
+//     last: it waits on for the client and clears no more. One that failed is tried again while the client lives
+//     and stays armed (after 5 s, then 10, 20, 40, 80), and once more when the client goes.
 // The client writes one byte each time: 'A' bus mastering may be on (EVERY PCI_COMMAND write with MASTER, EVERY DMA
 // mapping), 'C' its own teardown read bus mastering back OFF. The LAST byte received decides, whichever process of
 // the session sent it - a fork shares the pipe, so the client keeps no "already said" of its own. A quiesce in
@@ -53,8 +55,8 @@
 // review, 2026-11-19). Now the two just run in a row under the lock above: the second connects to the server that is
 // up, reads PCI_COMMAND, writes only if MASTER is still set, exits 0 - and, having waited, starts no server.
 // The socket is not in argv because tools that stop a server run `pkill -f tinygpu.sock`, which would take this too.
-// A live server that refuses the connect (its listen(1) backlog full) is tried again until the hard timeout: the
-// watchdog is the last one there, and exit 3 would leave nobody.
+// A live server that refuses the connect (its listen(1) backlog full), or that has no socket file yet (still
+// starting), is tried again until the hard timeout: the watchdog is the last one there, and exit 3 would leave nobody.
 // SIGINT, SIGHUP and SIGTERM are ignored and the process has a session of its own: a ^C or a group kill of the client
 // is exactly what it is there for. Its descriptors are fd 3 and stdio only - holding the client's server socket would
 // keep the session open after the client died, and the server would never see it go; stdout and stderr are the
@@ -306,8 +308,14 @@ static int clear(const char *sock, int old_pid, int old_gone, const char *app, d
   // the watchdog, coming next, was refused and gave up with the card at 0x407 (2026-11-19). Connects only, while a
   // server for the path lives, until one is taken or the alarm; nothing is replaced, and if the server dies
   // meanwhile the lines below decide as they always did.
-  if (fd < 0 && g_patient && ce == ECONNREFUSED && (old_alive || server_process_for(sock))) {
-    say("a server for %s is alive but refuses connections (its backlog is full, or it is wedged): trying until it takes one", sock);
+  // ENOENT THE SAME, while a server process for the path exists: that is a server somebody started and that has not
+  // bound its socket yet (start_server unlinks the file first). The clear that started it timed out, the client was
+  // killed, and this last clear saw no file, did not wait, and exited 3 with the card on (round 3 of the review).
+  // The loop ends without a connection only when no server process is left; then, and only for a helper that did
+  // not wait for the lock, the lines below may start one - never a second beside one that lives.
+  if (fd < 0 && g_patient && (ce == ECONNREFUSED || ce == ENOENT) && (old_alive || server_process_for(sock))) {
+    say("a server for %s is alive but %s: trying until it takes a connection", sock,
+        ce == ENOENT ? "has no socket yet (still starting)" : "refuses connections (its backlog is full, or it is wedged)");
     for (struct timespec nap = {0, 100 * 1000 * 1000}; fd < 0; nanosleep(&nap, NULL)) {
       fd = connect_to(sock, reply_timeout), ce = errno;
       if (fd < 0 && !(old_alive = !old_gone && pid_alive(old_pid)) && !server_process_for(sock)) break;
@@ -390,18 +398,9 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
     else if (errno != ESRCH) say("watch: cannot watch server pid %d (%s); watching the client only", server_pid, strerror(errno));
   }
   say("watching client pid %d and server pid %d%s on %s", client, server_pid, server_pid > 0 && !server_watched ? " (already gone)" : "", sock);
-  int server_gone = server_pid > 0 && !server_watched, client_gone = 0;
+  int server_gone = server_pid > 0 && !server_watched, client_gone = 0, said_idle = 0, tries = 0;
+  double next_try = 0, gap = 5;   // a failed server-death clear is tried again after `gap` seconds, doubling to 80
   for (;;) {
-    if (server_gone == 1) {
-      server_gone = 2;
-      if (!armed) say("server pid %d exited; this client has bus mastering off or never turned it on: nothing to do", server_pid);
-      else {
-        say("server pid %d exited while client pid %d is alive: clearing bus mastering", server_pid, client);
-        g_why = "the watchdog saw the old server exit under a live client (M4)";
-        // only a confirmed clear counts: after a failed one, the client's own death tries again
-        cleared = watched_clear(sock, server_pid, 1, app, timeout, reply_timeout, no_start) == 0;
-      }
-    }
     if (client_gone) {
       if (cleared) say("client pid %d gone; bus mastering was cleared once already, after server pid %d exited: done", client, server_pid);
       else if (!armed) say("stood down: clean - client pid %d %s", client, ever ? "read bus mastering back off" : "never turned bus mastering on");
@@ -412,11 +411,37 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
       }
       return 0;
     }
+    // THE SERVER GONE UNDER A LIVE, ARMED CLIENT: cleared, and if that fails, again - every 5 s, then 10, 20, 40, 80 -
+    // for as long as the client lives and stays armed, not only when it dies. An idle client can live for hours, and
+    // the first clear fails whenever the app it starts needs more than the hard timeout to listen (round 3 of the
+    // review). Only a clear that confirmed bus mastering off counts; 'C' or end of file end the retries (the latter
+    // with the clear above). One at a time: watched_clear returns only when its child is gone, and other helpers are
+    // kept out by the lock, under which nobody starts a server beside one that lives.
+    struct timespec mono;
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    double t = (double)mono.tv_sec + (double)mono.tv_nsec * 1e-9;
+    int due = server_gone && !cleared && armed;
+    if (server_gone && !cleared && !armed && !said_idle++)
+      say("server pid %d exited; this client has bus mastering off or never turned it on: nothing to do", server_pid);
+    if (due && t >= next_try) {
+      if (!tries++) say("server pid %d exited while client pid %d is alive: clearing bus mastering", server_pid, client);
+      else say("server pid %d is gone and bus mastering is not confirmed off: clearing again (attempt %d)", server_pid, tries);
+      g_why = "the watchdog saw the old server exit under a live client (M4)";
+      cleared = watched_clear(sock, server_pid, 1, app, timeout, reply_timeout, no_start) == 0;
+      if (cleared) continue;
+      say("trying again in %.0f s, unless the client says clean or goes first", gap);
+      clock_gettime(CLOCK_MONOTONIC, &mono);
+      next_try = (double)mono.tv_sec + (double)mono.tv_nsec * 1e-9 + gap;
+      if (gap < 80) gap *= 2;
+      continue;   // the time has moved on: work out the wait afresh
+    }
+    struct timespec wait = {0, 0};
+    if (due) { wait.tv_sec = (time_t)(next_try - t); wait.tv_nsec = (long)((next_try - t - (double)wait.tv_sec) * 1e9); }
     struct kevent got[4];
-    int k = kevent(kq, NULL, 0, got, 4, NULL);
+    int k = kevent(kq, NULL, 0, got, 4, due ? &wait : NULL);
     if (k < 0) { if (errno == EINTR) continue; say("watch: kevent: %s; stopping", strerror(errno)); return 5; }
     for (int i = 0; i < k; i++) {
-      if (got[i].filter == EVFILT_PROC && (int)got[i].ident == server_pid) { if (!server_gone) server_gone = 1; continue; }
+      if (got[i].filter == EVFILT_PROC && (int)got[i].ident == server_pid) { server_gone = 1; continue; }
       // every byte in the pipe; end of file is the last holder of the session gone
       char b[64];
       ssize_t r;

@@ -31,6 +31,14 @@
 //                 stdout and stderr. kill -9 clears within about 1 s all the same, the session ends at once, and
 //                 the server reads nothing on the client's connection that is not a request - not the watchdog's
 //                 log, not what the client itself prints to a closed fd 2. And the rescue (M3) starts and clears.
+//   slow app      the server dies under an idle armed client and the app the watchdog starts takes 12 s to listen, so
+//                 that clear times out (124). (a) the client killed meanwhile: the last clear finds no socket file
+//                 (ENOENT, start_server unlinked it) and once exited 3 with the card on - it waits for the server
+//                 that is coming up. (b) the client idle and alive: the clear is tried again and lands with nobody
+//                 dying; one app start in both (round 3 of the review)
+//   sticky        a quiesce whose read-back still has MASTER says nothing, and the watchdog clears after the exit
+//   no fds        the descriptor table full (EMFILE) with stdio closed, so the session's descriptors cannot be moved
+//                 off 0-2: a socket left there is not used (the open fails), a pipe end left there means no watchdog
 //   refork        armed, forked, the child quiesced and exited, the parent turned bus mastering on again and was
 //                 killed: cleared. The watchdog goes by the LAST byte, so every arming has to send one.
 //   6 off        TINYNV_WATCHDOG=0, TINYNV_EMERGENCY_BM=0: no watchdog process, no clear after kill -9
@@ -56,6 +64,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -106,7 +115,11 @@ static void card_set(uint32_t v) {
 static int role_server(const char *sock) {
   signal(SIGPIPE, SIG_IGN);
   logev("start");
-  const char *td = getenv("WD_TEARDOWN_MS"), *drop = getenv("WD_DROP_AFTER");
+  const char *td = getenv("WD_TEARDOWN_MS"), *drop = getenv("WD_DROP_AFTER"), *slow = getenv("WD_APP_DELAY_MS");
+  // WD_APP_DELAY_MS, set by a case only after its own server is up: an app slow to listen (the real one opens the
+  // device first). WD_STICKY: the first connection's writes that take MASTER off change nothing - a card that keeps it set.
+  int sticky = getenv("WD_STICKY") != NULL;
+  if (slow) nap(atof(slow) / 1000.0);
   double teardown = td ? atof(td) / 1000.0 : 0;
   int l = socket(AF_UNIX, SOCK_STREAM, 0);
   struct sockaddr_un a = {.sun_family = AF_UNIX};
@@ -126,7 +139,7 @@ static int role_server(const char *sock) {
       // a request is 33 bytes with a command the protocol has (0..12) for device 0; anything else is somebody's text
       if (rq.cmd > 12 || rq.dev_id) logev("bad %d %u", conn, rq.cmd);
       else if (rq.cmd == CMD_CFG_READ && rq.arg0 == 4) { rp.resp0 = card_get(); logev("read %d %#llx", conn, (unsigned long long)rp.resp0); }
-      else if (rq.cmd == CMD_CFG_WRITE && rq.arg0 == 4) { card_set((uint32_t)rq.arg2); logev("write %d %#llx", conn, (unsigned long long)rq.arg2); }
+      else if (rq.cmd == CMD_CFG_WRITE && rq.arg0 == 4) { if (!(sticky && conn == 1 && !(rq.arg2 & 4))) card_set((uint32_t)rq.arg2); logev("write %d %#llx", conn, (unsigned long long)rq.arg2); }
       else logev("other %d %u", conn, rq.cmd);
       if (send(s, &rp, sizeof(rp), 0) < 0) break;
     }
@@ -152,14 +165,28 @@ static int role_client(const char *mode, const char *sock) {
   // lowest free descriptors, which socket() and pipe() take, are 0-2.
   const char *cl = getenv("WD_CLOSE");
   for (; cl && *cl; cl++) close(*cl - '0');
+  // WD_FILL: no descriptor to move to. The table is 64 and full but for the ones WD_CLOSE closed - and, for "two", two
+  // more above them, which the socket and the pipe's read end take, leaving the write end on 0-2 with nowhere to go.
+  // One filler is closed again after the open, so the rest of this client (and its event log) has a descriptor.
+  const char *fill = getenv("WD_FILL");
+  int filler[64], nf = 0, f;
+  if (fill) {
+    struct rlimit rl = {64, 64};
+    setrlimit(RLIMIT_NOFILE, &rl);
+    while ((f = open("/dev/null", O_RDONLY)) >= 0) filler[nf++] = f;
+    for (int i = 0; i < nf; i++) if (filler[i] <= 2) close(filler[i]);   // the closed stdio, taken by the loop above
+    if (!strcmp(fill, "two")) { close(filler[--nf]); close(filler[--nf]); }
+  }
   tinynv_pci_t p;
-  if (tinynv_pci_open_tinygpu(sock, &p)) { fprintf(stderr, "client: open: %s\n", tinynv_last_error()); return 2; }
+  int failed = tinynv_pci_open_tinygpu(sock, &p);
+  if (fill) close(filler[nf - 1]);
+  if (failed) { logev("openfail"); fprintf(stderr, "client: open: %s\n", tinynv_last_error()); return 2; }
   uint32_t cmd = p.cfg_read(&p, 4, 2);
   if (strcmp(mode, "unarmed")) p.cfg_write(&p, 4, 2, cmd | 4);
   // what any program (and libtinynv's own fprintf) does with a closed fd 2: write to it anyway
   // - and to a closed stdout: with the pipe's write end there, the 'C' in this line was the watchdog's last byte
   if (getenv("WD_CLOSE")) {
-    static const char m[] = "client: a line for stderr, which is closed\n", o[] = "Client: armed, not Clean - a line for stdout\n";
+    static const char m[] = "Client: armed, not Clean - a line for stderr, which is closed\n", o[] = "Client: armed, not Clean - a line for stdout\n";
     if (write(2, m, sizeof(m) - 1) < 0) {}
     if (strchr(getenv("WD_CLOSE"), '1') && write(1, o, sizeof(o) - 1) < 0) {}
   }
@@ -270,6 +297,9 @@ static void case_env(const char *teardown_ms) {
   if (teardown_ms) setenv("WD_TEARDOWN_MS", teardown_ms, 1); else unsetenv("WD_TEARDOWN_MS");
   unsetenv("WD_DROP_AFTER");
   unsetenv("WD_CLOSE");
+  unsetenv("WD_FILL");
+  unsetenv("WD_APP_DELAY_MS");
+  unsetenv("WD_STICKY");
   card_set(0x0403);
 }
 static pid_t spawn_server(void) {
@@ -298,7 +328,8 @@ static pid_t spawn_client(const char *mode) {
   close(pp[1]);
   if (errfd >= 0) close(errfd);
   errfd = pp[0];
-  if (wait_for("armed", 0, pid, 1, 3, NULL) < 1) printf("note: client %d (%s) did not arm\n", (int)pid, mode);
+  for (double end = now() + 3; !count("armed", 0, pid, NULL) && !count("openfail", 0, pid, NULL) && now() < end;) nap(0.02);
+  if (!count("armed", 0, pid, NULL) && !count("openfail", 0, pid, NULL)) printf("note: client %d (%s) did not arm\n", (int)pid, mode);
   return pid;
 }
 // the children of pid (pgrep -P): the count, and the first
@@ -684,6 +715,96 @@ static void case_noio_rescue(void) {
   case_end(server, wd);
 }
 
+// slow app: the server killed under an idle armed client, and the app the watchdog starts listens only after 12 s -
+// past the clear's 10 s, so that clear exits 124 with the app still coming up and no socket file (start_server
+// unlinked it). killed: the client dies 3 s in; the watchdog's last clear got ENOENT, which it did not wait on, and
+// exited 3 with nobody left (round 3 of the review). !killed: the client stays alive and idle, and the clear has to
+// be tried again without waiting for anybody's death - and counted as done only when it is.
+static void case_slow_app(int killed) {
+  const char *name = killed ? "slow app, client killed" : "slow app, client idle";
+  case_env(NULL);
+  pid_t server = spawn_server();
+  setenv("WD_APP_DELAY_MS", "12000", 1);   // from here on: the stand-in app, not the server above
+  pid_t client = spawn_client("idle"), wd = 0;
+  children(client, &wd);
+  double t0 = now();
+  kill(server, SIGKILL);
+  waitpid(server, NULL, 0);
+  if (killed) { nap(3); kill(client, SIGKILL); reap(client, 3); }
+  ev_t w;
+  int writes = wait_for("write", t0, 0, 1, 26, &w);
+  CHECK(writes == 1 && w.v == 0x0403 && w.t - t0 > 11.5, "%s: %d write(s) after the server's death, want 0x0403 once the app listens (12 s)", name, writes);
+  nap(0.3);
+  CHECK(card_get() == 0x0403, "%s: the card ends at %#x, want 0x0403", name, card_get());
+  CHECK(file_has(errp, "the clear exited 124"), "%s: the first clear was meant to time out behind the slow app", name);
+  if (!killed) {
+    CHECK(kill(client, 0) == 0 && wd && running(wd), "slow app, client idle: the client or its watchdog is gone");
+    // and a clear that has landed is the last: nothing more while the client lives, nothing at its death
+    double t1 = now();
+    nap(6);
+    kill(client, SIGKILL);
+    reap(client, 3);
+    CHECK(wd && gone(wd, 3), "slow app, client idle: the watchdog did not exit after the client's death");
+    CHECK(count("accept", t1, 0, NULL) == 0, "slow app, client idle: %d connection(s) after the clear had landed", count("accept", t1, 0, NULL));
+  } else {
+    CHECK(wd && gone(wd, 3), "slow app, client killed: the watchdog did not exit");
+    CHECK(file_has(errp, "has no socket yet"), "slow app, client killed: the last clear did not meet the missing socket file this case is about");
+  }
+  CHECK(count("start", t0, 0, NULL) == 1, "%s: the app was started %d times, want once", name, count("start", t0, 0, NULL));
+  show_err(name);
+  case_end(0, wd);
+}
+
+// sticky: the client's quiesce writes MASTER off and the card keeps it. Its read-back says so, so it must not call
+// itself clean, and the watchdog clears once it has gone.
+static void case_sticky(void) {
+  case_env(NULL);
+  setenv("WD_STICKY", "1", 1);
+  pid_t server = spawn_server(), client = spawn_client("clean"), wd = 0;
+  children(client, &wd);
+  double t0 = now();
+  kill(client, SIGUSR1);
+  CHECK(reap(client, 3) == 0, "sticky: the client did not exit 0");
+  ev_t w = {0};
+  wait_for("write", t0, server, 2, 3, &w);
+  CHECK(w.conn == 2 && w.v == 0x0403, "sticky: no clear from the watchdog after a quiesce that left MASTER set");
+  nap(0.2);
+  CHECK(card_get() == 0x0403, "sticky: the card ends at %#x, want 0x0403", card_get());
+  CHECK(!file_has(errp, "stood down: clean"), "sticky: the watchdog was told the session was clean");
+  show_err("sticky");
+  case_end(server, wd);
+}
+
+// no fds: stdio closed and the table full, so what socket() and pipe() put on 0-2 cannot be moved.
+//   "2", none free:   the socket is on fd 2 and stays. It was used there, and "no watchdog: pipe: ..." went into it.
+//                     Now the open fails and nothing reaches the server.
+//   "02" / "012", two free: the socket and the pipe's read end take the two; the write end stays on fd 2 / fd 1, where
+//                     the program's own output is the watchdog's bytes ("Clean" ends in a session called clean).
+//                     Now there is no watchdog at all, which the client can at least be told (TINYNV_WATCHDOG=0's line).
+static void case_nofds(const char *closed, const char *fill) {
+  char name[48];
+  snprintf(name, sizeof(name), "no fds (%s closed, %s free)", closed, fill);
+  case_env(NULL);
+  setenv("WD_CLOSE", closed, 1);
+  setenv("WD_FILL", fill, 1);
+  pid_t server = spawn_server(), client = spawn_client("idle"), wd = 0;
+  int nwd = children(client, &wd);
+  if (!strcmp(fill, "none")) {
+    CHECK(count("openfail", 0, client, NULL) == 1 && count("armed", 0, client, NULL) == 0, "%s: the open did not fail - a session on fd 2 is in use", name);
+    CHECK(reap(client, 3) == 2, "%s: the client did not exit 2", name);
+  } else {
+    CHECK(count("armed", 0, client, NULL) == 1, "%s: the client did not arm", name);
+    CHECK(nwd == 0, "%s: a watchdog is running with the pipe's write end on the client's fd 0-2", name);
+    kill(client, SIGKILL);
+    reap(client, 3);
+  }
+  nap(0.3);
+  CHECK(count("bad", 0, server, NULL) == 0 && count("other", 0, server, NULL) == 0, "%s: the server read %d thing(s) that are no request", name,
+        count("bad", 0, server, NULL) + count("other", 0, server, NULL));
+  if (wd && !gone(wd, 3)) kill(wd, SIGKILL);
+  case_end(server, 0);
+}
+
 // refork: the pipe is shared by every process in the session, so what one of them last said is not what another may
 // assume. The parent armed; its child quiesced ('C') and went; the parent set MASTER again. A client that kept "I
 // have said 'A'" to itself sent nothing, and the watchdog called the kill clean with the card at 0x407.
@@ -779,6 +900,12 @@ int main(int argc, char **argv) {
   case_noio("012");
   case_noio_rescue();
   case_refork();
+  case_sticky();
+  case_nofds("2", "none");
+  case_nofds("02", "two");
+  case_nofds("012", "two");
+  case_slow_app(1);
+  case_slow_app(0);
   case_fork(0);
   case_fork(1);
   case_signals();

@@ -276,23 +276,26 @@ static void tg_wd_say(tg_t *tg, char what) {
 // child's stdout and stderr, gave the watchdog the client's server socket (its log text became requests and the
 // session outlived the client) or the pipe's own write end (it never saw end of file). Either way a killed client
 // left the card at 0x407 with nobody to clear it (found by review, 2026-11-19). Close-on-exec comes with the move.
-// A descriptor that cannot be moved (EMFILE) is kept where it is, and tg_child_stdio does not hand it on.
+// NO HALF MEASURE when it cannot be moved (EMFILE: the table is full): the descriptor is CLOSED and -1 comes back.
+// Kept where it was, a socket on fd 2 took the library's stderr as requests and a pipe end on fd 1 took the program's
+// stdout as the watchdog's bytes - a 'C' in it, and a killed session was called clean (round 3 of the review). So
+// the caller does without: no session at all (tinynv_pci_open_tinygpu fails), or no watchdog (tg_watch).
 static int tg_fd_high(int fd) {
   if (fd < 0 || fd > 2) return fd;
-  int hi = fcntl(fd, F_DUPFD_CLOEXEC, 3);
-  if (hi < 0) return fd;
+  int hi = fcntl(fd, F_DUPFD_CLOEXEC, 3), e = errno;
   close(fd);
+  errno = e;
   return hi;
 }
 
 // What a spawned helper gets as stdio: /dev/null to read, and this process's stderr as its stdout and stderr, so its
-// lines land in this process's log - but only a stderr that is open and is not part of the session (a, b, c: the
-// socket and the pipe's ends, -1 for none). Otherwise /dev/null: a dup2 from a closed fd 2 fails the whole spawn,
-// and there would be no watchdog and no rescue at all for a program without a stderr. fcntl only: tg_rescue can run
-// inside the crash handler.
-static void tg_child_stdio(posix_spawn_file_actions_t *fa, int a, int b, int c) {
+// lines land in this process's log - when this process has one. fd 2 is never part of the session (tg_fd_high), so
+// an open fd 2 is the program's own; a closed one is /dev/null for the child, because a dup2 from a closed fd 2 fails
+// the whole spawn and there would be no watchdog and no rescue at all for a program without a stderr. fcntl only:
+// tg_rescue can run inside the crash handler.
+static void tg_child_stdio(posix_spawn_file_actions_t *fa) {
   posix_spawn_file_actions_addopen(fa, 0, "/dev/null", O_RDONLY, 0);
-  if (fcntl(2, F_GETFD) != -1 && a != 2 && b != 2 && c != 2) {
+  if (fcntl(2, F_GETFD) != -1) {
     posix_spawn_file_actions_adddup2(fa, 2, 1);
 #ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
     posix_spawn_file_actions_addinherit_np(fa, 2);
@@ -502,7 +505,7 @@ static void tg_rescue(tinynv_pci_t *p, double wait_s) {
 #endif
     posix_spawnattr_setflags(&at, flags);
     posix_spawn_file_actions_init(&fa);
-    tg_child_stdio(&fa, tg->fd, tg->wd_fd, -1);
+    tg_child_stdio(&fa);
     int rc = posix_spawn(&tg->rescue_pid, helper, &fa, &at, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&at);
@@ -566,6 +569,7 @@ static void tg_close(tinynv_pci_t *p) {
 //   - The watchdog gets nothing else but stdio (POSIX_SPAWN_CLOEXEC_DEFAULT). Holding this process's server socket
 //     would keep the session open after this process died, and the server would never see it go. Its stdio is never
 //     the socket or the pipe either, whatever numbers this process's descriptors have (tg_fd_high, tg_child_stdio).
+//     If the pipe's ends cannot be moved off 0-2 there is NO watchdog, and one line says so.
 //   - NOT ATOMIC, and left so: macOS has no SOCK_CLOEXEC and no pipe2, so between socket()/pipe() and the fcntl that
 //     sets close-on-exec another thread can fork and exec, and that child holds one of the two without the other -
 //     the socket without the pipe (the watchdog fires against a session still open), or the pipe without the socket
@@ -591,13 +595,23 @@ static void tg_watch(tg_t *tg) {
   // no pipe2 here: see NOT ATOMIC above for the window before the two fcntls below
   if (pipe(pfd)) { fprintf(stderr, "libtinynv: no watchdog: pipe: %s\n", strerror(errno)); return; }
   // the read end above the three it becomes fd 3 among: a dup2 onto itself would keep its close-on-exec
-  int rd = fcntl(pfd[0], F_DUPFD_CLOEXEC, 10);
+  int rd = fcntl(pfd[0], F_DUPFD_CLOEXEC, 10), e = errno;
   close(pfd[0]);
-  pfd[1] = tg_fd_high(pfd[1]);   // off 0-2, where pipe() puts it in a program without stdio
+  pfd[1] = tg_fd_high(pfd[1]);   // off 0-2, where pipe() puts it in a program without stdio; closed if it cannot be
+  if (pfd[1] < 0) e = errno;
+  // Both ends where they belong, or no pipe and no watchdog: an end left on 0-2 would be read or written as the
+  // program's stdio. Said only now, with both ends closed and the socket long off 0-2 (tinynv_pci_open_tinygpu), so
+  // this line can land in neither.
+  if (rd < 0 || pfd[1] < 0) {
+    if (rd >= 0) close(rd);
+    if (pfd[1] >= 0) close(pfd[1]);
+    fprintf(stderr, "libtinynv: no watchdog: no descriptor above 2 for its pipe (%s); a kill of this process or of the "
+            "server leaves bus mastering as it is\n", strerror(e));
+    return;
+  }
   fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
   fcntl(pfd[1], F_SETFL, fcntl(pfd[1], F_GETFL) | O_NONBLOCK);
   fcntl(pfd[1], F_SETNOSIGPIPE, 1);
-  if (rd < 0) { close(pfd[1]); fprintf(stderr, "libtinynv: no watchdog: %s\n", strerror(errno)); return; }
 
   size_t n = 0;
   while (environ[n]) n++;
@@ -617,7 +631,7 @@ static void tg_watch(tg_t *tg) {
   posix_spawnattr_setsigmask(&at, &none);
   posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT);
   posix_spawn_file_actions_init(&fa);
-  tg_child_stdio(&fa, tg->fd, pfd[1], rd);
+  tg_child_stdio(&fa);
   posix_spawn_file_actions_adddup2(&fa, rd, 3);
   pid_t wd;
   int rc = posix_spawn(&wd, helper, &fa, &at, argv, env);
@@ -645,7 +659,12 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
   // socket (tg_watch: NOT ATOMIC). Off 0-2 first, where socket() puts it in a program that closed its stdio.
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return tinynv_fail("tinygpu: socket: %s", strerror(errno));
+  // A session on fd 0-2 is never used: if the socket cannot be moved (the table is full) it is closed, before the
+  // connect, and this open fails.
+  int low = fd;
   fd = tg_fd_high(fd);
+  if (fd < 0) return tinynv_fail("tinygpu: socket() gave fd %d and no descriptor above 2 is free to move it to (%s); a session "
+                                 "on fd 0-2 would take this process's stdio as requests, so none is opened", low, strerror(errno));
   if (connect(fd, (struct sockaddr *)&addr, sizeof(addr))) {
     close(fd);
     return tinynv_fail("tinygpu: no server on %s: %s", sock_path, strerror(errno));
