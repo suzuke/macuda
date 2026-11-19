@@ -83,5 +83,5 @@ unset). macuda's `install.sh` installs the app without that zip, so any Python t
 would kill a serving TinyGPU server, BM on. On this machine an empty file was created at that path on 2026-11-19
 (`touch`; tinygrad checks only `is_file()`), verified with tinygrad's own `_ensure_downloads_dir()`. Not proven to be the
 2026-11-18 cause. The name carries the commit tinygrad pins: a tinygrad that pins another TinyGPU commit needs its own
-file (or `APL_REMOTE_SOCK` set). Remove the file to undo. `extra/usbgpu/tbgpu/kill_tinygpu.sh` in the same checkout
+file (or `APL_REMOTE_SOCK` set). Remove the file to undo. Since 2026-11-19 `install.sh` creates it on every machine, for every pin found and in every cache tinygrad may use (`tools/tinygpu-sentinel.sh check|create`), and preflight warns when one is missing. `extra/usbgpu/tbgpu/kill_tinygpu.sh` in the same checkout
 (`pkill -f "tinygpu.sock"`) is a manual tool and also kills the server.
