@@ -20,10 +20,22 @@
 # writes script's own status and snapshots the DART property, at once and five seconds later. No inner status line
 # above the outer one means the shell around the server was killed with it, which is what a `pkill -f` looks like.
 #
+# libtinynv's emergency helper (cuda-shim/libtinynv/tools/tinynv_bmclear.c) starts its servers through here too, so a
+# server started right after an incident - the one whose death matters most - gets the same records. It sets
+# TINYGPU_START_NOWAIT=1: it waits for the socket itself, with its own connects, and the probe below would be one more
+# connect into the new server's listen(1) backlog while the helper's own connection is being served.
+#
 #   tools/tinygpu-server.sh status | start | ensure
-SOCK=${TMPDIR}tinygpu.sock
+#
+# Overrides, each defaulting to what it always was, so the script can be driven by a test with no card:
+#   TINYGPU_SOCK        the socket (default ${TMPDIR}tinygpu.sock)
+#   TINYGPU_APP         the app (default the installed TinyGPU)
+#   EGPU_ROOT           where logs/ is: the DART snapshots, and the log unless TINYGPU_SERVER_LOG says otherwise
+#   TINYGPU_SERVER_LOG  the server's log (default $R/logs/tinygpu-server.log)
+#   TINYGPU_START_NOWAIT=1  start: do not wait for the socket or probe it; say "started" and exit 0
+SOCK=${TINYGPU_SOCK:-${TMPDIR}tinygpu.sock}
 APP=${TINYGPU_APP:-/Applications/TinyGPU.app/Contents/MacOS/TinyGPU}   # TINYGPU_APP: a stand-in, for testing this script with no card
-R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; LOG=$R/logs/tinygpu-server.log; mkdir -p "$R/logs"
+R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; LOG=${TINYGPU_SERVER_LOG:-$R/logs/tinygpu-server.log}; mkdir -p "$R/logs"
 
 alive() { python3 -c "
 import socket, sys
@@ -57,6 +69,7 @@ case "${1:-status}" in
       dart_snap "$R/logs/dart-at-server-exit-$ts.txt"; sync
       sleep 5; dart_snap "$R/logs/dart-at-server-exit-$ts.txt.5s"; sync
     ) > /dev/null 2>&1 &
+    [ "${TINYGPU_START_NOWAIT:-}" = 1 ] && { echo "started (wrapper pid $!); not waiting for the socket (TINYGPU_START_NOWAIT=1)"; exit 0; }
     echo "started (wrapper pid $!), waiting for the socket"
     i=0; while [ ! -S "$SOCK" ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
     if alive; then echo "tinygpu server: listening on $SOCK"; else echo "tinygpu server: did not come up; see $LOG"; exit 1; fi ;;

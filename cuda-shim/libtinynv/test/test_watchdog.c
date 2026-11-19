@@ -53,6 +53,15 @@
 //                 hold the client's stderr: the client's stderr is a pipe here and reaches end of file once the client
 //                 and the watchdog are gone, with the app still running
 //   spellings     (in 5) two helpers at once, /tmp/X and /private/tmp/X: one lock, one start
+//   through the script  (M6 for the helper) the app a helper starts runs as tools/tinygpu-server.sh starts it: under
+//                 script(1), from `sh SCRIPT start`. kill -9 it, and the server log has "server exit status 137" and
+//                 EGPU_ROOT/logs both DART snapshots - written by the script's subshell after the client, the watchdog
+//                 and the helper have all gone. It ignores SIGHUP, holds neither the lock nor the client's stderr; and
+//                 4, 5 and slow app run again with the script, one start each, the started app stopped by SIGTERM
+//   unreadable    the script there but unreadable: the direct spawn, one start, and the log says it fell back
+// The script is given as the second argument and switched on only for those cases; every other case has
+// TINYGPU_SERVER_SCRIPT at a path that does not exist (the direct spawn), and EGPU_ROOT is always a temp directory of
+// this test's, so the script cannot write the repository's logs/.
 #include "tinynv_pci.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -64,6 +73,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -232,8 +243,14 @@ static int role_client(const char *mode, const char *sock) {
 }
 
 // ---- the harness ----
-static const char *helper;
-static char self[PATH_MAX], dir[64], sock[128], logp[160], card[160], errp[160], slog[160];
+static const char *helper, *script;
+static char self[PATH_MAX], dir[64], sock[128], logp[160], card[160], errp[160], slog[160], root[64];
+static int script_is_on;
+// the helper starts its server through tools/tinygpu-server.sh, or (a path that does not exist) directly
+static void script_on(int on) {
+  script_is_on = on;
+  setenv("TINYGPU_SERVER_SCRIPT", on ? script : "/nonexistent/tools/tinygpu-server.sh", 1);
+}
 // The client's stderr is a pipe, as it is under a shell or tools/serve.sh: whoever still holds its write end keeps a
 // reader from ever seeing end of file. drain() copies what has arrived into errp and says whether the end has come.
 static int errfd = -1;
@@ -351,6 +368,32 @@ static int args_of(pid_t pid, char *out, size_t n) {
   if (f) { if (!fgets(out, (int)n, f)) out[0] = 0; pclose(f); }
   return out[0] != 0;
 }
+static int ps_int(pid_t pid, const char *field) {
+  char c[64];
+  int v = 0;
+  snprintf(c, sizeof(c), "ps -o %s= -p %d", field, (int)pid);
+  FILE *f = popen(c, "r");
+  if (f) { if (fscanf(f, "%d", &v) != 1) v = 0; pclose(f); }
+  return v;
+}
+// An app started through the script: its parent is the `sh -c` inside script(1), whose parent is script(1), whose
+// parent is the script's own subshell. 0 when pid is not such an app; else the subshell's pid, and script(1)'s in *sc.
+static pid_t wrapper_of(pid_t app, pid_t *sc) {
+  char a[1024];
+  pid_t sh = ps_int(app, "ppid"), s = sh > 1 ? ps_int(sh, "ppid") : 0, sub = s > 1 ? ps_int(s, "ppid") : 0;
+  if (sc) *sc = s;
+  if (!sh || !args_of(sh, a, sizeof(a)) || strncmp(a, "/bin/sh -c", 10)) return 0;
+  if (!s || !args_of(s, a, sizeof(a)) || strncmp(a, "script ", 7)) return 0;
+  if (!sub || !args_of(sub, a, sizeof(a)) || !strstr(a, script) || !strstr(a, " start")) return 0;
+  return sub;
+}
+// The script's subshell, script(1) and whatever they run (sleep, ioreg) share one process group: gone at once, so a
+// case that is not about the snapshots leaves nothing behind writing into its directory.
+static void unwrap(pid_t app) {
+  pid_t sc, sub = wrapper_of(app, &sc);
+  int g = sub ? ps_int(sub, "pgid") : 0;
+  if (g > 1 && g != getpgrp()) kill(-g, SIGKILL);
+}
 // alive and not a zombie: the watchdog is the client's child, and kill(pid, 0) succeeds on one it has not reaped
 static int running(pid_t pid) {
   char c[64], st[16] = "";
@@ -394,7 +437,7 @@ static void case_end(pid_t server, pid_t wd) {
   if (wd > 0 && !gone(wd, 12)) { CHECK(0, "the watchdog %d is still running at the end of the case", (int)wd); kill(wd, SIGKILL); }
   ev_t e[512];
   int n = load(e, 512);
-  for (int i = 0; i < n; i++) if (!strcmp(e[i].ev, "start") && e[i].pid != server) kill(e[i].pid, SIGKILL);
+  for (int i = 0; i < n; i++) if (!strcmp(e[i].ev, "start") && e[i].pid != server) { unwrap(e[i].pid); kill(e[i].pid, SIGKILL); }
   if (server > 0) { kill(server, SIGKILL); waitpid(server, NULL, 0); }
   drain();
   if (errfd >= 0) { close(errfd); errfd = -1; }
@@ -468,6 +511,7 @@ static void case_clean(const char *mode) {
 // 4: the server killed under an idle client
 static void case_server_dies(void) {
   case_env(NULL);
+  if (script_is_on) printf("  (4 again, through the script)\n");
   pid_t server = spawn_server(), client = spawn_client("idle"), wd = 0;
   children(client, &wd);
   double t0 = now();
@@ -491,16 +535,124 @@ static void case_server_dies(void) {
   CHECK(starts == 1 && kill(st.pid, 0) == 0, "server -9: the started app is not running");
   CHECK(err_eof(1.0), "server -9: the client's stderr never reached end of file - the started app holds it");
   snprintf(want, sizeof(want), "(pid %d)", (int)st.pid);
-  CHECK(file_has(slog, "started") && file_has(slog, want), "server -9: %s has no line saying the helper started pid %d", slog, (int)st.pid);
+  if (script_is_on) {   // the helper knows the script's pid, not the app's: the line names the script
+    CHECK(starts == 1 && wrapper_of(st.pid, NULL), "server -9: the started app %d does not run under script(1) from %s start", (int)st.pid, script);
+    CHECK(file_has(slog, "started") && file_has(slog, script), "server -9: %s has no line saying the helper started the server through %s", slog, script);
+    if (starts == 1) unwrap(st.pid);   // its records are case_script's; this is about the start and the signal
+  } else
+    CHECK(file_has(slog, "started") && file_has(slog, want), "server -9: %s has no line saying the helper started pid %d", slog, (int)st.pid);
   if (starts == 1) kill(st.pid, SIGTERM);
   CHECK(starts == 1 && gone(st.pid, 1.5), "server -9: the started app ignored SIGTERM (pkill -f tinygpu.sock could not stop it)");
   if (fails) show_err("server -9");
   case_end(0, wd);
 }
 
+// The DART snapshots in EGPU_ROOT/logs whose names end in `suffix` (".txt", ".txt.5s")
+static int snaps(const char *suffix) {
+  char d[128];
+  snprintf(d, sizeof(d), "%s/logs", root);
+  DIR *dp = opendir(d);
+  struct dirent *e;
+  int n = 0;
+  size_t ls = strlen(suffix);
+  while (dp && (e = readdir(dp))) {
+    size_t l = strlen(e->d_name);
+    if (!strncmp(e->d_name, "dart-at-server-exit-", 20) && l > ls && !strcmp(e->d_name + l - ls, suffix)) n++;
+  }
+  if (dp) closedir(dp);
+  return n;
+}
+
+// with the script on, every app started since t0 runs under it - not the direct spawn, which would pass the rest too
+static void via_script(const char *name, double t0) {
+  if (!script_is_on) return;
+  ev_t e[512];
+  int n = load(e, 512);
+  for (int i = 0; i < n; i++)
+    if (!strcmp(e[i].ev, "start") && e[i].t >= t0) CHECK(wrapper_of(e[i].pid, NULL), "%s: the app %d was not started through %s", name, e[i].pid, script);
+}
+
+// through the script: a server the helper starts gets M6's records, kept by a wrapper that outlives the helper
+static void case_script(void) {
+  case_env(NULL);
+  // the path baked into the helper (Makefile: TINYNV_SERVER_SCRIPT_DEFAULT), which wrapper_of() checks is `script`
+  unsetenv("TINYGPU_SERVER_SCRIPT");
+  pid_t server = spawn_server(), client = spawn_client("idle"), wd = 0;
+  children(client, &wd);
+  double t0 = now();
+  kill(server, SIGKILL);
+  waitpid(server, NULL, 0);
+  ev_t st = {0}, w = {0};
+  int starts = wait_for("start", t0, 0, 1, 5, &st), writes = wait_for("write", t0, 0, 1, 5, &w);
+  CHECK(starts == 1 && writes == 1 && w.v == 0x0403 && w.pid == st.pid, "script: %d start(s) and %d write(s) after the server's death, want one each through the new server",
+        starts, writes);
+  pid_t sc = 0, sub = starts == 1 ? wrapper_of(st.pid, &sc) : 0;
+  CHECK(sub, "script: the started app %d does not run under script(1) from `sh %s start`", (int)st.pid, script);
+  CHECK(file_has(slog, script) && file_has(slog, "exit under a live client"), "script: %s has no line saying the helper started the server through the script, and why", slog);
+  // everybody who could have started it gone: the client, its watchdog, and with it the watchdog's clear
+  kill(client, SIGKILL);
+  reap(client, 3);
+  CHECK(wd && gone(wd, 3), "script: the watchdog did not exit after the client's death");
+  CHECK(sub && running(sub) && running(sc), "script: the script's subshell %d or script(1) %d did not outlive the helper", (int)sub, (int)sc);
+  // a terminal's hangup does not stop it; a kill does
+  if (starts == 1) kill(st.pid, SIGHUP);
+  nap(0.3);
+  CHECK(starts == 1 && running(st.pid), "script: the started app died of SIGHUP");
+  char lock[200];
+  snprintf(lock, sizeof(lock), "%s.bmclear.lock", sock);
+  int lf = open(lock, O_RDWR | O_CLOEXEC);
+  CHECK(lf >= 0 && flock(lf, LOCK_EX | LOCK_NB) == 0, "script: the lock %s is still held with the helpers gone - the server or its wrapper holds it", lock);
+  if (lf >= 0) close(lf);
+  CHECK(err_eof(1.0), "script: the client's stderr never reached end of file - the server or its wrapper holds it");
+  int n0 = snaps(".txt"), n5 = snaps(".txt.5s");
+  double t1 = now();
+  if (starts == 1) kill(st.pid, SIGKILL);
+  double end = now() + 3;
+  while (!file_has(slog, "server exit status 137") && now() < end) nap(0.05);
+  CHECK(file_has(slog, "server exit status 137"), "script: no \"server exit status 137\" in %s after kill -9", slog);
+  CHECK(file_has(slog, "script(1) around the server exited"), "script: the subshell did not write script(1)'s status to %s", slog);
+  for (end = now() + 12; (snaps(".txt") <= n0 || snaps(".txt.5s") <= n5) && now() < end;) nap(0.1);
+  CHECK(snaps(".txt") == n0 + 1 && snaps(".txt.5s") == n5 + 1, "script: want one more dart-at-server-exit snapshot and one more .5s in %s/logs, have %d and %d (%.1f s)",
+        root, snaps(".txt") - n0, snaps(".txt.5s") - n5, now() - t1);
+  CHECK(sub && gone(sub, 2), "script: the subshell %d is still running after its last snapshot", (int)sub);
+  show_err("script");
+  case_end(0, wd);
+  script_on(1);
+}
+
+// the script there but unreadable: the direct spawn, as before, once; and the logs say so
+static void case_unreadable(void) {
+  case_env(NULL);
+  char unr[200];
+  snprintf(unr, sizeof(unr), "%s/tinygpu-server.sh", dir);
+  FILE *f = fopen(unr, "w");
+  if (f) { fputs("exit 0\n", f); fclose(f); }
+  chmod(unr, 0);
+  setenv("TINYGPU_SERVER_SCRIPT", unr, 1);
+  card_set(0x0407);
+  pid_t dead = fork();
+  if (!dead) _exit(0);
+  waitpid(dead, NULL, 0);
+  char dp[16];
+  snprintf(dp, sizeof(dp), "%d", (int)dead);
+  char *argv[] = {(char *)helper, "--sock", sock, "--old-pid", dp, "--app", self, NULL};
+  pid_t h[2];
+  for (int i = 0; i < 2; i++) if (posix_spawn(&h[i], helper, NULL, NULL, argv, environ)) { perror("spawn"); exit(2); }
+  int r0 = reap(h[0], 8), r1 = reap(h[1], 8);
+  ev_t st = {0};
+  int starts = count("start", 0, 0, &st);
+  CHECK(r0 == 0 && r1 == 0 && starts == 1 && card_get() == 0x0403, "unreadable script: helpers exited %d and %d, %d start(s), card %#x; want 0, 0, one, 0x0403",
+        r0, r1, starts, card_get());
+  CHECK(starts == 1 && !wrapper_of(st.pid, NULL), "unreadable script: the app runs under a wrapper");
+  CHECK(file_has(slog, "fell back") && file_has(slog, unr), "unreadable script: %s does not say the helper fell back from %s", slog, unr);
+  unlink(unr);
+  case_end(0, 0);
+}
+
 // 5: the client's own rescue and the watchdog's server-death trigger, together
 static void case_together(void) {
   case_env(NULL);
+  if (script_is_on) printf("  (5 again, through the script)\n");
   pid_t server = spawn_server(), client = spawn_client("rescue"), wd = 0;
   children(client, &wd);
   double t0 = now();
@@ -513,6 +665,7 @@ static void case_together(void) {
   CHECK(wd && gone(wd, 8), "together: the watchdog did not exit");
   int starts = count("start", t0, 0, NULL);
   CHECK(starts == 1, "together: the app was started %d times, want exactly once", starts);
+  via_script("together", t0);
   CHECK(card_get() == 0x0403, "together: the card ends at %#x", card_get());
   if (fails) show_err("together");
   case_end(0, wd);
@@ -531,6 +684,7 @@ static void case_together(void) {
   int r0 = reap(h[0], 8), r1 = reap(h[1], 8);
   CHECK(r0 == 0 && r1 == 0, "two helpers at once: they exited %d and %d, want both 0", r0, r1);
   CHECK(count("start", 0, 0, NULL) == 1, "two helpers at once: the app was started %d times", count("start", 0, 0, NULL));
+  via_script("two helpers at once", 0);
   CHECK(card_get() == 0x0403, "two helpers at once: the card ends at %#x", card_get());
   case_end(0, 0);
 
@@ -544,6 +698,7 @@ static void case_together(void) {
   r0 = reap(h[0], 8), r1 = reap(h[1], 8);
   CHECK(r0 == 0 && r1 == 0, "two spellings at once: they exited %d and %d, want both 0", r0, r1);
   CHECK(count("start", 0, 0, NULL) == 1, "two spellings at once: the app was started %d times", count("start", 0, 0, NULL));
+  via_script("two spellings at once", 0);
   case_end(0, 0);
 }
 
@@ -723,6 +878,7 @@ static void case_noio_rescue(void) {
 static void case_slow_app(int killed) {
   const char *name = killed ? "slow app, client killed" : "slow app, client idle";
   case_env(NULL);
+  if (script_is_on) printf("  (slow app again, through the script)\n");
   pid_t server = spawn_server();
   setenv("WD_APP_DELAY_MS", "12000", 1);   // from here on: the stand-in app, not the server above
   pid_t client = spawn_client("idle"), wd = 0;
@@ -751,6 +907,7 @@ static void case_slow_app(int killed) {
     CHECK(file_has(errp, "has no socket yet"), "slow app, client killed: the last clear did not meet the missing socket file this case is about");
   }
   CHECK(count("start", t0, 0, NULL) == 1, "%s: the app was started %d times, want once", name, count("start", t0, 0, NULL));
+  via_script(name, t0);
   show_err(name);
   case_end(0, wd);
 }
@@ -877,8 +1034,12 @@ static void case_sigpipe(void) {
 int main(int argc, char **argv) {
   if (argc == 3 && !strcmp(argv[1], "server")) return role_server(argv[2]);
   if (argc == 4 && !strcmp(argv[1], "client")) return role_client(argv[2], argv[3]);
-  if (argc != 2 || argv[1][0] != '/') { fprintf(stderr, "usage: test_watchdog /absolute/path/to/tinynv-bmclear\n"); return 2; }
+  if (argc != 3 || argv[1][0] != '/' || argv[2][0] != '/') {
+    fprintf(stderr, "usage: test_watchdog /absolute/path/to/tinynv-bmclear /absolute/path/to/tools/tinygpu-server.sh\n");
+    return 2;
+  }
   helper = argv[1];
+  script = argv[2];
   if (!realpath(argv[0], self)) { perror("realpath"); return 2; }
   signal(SIGPIPE, SIG_IGN);   // the harness only; each client resets it to the default
   // Before anything is spawned: every way to the real app or a real socket points at this test's stand-ins.
@@ -887,6 +1048,11 @@ int main(int argc, char **argv) {
   setenv("TINYNV_EMERGENCY_BM", "1", 1);
   setenv("TINYNV_WATCHDOG", "1", 1);
   unsetenv("TINYNV_SOCKET");
+  snprintf(root, sizeof(root), "/tmp/tgwd-root.XXXXXX");   // EGPU_ROOT: where the script puts logs/, never the repo's
+  if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
+  setenv("EGPU_ROOT", root, 1);
+  unsetenv("TINYGPU_START_NOWAIT");
+  script_on(0);
 
   case_clean("clean");
   case_clean("unarmed");
@@ -894,6 +1060,13 @@ int main(int argc, char **argv) {
   case_killed(1);
   case_server_dies();
   case_together();
+  script_on(1);
+  case_script();
+  case_server_dies();
+  case_together();
+  case_slow_app(1);
+  script_on(0);
+  case_unreadable();
   case_rescue();
   case_rescue_slow();
   case_noio("2");
@@ -925,6 +1098,9 @@ int main(int argc, char **argv) {
   case_end(server, wd);
   case_sigpipe();
 
+  char rm[128];
+  snprintf(rm, sizeof(rm), "rm -rf '%s'", root);   // this test's own EGPU_ROOT, made by mkdtemp above
+  if (system(rm)) {}
   printf("test_watchdog: %d checks run, %d failed\n", checks, fails);
   return fails ? 1 : 0;
 }

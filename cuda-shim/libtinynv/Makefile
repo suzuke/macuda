@@ -39,6 +39,10 @@ SKIPS    = $(BUILD)/test-skips.txt   # one line per SKIP of the last `make test`
 CFLAGS  += -DTINYNV_BMCLEAR_DEFAULT=\"$(abspath $(BUILD))/tinynv-bmclear\"
 # and where a server that helper starts writes its output: the log tools/tinygpu-server.sh writes, at the repo root
 CFLAGS  += -DTINYNV_SERVER_LOG_DEFAULT=\"$(abspath ../..)/logs/tinygpu-server.log\"
+# and the script it starts that server through, so the server runs under script(1) with its exit and the DART state
+# recorded (M6): tools/tinygpu-server.sh, at the repo root
+SERVER_SCRIPT := $(abspath ../..)/tools/tinygpu-server.sh
+CFLAGS  += -DTINYNV_SERVER_SCRIPT_DEFAULT=\"$(SERVER_SCRIPT)\"
 # track header dependencies. without this a change to a struct in a header rebuilds only the .c files that were edited,
 # and the rest of the library keeps the old layout: the two halves then disagree about where a field is, which shows up
 # as a value that was set a moment ago reading back as zero. cost me a debugging round; never again.
@@ -202,6 +206,10 @@ test: export TINYNV_WATCHDOG := 0
 test: export TINYGPU_APP := /nonexistent/TinyGPU.app/Contents/MacOS/TinyGPU
 # and a stand-in a test does start writes its output nowhere near the repository's own server log
 test: export TINYGPU_SERVER_LOG := /dev/null
+# and no server started through tools/tinygpu-server.sh, whose snapshots would land in the repository's logs/: a path
+# that does not exist is the helper's direct spawn. test_watchdog turns the script on for its own cases, with EGPU_ROOT
+# a temp directory of its own; test_server_script.sh drives the script with every path it takes pointed at stand-ins.
+test: export TINYGPU_SERVER_SCRIPT := /nonexistent/tools/tinygpu-server.sh
 test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_tg_dead $(BUILD)/test_tg_sigpipe $(BUILD)/test_lost $(BUILD)/test_bmclear $(BUILD)/tinynv-bmclear $(BUILD)/test_watchdog $(BUILD)/test_teardown_lost $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_ce_route $(BUILD)/test_teardown_term $(BUILD)/test_teardown_skip $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_hw_ce_overlap $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@mkdir -p $(BUILD); : > $(SKIPS)
 	@if [ -z "$(HAVE_TINYGRAD)" ] && [ -n "$(STRICT)" ]; then echo "FAIL: TINYNV_REQUIRE_TINYGRAD=1 but $(PYTHON) cannot import tinygrad (tinygrad.helpers, tinygrad.runtime.autogen.nv_570, test.unit.test_remote_pci; TINYGRAD_SRC=$${TINYGRAD_SRC:-$(abspath ../../tinygrad)}; see env.sh)"; exit 1; fi
@@ -286,8 +294,13 @@ test: $(BUILD)/test_tensor_unlock_state $(BUILD)/test_arena $(BUILD)/test_witnes
 	@# the watchdog (M4) with real processes and SIGKILL, against a fake server it plays and counts the starts of: a
 	@# killed client or a killed server gets bus mastering cleared once, a clean exit costs the server no connection, two
 	@# clears at once start one app. Its stand-in app is the test binary itself, never the installed one.
-	@if [ "$$(uname)" = Darwin ]; then $(BUILD)/test_watchdog $(abspath $(BUILD))/tinynv-bmclear; \
+	@if [ "$$(uname)" = Darwin ]; then $(BUILD)/test_watchdog $(abspath $(BUILD))/tinynv-bmclear $(SERVER_SCRIPT); \
 	 else echo "SKIP (not macOS): test_watchdog - the watchdog watches pids with kqueue and is spawned on macOS only" | tee -a $(SKIPS); fi
+	@# tools/tinygpu-server.sh's overrides (the helper starts its servers through it): start, status, a kill -9 and a
+	@# SIGTERM recorded, with the socket, the app and EGPU_ROOT all stand-ins, and nothing real changed. The stand-in
+	@# app is test_watchdog's fake server.
+	@if [ "$$(uname)" = Darwin ]; then sh test/test_server_script.sh $(SERVER_SCRIPT) $(abspath $(BUILD))/test_watchdog $(abspath ../..)/logs; \
+	 else echo "SKIP (not macOS): test_server_script.sh - the script runs the server under macOS script(1)" | tee -a $(SKIPS); fi
 	@if [ -n "$(HAVE_TINYGRAD)" ]; then $(PYTHON) tools/nv_trace.py --selftest; else echo "SKIP (no tinygrad): nv_trace.py --selftest — the boot-trace recorder's coalescing self-check" | tee -a $(SKIPS); fi
 	@# what a cubin references and does not contain, both halves: the device printf resolves, anything else is refused.
 	@# the cubin is build output and not in the repository, so it is made if it is missing rather than assumed.

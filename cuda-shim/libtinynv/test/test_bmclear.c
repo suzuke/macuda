@@ -115,6 +115,9 @@ int main(int argc, char **argv) {
   char slog[160];
   snprintf(slog, sizeof(slog), "%s/server.log", dir);
   setenv("TINYGPU_SERVER_LOG", slog, 1);   // never the repository's logs/tinygpu-server.log
+  // and the direct spawn, never tools/tinygpu-server.sh, whose snapshots go to the repository's logs/ (test_watchdog
+  // runs the script's path, with EGPU_ROOT a temp directory)
+  setenv("TINYGPU_SERVER_SCRIPT", "/nonexistent/tools/tinygpu-server.sh", 1);
 
   serve_cmd(0x0407, 1);
   serve_cmd(0xffff, 0);

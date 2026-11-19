@@ -11,8 +11,10 @@
 //
 // 1. A server for PATH: if nothing accepts a connection, and the old server (--old-pid) is gone, and no process at all
 //    is serving PATH (argv "... server PATH", as tools/tinygpu-server.sh checks with pgrep), one is started the way
-//    that script starts it: `APP server PATH`, in a session of its own so it outlives this. --app, else $TINYGPU_APP,
-//    else the installed app. A live server that refuses connections is busy or wedged and is never replaced.
+//    that script starts it - BY that script, `sh tools/tinygpu-server.sh start`, which runs `APP server PATH` under
+//    script(1) and records how it ends (M6; start_server says how, and when it falls back to starting the app itself)
+//    - in a session of its own so it outlives this. --app, else $TINYGPU_APP, else the installed app. A live server
+//    that refuses connections is busy or wedged and is never replaced.
 // 2. The first request is a READ of PCI_COMMAND, and nothing is written until it is answered. The server takes one
 //    client at a time (listen(1), one thread), so a connect alone proves nothing - the backlog accepts it while
 //    another client is being served. An answer within --reply-timeout proves this connection is the one served.
@@ -101,6 +103,11 @@ enum { CMD_CFG_READ = 3, CMD_CFG_WRITE = 4 };
 #define TINYNV_SERVER_LOG_DEFAULT ""
 #endif
 static const char *server_log_default = TINYNV_SERVER_LOG_DEFAULT;
+// and tools/tinygpu-server.sh itself, which starts the server the way M6 records it; TINYGPU_SERVER_SCRIPT overrides it
+#ifndef TINYNV_SERVER_SCRIPT_DEFAULT
+#define TINYNV_SERVER_SCRIPT_DEFAULT ""
+#endif
+static const char *server_script_default = TINYNV_SERVER_SCRIPT_DEFAULT;
 
 static void say(const char *fmt, ...) {
   char ts[32];
@@ -198,6 +205,25 @@ static int g_patient;
 //     logs/tinygpu-server.log, baked in at build), appended, with one line first saying who started it and why. Never
 //     the client's stderr: a server holding that would keep a pipe reading the client's log open for its whole life.
 //     A log that cannot be opened is /dev/null.
+// THROUGH THE SCRIPT (M6 for this helper). A server started here exists only right after an incident, and is the one
+// whose death matters most - yet started directly it left no exit status and no DART snapshot. So it is started as
+// `/bin/sh SCRIPT start` (TINYGPU_SERVER_SCRIPT, else tools/tinygpu-server.sh baked in at build), which runs the app
+// under script(1), writes its exit status and snapshots pci-dart-error-data from a subshell of its own that outlives
+// this process. The script is handed the socket (TINYGPU_SOCK), the app (TINYGPU_APP), the log opened here
+// (TINYGPU_SERVER_LOG, so the line below and the server's output are one file; /dev/null if it could not be opened,
+// where the script's own `>> LOG` would otherwise fail and start nothing) and TINYGPU_START_NOWAIT=1: this process
+// waits for the socket with its own connects, and the script's probe would be one more connect into the new server's
+// listen(1) backlog. Everything above holds for the script as for the app, since it is the same spawn: the signals,
+// CLOEXEC_DEFAULT (neither the lock nor any socket or pipe of the client's reaches the script or the server), stdio,
+// and a session of its own. A script that is not there or not readable, or a /bin/sh that cannot be spawned, is the
+// direct spawn as before, and the log says it fell back.
+// The window this opens: until the script has exec'd the app, no process has "server PATH" in its argv, so
+// server_process_for() cannot see a server coming up (the script itself and its subshell must not carry the socket in
+// argv: `pkill -f tinygpu.sock` would take the subshell that keeps the records). That is harmless while the starter
+// holds the lock and polls its connect, which lasts until it connects or its hard timeout; a lock waiter never starts
+// one anyway. Only a starter whose timeout (5 s, 10 s watching) expires inside the window - which takes well under a
+// second - would hand the lock to a later helper that sees nothing and starts a second; the script's own pgrep then
+// refuses a second installed app that has exec'd by then.
 static int start_server(const char *app, const char *sock) {
   struct stat st;
   if (!lstat(sock, &st) && !S_ISSOCK(st.st_mode)) { say("%s exists and is not a socket; not starting a server on it", sock); return -1; }
@@ -214,7 +240,13 @@ static int start_server(const char *app, const char *sock) {
     lfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (lfd < 0) { say("cannot open /dev/null: %s; not starting a server", strerror(errno)); return -1; }
   }
-  char *argv[] = {(char *)app, "server", (char *)sock, NULL};
+  // an app that cannot run is a start that fails here, as the direct spawn's did, not a script waiting on nothing
+  if (access(app, X_OK)) { int e = errno; close(lfd); say("could not start %s server %s: %s", app, sock, strerror(e)); return -1; }
+  const char *script = getenv("TINYGPU_SERVER_SCRIPT");
+  if (!script || !*script) script = server_script_default;
+  char fell[PATH_MAX + 160] = "";   // why the app is started directly, when it is
+  if (!script || !*script) snprintf(fell, sizeof(fell), "no server script is configured (TINYGPU_SERVER_SCRIPT)");
+  else if (access(script, R_OK)) snprintf(fell, sizeof(fell), "the server script %s cannot be read (%s)", script, strerror(errno));
   posix_spawnattr_t at;
   posix_spawn_file_actions_t fa;
   sigset_t def, none;
@@ -240,18 +272,36 @@ static int start_server(const char *app, const char *sock) {
   posix_spawn_file_actions_adddup2(&fa, lfd, 1);
   posix_spawn_file_actions_adddup2(&fa, lfd, 2);
   pid_t pid;
-  int rc = posix_spawn(&pid, app, &fa, &at, argv, environ);
+  int rc = -1;
+  if (!*fell) {
+    // this process is a one-shot helper or the watchdog's clear child, both gone soon: the environment is theirs to set
+    setenv("TINYGPU_SOCK", sock, 1);
+    setenv("TINYGPU_APP", app, 1);
+    setenv("TINYGPU_SERVER_LOG", log, 1);
+    setenv("TINYGPU_START_NOWAIT", "1", 1);
+    char *sargv[] = {"/bin/sh", (char *)script, "start", NULL};
+    rc = posix_spawn(&pid, "/bin/sh", &fa, &at, sargv, environ);
+    if (rc) snprintf(fell, sizeof(fell), "/bin/sh %s start could not be spawned (%s)", script, strerror(rc));
+  }
+  if (*fell) {
+    say("%s: fell back to starting %s directly, with no exit status or DART snapshot recorded", fell, app);
+    char *argv[] = {(char *)app, "server", (char *)sock, NULL};
+    rc = posix_spawn(&pid, app, &fa, &at, argv, environ);
+  }
   posix_spawn_file_actions_destroy(&fa);
   posix_spawnattr_destroy(&at);
   if (rc) { close(lfd); say("could not start %s server %s: %s", app, sock, strerror(rc)); return -1; }
-  char line[PATH_MAX * 2 + 256], ts[32];
+  char line[PATH_MAX * 4 + 256], ts[32];
   time_t now = time(NULL);
   strftime(ts, sizeof(ts), "%F %T", localtime(&now));
-  int n = snprintf(line, sizeof(line), "%s tinynv-bmclear[%d]: started %s server %s (pid %d): %s\n", ts, (int)getpid(), app,
-                   sock, (int)pid, g_why);
+  int n = *fell ? snprintf(line, sizeof(line), "%s tinynv-bmclear[%d]: %s: fell back; started %s server %s directly (pid %d): %s\n", ts,
+                           (int)getpid(), fell, app, sock, (int)pid, g_why)
+                : snprintf(line, sizeof(line), "%s tinynv-bmclear[%d]: started %s server %s through %s start (the script's pid %d; "
+                           "the lines below are its own): %s\n", ts, (int)getpid(), app, sock, script, (int)pid, g_why);
   if (n > 0 && write(lfd, line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1) < 0) {}
   close(lfd);
-  say("started %s server %s (pid %d); its output goes to %s%s", app, sock, (int)pid, log, why);
+  if (*fell) say("started %s server %s (pid %d); its output goes to %s%s", app, sock, (int)pid, log, why);
+  else say("started %s server %s through %s start (pid %d); its output goes to %s%s", app, sock, script, (int)pid, log, why);
   return 0;
 }
 
