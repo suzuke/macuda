@@ -34,12 +34,17 @@ case "${1:-check}" in
   check|create)
     cs=$(commits); [ -n "$cs" ] || { echo "   no TinyGPU commit pin found (install.sh, tinygrad*/): nothing to check"; exit 0; }
     missing=0
-    for c in $(caches); do for k in $cs; do
+    # one cache per line, read whole: a path with a space (an EGPU_ROOT or HOME with one, which env.sh carries into
+    # XDG_CACHE_HOME) must not be split into two relative paths
+    tab=$(caches); IFS='
+'
+    for c in $tab; do for k in $cs; do
       f="$c/downloads/TinyGPU_$k.zip"
       if [ -f "$f" ]; then echo "   present: $f"
       elif [ "$1" = create ] && mkdir -p "$c/downloads" && : > "$f"; then echo "   created: $f"
       else echo "   MISSING: $f"; missing=1; fi
     done; done
+    unset IFS
     [ $missing = 0 ] || { echo "   a tinygrad APL program run without APL_REMOTE_SOCK would \`pkill -f TinyGPU\` the serving server; fix: $0 create"; exit 1; } ;;
   *) echo "usage: $0 check|create"; exit 2 ;;
 esac

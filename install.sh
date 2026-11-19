@@ -142,12 +142,13 @@ if [ "$mode" != build ] && [ "$miss" -gt 0 ]; then
       echo "         (System Settings > General > Login Items & Extensions > Driver Extensions)"
     fi
   fi
-  # tinygrad's ensure_app() pkills a serving TinyGPU server unless its own download of the app is cached; an empty file
-  # under that name is the whole check (tools/tinygpu-sentinel.sh). Local cache files only, so no question asked.
-  if [ -d /Applications/TinyGPU.app ]; then
-    echo "         tinygrad pkill guard (sentinel files tinygrad checks before it would kill the server):"
-    sh "$R/tools/tinygpu-sentinel.sh" create | sed 's/^   /           /'
-  fi
+fi
+# tinygrad's ensure_app() pkills a serving TinyGPU server unless its own download of the app is cached; an empty file
+# under that name is the whole check (tools/tinygpu-sentinel.sh). Outside the block above on purpose: a machine with
+# nothing missing - the usual one - needs it too. Local cache files only, so no question asked.
+if [ -d /Applications/TinyGPU.app ]; then
+  echo "== tinygrad pkill guard (the files tinygrad checks before it would kill a serving TinyGPU server):"
+  sh "$R/tools/tinygpu-sentinel.sh" create | sed 's/^   /   /'
 fi
 
 # ---------------------------------------------------------------- build

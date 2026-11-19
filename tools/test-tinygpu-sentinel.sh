@@ -21,5 +21,13 @@ for d in "$T/xdg/tinygrad" "$T/root/.cache/tinygrad" "$T/home/Library/Caches/tin
   ok '[ -f "$d/downloads/TinyGPU_$k.zip" ]' "missing after create: $d/downloads/TinyGPU_$k.zip"; done; done
 out=$(run check); rc=$?
 ok '[ $rc = 0 ]' "check after create should exit 0 (got $rc): $out"
+# a space in every path (EGPU_ROOT, HOME and XDG_CACHE_HOME): each cache is one path, not two relative ones
+W="$T/with space"; mkdir -p "$W/ro ot/tinygrad-x/tinygrad/runtime/support" "$W/ho me" "$W/x dg"
+cp "$T/root/install.sh" "$W/ro ot/"; cp "$T/root/tinygrad-x/tinygrad/runtime/support/system.py" "$W/ro ot/tinygrad-x/tinygrad/runtime/support/"
+out=$(cd "$T" && HOME="$W/ho me" EGPU_ROOT="$W/ro ot" XDG_CACHE_HOME="$W/x dg" sh "$S" create); rc=$?
+ok '[ $rc = 0 ] && [ $(echo "$out" | grep -c created:) = 6 ]' "create with spaces: rc $rc: $out"
+for d in "$W/x dg/tinygrad" "$W/ro ot/.cache/tinygrad" "$W/ho me/Library/Caches/tinygrad"; do
+  ok '[ -f "$d/downloads/TinyGPU_$A.zip" ] && [ -f "$d/downloads/TinyGPU_$B.zip" ]' "missing with spaces: $d"; done
+ok '[ ! -e "$T/dg" ] && [ ! -e "$T/me" ] && [ ! -e "$T/ot" ]' "a split path created a relative directory: $(ls "$T")"
 rm -rf "$T"
 echo "test-tinygpu-sentinel: $n checks run, $fails failed"; [ $fails = 0 ]
