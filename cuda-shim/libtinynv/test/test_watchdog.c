@@ -424,7 +424,7 @@ static int err_eof(double limit) {
 static int file_has(const char *path, const char *needle) {
   if (path == errp) drain();
   FILE *f = fopen(path, "r");
-  char line[512];
+  char line[8192];   // whole lines: the helper's "started ... through SCRIPT" line carries two full paths
   int found = 0;
   if (!f) return 0;
   while (!found && fgets(line, sizeof(line), f)) found = strstr(line, needle) != NULL;
