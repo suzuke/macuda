@@ -56,7 +56,8 @@ sh install.sh          # 每裝一樣都會先問；YES=1 sh install.sh 則全�
    llama.cpp 約 5 分鐘、CUDA 部分 3–5 分鐘，第一次另加 4 GB 的 image 下載。
 
 執行檔位置：`sm_120a` 在 `cuda-shim/build/bin`，其他架構在 `cuda-shim/build/bin-<arch>`
-（例如 3060 是 `cuda-shim/build/bin-sm_86`）。之後的工具沒指定 `BIN` 時會自動挑對的那一個。
+（例如 3060 是 `cuda-shim/build/bin-sm_86`）。`nv_shim_step.sh` 和 `serve.sh` 沒指定 `BIN` 時，會依連接的卡
+（或你 export 的 `ARCH`）挑對應的目錄；沒有為這張卡編過的執行檔時直接報錯，不會拿別的架構的來跑。
 
 **使用容器時**記得先讓它跑起來：`container system start`，或打開 Docker Desktop。
 
@@ -80,7 +81,8 @@ sh tools/preflight.sh
 
 ## 6. 下載模型
 
-用 `hf`（`huggingface_hub`）放進 `models/`。依顯示記憶體挑：
+用 `hf` 指令放進 `models/`。`install.sh` 不會裝它，先自己裝：`python3 -m pip install --user huggingface_hub`
+（或 `brew install huggingface-cli`）。依顯示記憶體挑：
 
 ```sh
 # RTX 3060（12 GB）：7B/8B 級
@@ -94,8 +96,9 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_M.gguf MTP/mtp-Qwen3.8-
 
 ## 7. 第一次跑
 
-所有碰卡的動作都透過 `tools/nv_shim_step.sh`：它會跑 preflight → 取得鎖 → 確保 TinyGPU 伺服器在跑
-（經過 `tools/tinygpu-server.sh` 的包裝）→ 執行**一個** GPU 程序 → 釋放鎖。
+所有碰卡的動作都透過 `tools/nv_shim_step.sh`：它會跑 preflight → 確保 TinyGPU 伺服器在跑
+（經過 `tools/tinygpu-server.sh` 的包裝）→ 執行**一個** GPU 行程並記錄 log →（`QUIESCE=1` 時）冷停止。
+它**不會**上鎖（GPU 鎖在 2026-09-17 拿掉了），所以不要同時開兩個；`serve.sh` 則會在服務期間持有鎖。
 
 ```sh
 sh tools/nv_shim_step.sh A opverify                                    # 算子驗證
@@ -107,7 +110,7 @@ RTX 3060（Ampere）在 Thunderbolt 外接盒上的既定程序是每一步加 `
 （FLR、關 bus master）。驅動本身已經會讓 Ampere 卡冷停，所以 `QUIESCE=1` 是額外保險；它需要第 10 節的
 tinygrad 復原環境，沒裝的話那一步會報錯，但不影響推論本身。
 
-同一時間只能有一個程序碰卡；兩個程序同時開卡會把卡卡死。
+同一時間只能有一個行程碰卡；兩個行程同時開卡會把卡卡死。
 
 ## 8. 提供 OpenAI 相容 API
 
@@ -127,23 +130,24 @@ API 在 `http://127.0.0.1:8090/v1`。
 
 | 機制 | 做什麼 |
 |---|---|
-| 伺服器遺失偵測（M1/M2/M7） | 用戶端發現伺服器斷了就停止送指令、走遺失時的收尾，不再對卡寫東西 |
-| 緊急清除（M3） | 偵測到遺失或用戶端崩潰時，啟動 `tinynv-bmclear`，透過新的伺服器連線把 bus master 關掉 |
-| watchdog（M4） | 每個 session 旁邊跑一個 `tinynv-bmclear --watch`：用戶端被 SIGKILL、伺服器被殺，它都會在約 0.2 秒內關掉 bus master |
+| 伺服器遺失偵測（M1/M2/M7） | 用戶端發現伺服器斷了就鎖定「已遺失」，不再送一般指令；收尾時若連線還在，會先關掉 bus master 再結束 |
+| 緊急清除（M3） | 用戶端自己偵測到伺服器遺失時，立刻啟動 `tinynv-bmclear`，透過新的伺服器連線把 bus master 關掉。實測約 0.2 秒 |
+| watchdog（M4） | 每個 session 旁邊跑一個 `tinynv-bmclear --watch`，負責 M3 管不到的情況（用戶端自己被 SIGKILL、崩潰）。已通過四輪無卡驗證，**尚未上卡做故障測試**；重試間隔最長可達數十秒，時間不如 M3 確定 |
 | 伺服器包裝（M6） | 伺服器經 `tools/tinygpu-server.sh` 啟動，記錄退出狀態，並在退出當下與 5 秒後各拍一張 DART 快照 |
 | pkill sentinel（M5） | 擋住 tinygrad `ensure_app()` 的 `pkill -f TinyGPU` |
 | SIGPIPE 防護 | 伺服器斷線時用戶端不會被 SIGPIPE 直接殺掉，能走完收尾 |
 
-實測（2026-11-19，刻意在推論中 SIGKILL 伺服器）：沒有防護時 11.3 秒內 129 次 DART 錯誤；有防護時 0.2 秒內
-6 次，沒有 panic。
+數字：2026-11-18 的真實事故沒有任何防護，32 秒內 129 次 DART 錯誤後 panic。2026-11-19 刻意在推論中 SIGKILL
+伺服器：第一輪用戶端被 SIGPIPE 殺掉、M3 沒機會動作，錯誤一直持續到手動清除 bus master 的那一刻才停
+（約 11 秒、129 次，沒有 panic）；修好 SIGPIPE 後第二輪由 M3 處理，0.2 秒內 6 次。
 
 紀錄在哪裡：伺服器 log 與 DART 快照在 `logs/`（安裝目錄不可寫時改到 `~/Library/Logs/macuda`），每一步的
 log 是 `logs/shim-<步驟>-<時間>.log`。
 
 除錯用的開關（平常不要動）：`TINYNV_WATCHDOG=0` 關 watchdog、`TINYNV_EMERGENCY_BM=0` 關緊急清除。
 
-**仍然存在的風險**：伺服器死掉到 bus master 被關掉之間，仍有約 0.2 秒的錯誤窗口；根治要 TinyGPU 的 dext 在
-session 收尾時先關 bus master（已擬好給上游的回報，尚未送出）。
+**仍然存在的風險**：伺服器死掉到 bus master 被關掉之間，最好的情況（M3）仍有約 0.2 秒的錯誤空窗；只靠 M4 的
+情況還沒在卡上測過。根治要 TinyGPU 的 dext 在 session 收尾時先關 bus master（給上游的回報還在草稿階段，尚未送出）。
 
 ## 10. （選用）tinygrad 復原工具
 
@@ -153,9 +157,9 @@ macOS 遠端 PCI 路徑）。本機的做法：
 ```sh
 git clone https://github.com/Davinchy/tinygrad tinygrad-stable
 git -C tinygrad-stable checkout 33cd373ad
-python3.12 -m venv venv
+python3.12 -m venv venv      # 沒有 python3.12：brew install python@3.12
 . ./env.sh          # 設定 EGPU_ROOT、PYTHONPATH（指向 tinygrad-stable）、venv、XDG_CACHE_HOME
-sh tools/tinygpu-sentinel.sh create   # env.sh 把 tinygrad 的 cache 指到 repo 內，這裡也要有 sentinel
+sh tools/tinygpu-sentinel.sh create   # 新的 tinygrad checkout 可能固定別的 TinyGPU 版本，補齊它的 sentinel
 ```
 
 不要把 `APL_REMOTE_SOCK` 設成全域環境變數。
@@ -164,6 +168,8 @@ sh tools/tinygpu-sentinel.sh create   # env.sh 把 tinygrad 的 cache 指到 rep
 
 - **卡不見、`pci-dart-error-data` 旗標被設、連結檢查失敗**：關掉外接盒電源、重插，再跑 `sh tools/preflight.sh`。
   沒有任何腳本能代替實體重插。
+- **重插或重開機之後 preflight 仍然 ABORT**，說 dext 重新列舉過或 DART 旗標還在：確認卡已經重插、狀態正常後，
+  由人執行 `sh tools/dart-stale.sh --clear`（忘掉舊紀錄，下一次乾淨的 preflight 會重新記錄），再跑一次 preflight。
 - **不要**手動 `pkill` TinyGPU 伺服器、不要 `systemextensionsctl reset`。
 - 看 `logs/tinygpu-server.log` 的退出狀態行和同時間的 `dart-at-server-exit-*.txt` 快照。
 

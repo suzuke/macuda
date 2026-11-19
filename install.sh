@@ -186,8 +186,8 @@ echo "       sh tools/preflight.sh                # read-only; must say VERDICT:
 echo "  2. Get a model (any GGUF llama.cpp can read) into models/ — see models/README.md"
 echo "  3. Run one:"
 echo "       sh tools/nv_shim_step.sh A bench models/<your-model>.gguf"
-echo "     which does the whole protocol for you: preflight, take the lock, start the server, run, release."
-echo "     It runs the binaries built here ($ARCH: cuda-shim/build/bin$([ "$ARCH" = sm_120a ] || echo "-$ARCH")) unless BIN says otherwise."
+echo "     which does the whole protocol for you: preflight, make sure the server runs, run one process, quiesce."
+echo "     It runs the binaries built for the connected card (here $ARCH: cuda-shim/build/bin$([ "$ARCH" = sm_120a ] || echo "-$ARCH")) unless BIN says otherwise."
 [ "$ARCH" = sm_86 ] && echo "     On an RTX 30 (Ampere) card the protocol adds QUIESCE=1 to every step - it needs the tinygrad recovery checkout (README)."
 echo
 echo "  Read README §Run before driving the card yourself: one process on it at a time, and a wedged card needs"

@@ -26,7 +26,7 @@
 # DRY=1 runs on the null device with no preflight/quiesce, to test this script itself.
 # Driver test steps (gap, fault) take their binary from TREE=<worktree> (default: the main checkout) or TESTBIN=<path>.
 set -u
-R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; S=$R/cuda-shim; T=${TREE:-$S}; BIN=${BIN:-$(sh $R/tools/pick-bin.sh || echo $S/build/bin)}; SOCK=${TINYNV_SOCKET:-${TMPDIR}tinygpu.sock}
+R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; S=$R/cuda-shim; T=${TREE:-$S}; BIN=${BIN:-$(sh "$(dirname "$0")/pick-bin.sh" || echo $S/build/no-binaries-for-this-card)}; SOCK=${TINYNV_SOCKET:-${TMPDIR}tinygpu.sock}
 who=${1:?A|B}; step=${2:?opverify|bench|simple}; shift 2
 mkdir -p $R/logs; ts=$(date +%Y%m%d-%H%M%S); log=$R/logs/shim-$step-$ts.log
 out=

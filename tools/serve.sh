@@ -20,7 +20,7 @@
 # override (TINYNV_ARENA_DMA=0 turns the delivery off). The DRIVER's own default stays off until the region change is soaked.
 # DRY=1 serves on the null device: no preflight, no lock, garbage tokens, useful for the API plumbing only.
 set -u
-R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; S=$R/cuda-shim; BIN=${BIN:-$(sh $R/tools/pick-bin.sh || echo $S/build/bin)/llama-server-null}
+R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; S=$R/cuda-shim; BIN=${BIN:-$(sh "$(dirname "$0")/pick-bin.sh" || echo $S/build/no-binaries-for-this-card)/llama-server-null}
 PIDF=$R/logs/serve.pid; URLF=$R/logs/serve.url
 cmd=${1:-status}; shift 2>/dev/null || true
 case "$cmd" in
