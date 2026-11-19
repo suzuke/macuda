@@ -62,6 +62,15 @@ on the card and only with the owner's go: stop submitting on the first impossibl
 teardown that skips dead drains, and the emergency BM clear through a fresh server connection (the one that would have
 ended the 32 s storm), then a watchdog. The real fix stays in the dext (above).
 
+**Step B on the card (2026-11-19, build 9276c90): the server SIGKILLed mid-decode under llama-simple.** Clearing bus
+mastering stops the storm: 129 PTE-invalid write faults from 52 ms after the kill (38 in the first second, then 7-12/s),
+the last one in the same millisecond the clear landed (PCI_COMMAND 0x0007 -> 0x0003), no panic, nothing latched in
+`pci-dart-error-data`. But the client's own guard never ran: it died of SIGPIPE (exit 141) on its next send, because the
+transport socket did not set SO_NOSIGPIPE and the offline tests ignored SIGPIPE (and `test_tg_dead` only half-closed its
+server). The clear came from `tinynv-bmclear` run by hand after 11 s. Fixed in b420134 (SO_NOSIGPIPE / MSG_NOSIGNAL;
+`test_tg_sigpipe` kills its server outright with SIGPIPE at its default). M6 worked: exit status 137 and both DART
+snapshots recorded. Evidence: `logs/stepB-20261119-122456/` (local, not in git).
+
 **Known server killer, neutralised by a sentinel file.** tinygrad's `APLRemotePCIDevice.ensure_app()`
 (`tinygrad-stable/tinygrad/runtime/support/system.py:421-427`, Davinchy/tinygrad 33cd373ad) runs `pkill -f TinyGPU` and
 reinstalls the app unless BOTH `/Applications/TinyGPU.app` and
