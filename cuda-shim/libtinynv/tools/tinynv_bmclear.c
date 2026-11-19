@@ -398,8 +398,8 @@ static int watch(int server_pid, const char *app, double timeout, double reply_t
       else {
         say("server pid %d exited while client pid %d is alive: clearing bus mastering", server_pid, client);
         g_why = "the watchdog saw the old server exit under a live client (M4)";
-        watched_clear(sock, server_pid, 1, app, timeout, reply_timeout, no_start);
-        cleared = 1;
+        // only a confirmed clear counts: after a failed one, the client's own death tries again
+        cleared = watched_clear(sock, server_pid, 1, app, timeout, reply_timeout, no_start) == 0;
       }
     }
     if (client_gone) {
